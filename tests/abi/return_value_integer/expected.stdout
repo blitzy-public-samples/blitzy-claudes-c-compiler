@@ -1,0 +1,12 @@
+return_char: OK
+return_uchar: OK
+return_schar_neg: OK
+return_short: OK
+return_short_neg: OK
+return_ushort: OK
+return_int: OK
+return_int_neg: OK
+return_long: OK
+return_llong: OK
+return_llong_neg: OK
+All integer return tests passed
