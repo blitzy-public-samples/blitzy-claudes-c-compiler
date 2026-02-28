@@ -1,0 +1,7 @@
+alignas16_char: OK
+alignas16_int: OK
+alignas16_array: OK
+long_double_align: OK
+multiple_aligned: OK
+nested_call_align: OK
+All 16-byte alignment tests passed
