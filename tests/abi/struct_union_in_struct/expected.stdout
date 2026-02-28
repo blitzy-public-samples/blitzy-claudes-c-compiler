@@ -1,0 +1,11 @@
+sizeof_union: OK
+alignof_union: OK
+offset_a: OK
+offset_u: OK
+offset_b: OK
+sizeof_struct: OK
+union_overlap: OK
+store_load_all: OK
+return_struct: OK
+union_write_int_read_short: OK
+All struct union in struct tests passed
