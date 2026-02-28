@@ -1,0 +1,553 @@
+# CCC CI — Continuous Integration for Claude's C Compiler
+#
+# This workflow validates the CCC compiler across all four supported
+# architectures (x86-64, AArch64, RISC-V 64, i686) through four blocking
+# jobs: build verification, unit tests, native x86-64 integration tests,
+# and cross-architecture integration tests via QEMU user-mode emulation.
+#
+# All jobs are blocking — failure in any job fails the entire workflow.
+# Target pipeline completion: ≤30 minutes.
+
+name: CCC CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Job 1: Build
+  # Purpose: Compile the project in release mode and verify all 5 binary
+  #          targets are produced. Upload artifacts for downstream jobs.
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry and build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build release binaries
+        run: cargo build --release
+
+      - name: Verify all 5 binary targets exist
+        run: |
+          echo "Checking for all 5 binary targets..."
+          missing=0
+          for bin in ccc ccc-x86 ccc-arm ccc-riscv ccc-i686; do
+            if [ ! -f "target/release/$bin" ]; then
+              echo "ERROR: target/release/$bin not found"
+              missing=$((missing + 1))
+            else
+              echo "OK: target/release/$bin exists ($(stat -c%s "target/release/$bin") bytes)"
+            fi
+          done
+          if [ "$missing" -gt 0 ]; then
+            echo "FAIL: $missing binary target(s) missing"
+            exit 1
+          fi
+          echo "All 5 binary targets verified."
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ccc-binaries
+          path: |
+            target/release/ccc
+            target/release/ccc-x86
+            target/release/ccc-arm
+            target/release/ccc-riscv
+            target/release/ccc-i686
+          retention-days: 1
+
+  # ---------------------------------------------------------------------------
+  # Job 2: Unit Tests
+  # Purpose: Run all Rust unit tests (#[test] functions) across all modules.
+  # ---------------------------------------------------------------------------
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry and build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Run unit tests
+        run: cargo test --release
+
+  # ---------------------------------------------------------------------------
+  # Job 3: x86-64 Integration Tests
+  # Purpose: Run end-to-end integration tests natively on x86-64.
+  #          Each test directory in tests/ contains main.c and expected output
+  #          files. Tests are compiled with ccc and executed natively.
+  # ---------------------------------------------------------------------------
+  integration-x86_64:
+    name: Integration Tests (x86-64)
+    runs-on: ubuntu-latest
+    needs: build
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc
+        env:
+          DEBIAN_FRONTEND: noninteractive
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: ccc-binaries
+          path: target/release
+
+      - name: Make binaries executable
+        run: chmod +x target/release/ccc*
+
+      - name: Run x86-64 integration tests
+        run: |
+          PASS=0
+          FAIL=0
+          SKIP=0
+          ERRORS=""
+
+          if [ ! -d "tests" ]; then
+            echo "No tests/ directory found. Skipping integration tests."
+            exit 0
+          fi
+
+          test_count=0
+          for test_dir in tests/*/; do
+            [ -d "$test_dir" ] || continue
+            test_count=$((test_count + 1))
+          done
+
+          if [ "$test_count" -eq 0 ]; then
+            echo "No test directories found in tests/. Skipping."
+            exit 0
+          fi
+
+          echo "Running x86-64 integration tests ($test_count test directories)..."
+          echo "================================================================="
+
+          for test_dir in tests/*/; do
+            [ -d "$test_dir" ] || continue
+            test_name=$(basename "$test_dir")
+
+            # Check skip marker for x86-64
+            if [ -f "$test_dir/expected.skip.x86_64" ]; then
+              echo "SKIP: $test_name (x86_64 skip marker)"
+              SKIP=$((SKIP + 1))
+              continue
+            fi
+
+            # Verify main.c exists
+            if [ ! -f "$test_dir/main.c" ]; then
+              echo "SKIP: $test_name (no main.c)"
+              SKIP=$((SKIP + 1))
+              continue
+            fi
+
+            # Compile with ccc
+            compile_output=$(./target/release/ccc -o /tmp/ccc_test_bin "$test_dir/main.c" 2>&1) || {
+              echo "FAIL: $test_name (compilation failed)"
+              echo "  Compiler output: $compile_output"
+              FAIL=$((FAIL + 1))
+              ERRORS="${ERRORS}  FAIL: ${test_name} (compilation failed)\n"
+              continue
+            }
+
+            # Execute the compiled binary and capture stdout and exit code
+            actual_stdout=$(/tmp/ccc_test_bin 2>/dev/null) || true
+            actual_ret=$?
+
+            # Check expected exit code
+            if [ -f "$test_dir/expected.ret" ]; then
+              expected_ret=$(cat "$test_dir/expected.ret" | tr -d '[:space:]')
+              if [ "$actual_ret" != "$expected_ret" ]; then
+                echo "FAIL: $test_name (exit code: expected $expected_ret, got $actual_ret)"
+                FAIL=$((FAIL + 1))
+                ERRORS="${ERRORS}  FAIL: ${test_name} (exit code: expected ${expected_ret}, got ${actual_ret})\n"
+                continue
+              fi
+            fi
+
+            # Check expected stdout
+            if [ -f "$test_dir/expected.stdout" ]; then
+              expected_stdout=$(cat "$test_dir/expected.stdout")
+              if [ "$actual_stdout" != "$expected_stdout" ]; then
+                echo "FAIL: $test_name (stdout mismatch)"
+                echo "  Expected: $(echo "$expected_stdout" | head -3)"
+                echo "  Actual:   $(echo "$actual_stdout" | head -3)"
+                FAIL=$((FAIL + 1))
+                ERRORS="${ERRORS}  FAIL: ${test_name} (stdout mismatch)\n"
+                continue
+              fi
+            fi
+
+            echo "PASS: $test_name"
+            PASS=$((PASS + 1))
+          done
+
+          echo "================================================================="
+          echo "x86-64 Integration Test Results: $PASS passed, $FAIL failed, $SKIP skipped"
+
+          if [ "$FAIL" -gt 0 ]; then
+            echo ""
+            echo "Failed tests:"
+            printf "$ERRORS"
+            exit 1
+          fi
+
+  # ---------------------------------------------------------------------------
+  # Job 4: Cross-Architecture Integration Tests
+  # Purpose: Run integration tests via QEMU user-mode emulation for AArch64,
+  #          RISC-V 64, and i686. Each architecture uses its dedicated compiler
+  #          binary and QEMU with the appropriate sysroot.
+  # ---------------------------------------------------------------------------
+  integration-cross-arch:
+    name: Integration Tests (Cross-Architecture)
+    runs-on: ubuntu-latest
+    needs: build
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            gcc-aarch64-linux-gnu \
+            gcc-riscv64-linux-gnu \
+            gcc-i686-linux-gnu \
+            qemu-user
+        env:
+          DEBIAN_FRONTEND: noninteractive
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: ccc-binaries
+          path: target/release
+
+      - name: Make binaries executable
+        run: chmod +x target/release/ccc*
+
+      - name: Run AArch64 integration tests
+        run: |
+          PASS=0
+          FAIL=0
+          SKIP=0
+          ERRORS=""
+
+          if [ ! -d "tests" ]; then
+            echo "No tests/ directory found. Skipping AArch64 integration tests."
+            exit 0
+          fi
+
+          test_count=0
+          for test_dir in tests/*/; do
+            [ -d "$test_dir" ] || continue
+            test_count=$((test_count + 1))
+          done
+
+          if [ "$test_count" -eq 0 ]; then
+            echo "No test directories found in tests/. Skipping."
+            exit 0
+          fi
+
+          echo "Running AArch64 integration tests ($test_count test directories)..."
+          echo "================================================================="
+
+          for test_dir in tests/*/; do
+            [ -d "$test_dir" ] || continue
+            test_name=$(basename "$test_dir")
+
+            # Check skip marker for AArch64
+            if [ -f "$test_dir/expected.skip.arm" ]; then
+              echo "SKIP: $test_name (arm skip marker)"
+              SKIP=$((SKIP + 1))
+              continue
+            fi
+
+            # Verify main.c exists
+            if [ ! -f "$test_dir/main.c" ]; then
+              echo "SKIP: $test_name (no main.c)"
+              SKIP=$((SKIP + 1))
+              continue
+            fi
+
+            # Compile with ccc-arm
+            compile_output=$(./target/release/ccc-arm -o /tmp/ccc_test_bin "$test_dir/main.c" 2>&1) || {
+              echo "FAIL: $test_name (compilation failed)"
+              echo "  Compiler output: $compile_output"
+              FAIL=$((FAIL + 1))
+              ERRORS="${ERRORS}  FAIL: ${test_name} (compilation failed)\n"
+              continue
+            }
+
+            # Execute via QEMU with AArch64 sysroot
+            actual_stdout=$(qemu-aarch64 -L /usr/aarch64-linux-gnu /tmp/ccc_test_bin 2>/dev/null) || true
+            actual_ret=$?
+
+            # Check expected exit code
+            if [ -f "$test_dir/expected.ret" ]; then
+              expected_ret=$(cat "$test_dir/expected.ret" | tr -d '[:space:]')
+              if [ "$actual_ret" != "$expected_ret" ]; then
+                echo "FAIL: $test_name (exit code: expected $expected_ret, got $actual_ret)"
+                FAIL=$((FAIL + 1))
+                ERRORS="${ERRORS}  FAIL: ${test_name} (exit code: expected ${expected_ret}, got ${actual_ret})\n"
+                continue
+              fi
+            fi
+
+            # Check expected stdout
+            if [ -f "$test_dir/expected.stdout" ]; then
+              expected_stdout=$(cat "$test_dir/expected.stdout")
+              if [ "$actual_stdout" != "$expected_stdout" ]; then
+                echo "FAIL: $test_name (stdout mismatch)"
+                echo "  Expected: $(echo "$expected_stdout" | head -3)"
+                echo "  Actual:   $(echo "$actual_stdout" | head -3)"
+                FAIL=$((FAIL + 1))
+                ERRORS="${ERRORS}  FAIL: ${test_name} (stdout mismatch)\n"
+                continue
+              fi
+            fi
+
+            echo "PASS: $test_name"
+            PASS=$((PASS + 1))
+          done
+
+          echo "================================================================="
+          echo "AArch64 Integration Test Results: $PASS passed, $FAIL failed, $SKIP skipped"
+
+          if [ "$FAIL" -gt 0 ]; then
+            echo ""
+            echo "Failed tests:"
+            printf "$ERRORS"
+            exit 1
+          fi
+
+      - name: Run RISC-V 64 integration tests
+        run: |
+          PASS=0
+          FAIL=0
+          SKIP=0
+          ERRORS=""
+
+          if [ ! -d "tests" ]; then
+            echo "No tests/ directory found. Skipping RISC-V integration tests."
+            exit 0
+          fi
+
+          test_count=0
+          for test_dir in tests/*/; do
+            [ -d "$test_dir" ] || continue
+            test_count=$((test_count + 1))
+          done
+
+          if [ "$test_count" -eq 0 ]; then
+            echo "No test directories found in tests/. Skipping."
+            exit 0
+          fi
+
+          echo "Running RISC-V 64 integration tests ($test_count test directories)..."
+          echo "================================================================="
+
+          for test_dir in tests/*/; do
+            [ -d "$test_dir" ] || continue
+            test_name=$(basename "$test_dir")
+
+            # Check skip marker for RISC-V
+            if [ -f "$test_dir/expected.skip.riscv" ]; then
+              echo "SKIP: $test_name (riscv skip marker)"
+              SKIP=$((SKIP + 1))
+              continue
+            fi
+
+            # Verify main.c exists
+            if [ ! -f "$test_dir/main.c" ]; then
+              echo "SKIP: $test_name (no main.c)"
+              SKIP=$((SKIP + 1))
+              continue
+            fi
+
+            # Compile with ccc-riscv
+            compile_output=$(./target/release/ccc-riscv -o /tmp/ccc_test_bin "$test_dir/main.c" 2>&1) || {
+              echo "FAIL: $test_name (compilation failed)"
+              echo "  Compiler output: $compile_output"
+              FAIL=$((FAIL + 1))
+              ERRORS="${ERRORS}  FAIL: ${test_name} (compilation failed)\n"
+              continue
+            }
+
+            # Execute via QEMU with RISC-V sysroot
+            actual_stdout=$(qemu-riscv64 -L /usr/riscv64-linux-gnu /tmp/ccc_test_bin 2>/dev/null) || true
+            actual_ret=$?
+
+            # Check expected exit code
+            if [ -f "$test_dir/expected.ret" ]; then
+              expected_ret=$(cat "$test_dir/expected.ret" | tr -d '[:space:]')
+              if [ "$actual_ret" != "$expected_ret" ]; then
+                echo "FAIL: $test_name (exit code: expected $expected_ret, got $actual_ret)"
+                FAIL=$((FAIL + 1))
+                ERRORS="${ERRORS}  FAIL: ${test_name} (exit code: expected ${expected_ret}, got ${actual_ret})\n"
+                continue
+              fi
+            fi
+
+            # Check expected stdout
+            if [ -f "$test_dir/expected.stdout" ]; then
+              expected_stdout=$(cat "$test_dir/expected.stdout")
+              if [ "$actual_stdout" != "$expected_stdout" ]; then
+                echo "FAIL: $test_name (stdout mismatch)"
+                echo "  Expected: $(echo "$expected_stdout" | head -3)"
+                echo "  Actual:   $(echo "$actual_stdout" | head -3)"
+                FAIL=$((FAIL + 1))
+                ERRORS="${ERRORS}  FAIL: ${test_name} (stdout mismatch)\n"
+                continue
+              fi
+            fi
+
+            echo "PASS: $test_name"
+            PASS=$((PASS + 1))
+          done
+
+          echo "================================================================="
+          echo "RISC-V 64 Integration Test Results: $PASS passed, $FAIL failed, $SKIP skipped"
+
+          if [ "$FAIL" -gt 0 ]; then
+            echo ""
+            echo "Failed tests:"
+            printf "$ERRORS"
+            exit 1
+          fi
+
+      - name: Run i686 integration tests
+        run: |
+          PASS=0
+          FAIL=0
+          SKIP=0
+          ERRORS=""
+
+          if [ ! -d "tests" ]; then
+            echo "No tests/ directory found. Skipping i686 integration tests."
+            exit 0
+          fi
+
+          test_count=0
+          for test_dir in tests/*/; do
+            [ -d "$test_dir" ] || continue
+            test_count=$((test_count + 1))
+          done
+
+          if [ "$test_count" -eq 0 ]; then
+            echo "No test directories found in tests/. Skipping."
+            exit 0
+          fi
+
+          echo "Running i686 integration tests ($test_count test directories)..."
+          echo "================================================================="
+
+          for test_dir in tests/*/; do
+            [ -d "$test_dir" ] || continue
+            test_name=$(basename "$test_dir")
+
+            # Check skip marker for i686
+            if [ -f "$test_dir/expected.skip.i686" ]; then
+              echo "SKIP: $test_name (i686 skip marker)"
+              SKIP=$((SKIP + 1))
+              continue
+            fi
+
+            # Verify main.c exists
+            if [ ! -f "$test_dir/main.c" ]; then
+              echo "SKIP: $test_name (no main.c)"
+              SKIP=$((SKIP + 1))
+              continue
+            fi
+
+            # Compile with ccc-i686
+            compile_output=$(./target/release/ccc-i686 -o /tmp/ccc_test_bin "$test_dir/main.c" 2>&1) || {
+              echo "FAIL: $test_name (compilation failed)"
+              echo "  Compiler output: $compile_output"
+              FAIL=$((FAIL + 1))
+              ERRORS="${ERRORS}  FAIL: ${test_name} (compilation failed)\n"
+              continue
+            }
+
+            # Execute via QEMU i386 with i686 sysroot
+            actual_stdout=$(qemu-i386 -L /usr/i686-linux-gnu /tmp/ccc_test_bin 2>/dev/null) || true
+            actual_ret=$?
+
+            # Check expected exit code
+            if [ -f "$test_dir/expected.ret" ]; then
+              expected_ret=$(cat "$test_dir/expected.ret" | tr -d '[:space:]')
+              if [ "$actual_ret" != "$expected_ret" ]; then
+                echo "FAIL: $test_name (exit code: expected $expected_ret, got $actual_ret)"
+                FAIL=$((FAIL + 1))
+                ERRORS="${ERRORS}  FAIL: ${test_name} (exit code: expected ${expected_ret}, got ${actual_ret})\n"
+                continue
+              fi
+            fi
+
+            # Check expected stdout
+            if [ -f "$test_dir/expected.stdout" ]; then
+              expected_stdout=$(cat "$test_dir/expected.stdout")
+              if [ "$actual_stdout" != "$expected_stdout" ]; then
+                echo "FAIL: $test_name (stdout mismatch)"
+                echo "  Expected: $(echo "$expected_stdout" | head -3)"
+                echo "  Actual:   $(echo "$actual_stdout" | head -3)"
+                FAIL=$((FAIL + 1))
+                ERRORS="${ERRORS}  FAIL: ${test_name} (stdout mismatch)\n"
+                continue
+              fi
+            fi
+
+            echo "PASS: $test_name"
+            PASS=$((PASS + 1))
+          done
+
+          echo "================================================================="
+          echo "i686 Integration Test Results: $PASS passed, $FAIL failed, $SKIP skipped"
+
+          if [ "$FAIL" -gt 0 ]; then
+            echo ""
+            echo "Failed tests:"
+            printf "$ERRORS"
+            exit 1
+          fi
