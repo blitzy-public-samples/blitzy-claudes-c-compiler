@@ -1,0 +1,4 @@
+default_align: OK
+pack1_no_padding: OK
+restored_default: OK
+All pragma pack basic tests passed
