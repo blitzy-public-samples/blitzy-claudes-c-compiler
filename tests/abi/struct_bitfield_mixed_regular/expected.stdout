@@ -1,0 +1,11 @@
+sizeof_struct: OK
+alignof_struct: OK
+offset_b: OK
+offset_d: OK
+store_load_a: OK
+store_load_b: OK
+store_load_c: OK
+store_load_d: OK
+b_no_corrupt_bitfields: OK
+a_no_corrupt_others: OK
+All bitfield mixed regular tests passed
