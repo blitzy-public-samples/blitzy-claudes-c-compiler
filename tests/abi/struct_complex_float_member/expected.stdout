@@ -1,0 +1,10 @@
+sizeof_complex_float: OK
+sizeof_complex_double: OK
+sizeof_struct: OK
+offsetof_cf: OK
+offsetof_cd: OK
+alignof_cf: OK
+alignof_cd: OK
+alignof_struct: OK
+return_value: OK
+All complex float member tests passed
