@@ -1,0 +1,9 @@
+sizeof_PadMultiField: OK
+offsetof_a: OK
+offsetof_b: OK
+offsetof_c: OK
+offsetof_d: OK
+offsetof_e: OK
+alignof_PadMultiField: OK
+value_check: OK
+All struct_pad_multi_field tests passed
