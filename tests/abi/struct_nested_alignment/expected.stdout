@@ -1,0 +1,9 @@
+sizeof_Inner: OK
+alignof_Inner: OK
+offsetof_a: OK
+offsetof_b: OK
+sizeof_Outer: OK
+alignof_Outer: OK
+value_nested: OK
+double_precision: OK
+All nested alignment tests passed
