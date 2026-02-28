@@ -1,0 +1,7 @@
+sum_twelve: OK
+verify_args: OK
+sum_twelve_long: OK
+sum_negative: OK
+sum_mixed: OK
+sum_large_vals: OK
+All many-args tests passed
