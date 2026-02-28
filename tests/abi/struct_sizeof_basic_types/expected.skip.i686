@@ -1,0 +1,1 @@
+sizeof(long) and sizeof(void*) differ on i686 (ILP32): 4 instead of 8
