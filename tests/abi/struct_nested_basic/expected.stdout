@@ -1,0 +1,11 @@
+sizeof_Inner: OK
+sizeof_Outer: OK
+offsetof_a: OK
+offsetof_b: OK
+offsetof_c: OK
+offsetof_inner_x: OK
+offsetof_inner_y: OK
+alignof_Inner: OK
+alignof_Outer: OK
+value_nested: OK
+All nested basic tests passed
