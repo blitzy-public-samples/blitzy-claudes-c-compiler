@@ -1,0 +1,6 @@
+7_int_args: OK
+9_int_args: OK
+8_int_args: OK
+mixed_spill: OK
+align_probe: OK
+All stack alignment tests passed
