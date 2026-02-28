@@ -1,0 +1,8 @@
+sizeof_packed_aligned: OK
+offsetof_b_packed_aligned: OK
+sizeof_packed_only: OK
+offsetof_b_packed_only: OK
+sizeof_default: OK
+offsetof_b_default: OK
+value_correctness: OK
+All packed+aligned combo tests passed
