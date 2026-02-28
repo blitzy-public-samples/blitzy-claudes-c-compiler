@@ -1,0 +1,6 @@
+s1_return: OK
+s4_return: OK
+s8_return: OK
+s16_return: OK
+s8_from_return: OK
+All small struct return tests passed
