@@ -61,6 +61,17 @@ to ELF executable -- is handled internally with no external tools.
     +----------------------------------------------v---------------------+
     |               OPTIMIZATION PASSES (src/passes/)                    |
     |                                                                    |
+    |  Tier-aware dispatch (selected by -O level):                       |
+    |                                                                    |
+    |  -O0: Skip ALL passes and mem2reg (fastest compilation)            |
+    |  -O1: constant_fold + copy_prop + dce + mem2reg (basic cleanup)    |
+    |  -O2: Full pipeline below (default)                                |
+    |  -O3: Full pipeline + loop_unroll + raised inlining threshold      |
+    |  -Os: Full pipeline - loop unrolling, inlining at 50% threshold    |
+    |  -Oz: Full pipeline - loop unrolling - inlining entirely           |
+    |                                                                    |
+    |  -O2 (default) pass configuration:                                 |
+    |                                                                    |
     |  Phase 0: Inlining + post-inline cleanup                           |
     |    (inline -> mem2reg -> constant_fold -> copy_prop -> simplify    |
     |     -> constant_fold -> copy_prop -> resolve_asm)                  |
@@ -137,6 +148,7 @@ src/
     div_by_const             Division strength reduction (mul+shift)
     ipcp                     Interprocedural constant propagation
     iv_strength_reduce       Induction variable strength reduction
+    loop_unroll              Constant-bound loop unrolling (-O3 only, ≤32 iters, ≤256 insns)
     loop_analysis            Shared natural loop detection (used by LICM, IVSR)
     dead_statics             Dead static function/global elimination
     resolve_asm              Post-inline asm symbol resolution
@@ -157,6 +169,7 @@ src/
     elf/                     ELF constants, archive reading, shared types
     elf_writer_common.rs     Common ELF object file writing utilities
     linker_common/           Shared linker types (symbols, dynamic linking, EH frame)
+      linker_script.rs       Linker script parser (SECTIONS, MEMORY, ENTRY, PROVIDE, KEEP)
     asm_preprocess.rs        Assembly text preprocessing (macro expansion, conditionals)
     asm_expr.rs              Assembly expression evaluation
     peephole_common.rs       Shared peephole optimizer utilities (word matching, line store)
@@ -220,7 +233,7 @@ representation. The concrete Rust types flowing between phases are:
     v
   IrModule  (SSA form: phi nodes, virtual registers)
     |
-    |  run_passes()  (up to 3 iterations with dirty tracking)
+    |  run_passes(opt_level)  (tier-aware: -O0 skips, -O1 limited, -O2 full, -O3 extended)
     v
   IrModule  (optimized SSA)
     |
@@ -252,9 +265,10 @@ representation. The concrete Rust types flowing between phases are:
   (~185 methods). Shared logic (call ABI classification, inline asm framework,
   f128 soft-float) lives in default trait methods and shared modules.
 
-- **Linear scan register allocation**: Loop-aware liveness analysis feeds a
-  linear scan allocator (callee-saved + caller-saved) on all four backends.
-  Register-allocated values bypass stack slots entirely.
+- **Linear scan register allocation**: Loop-aware liveness analysis with
+  loop-depth spill weight heuristics feeds a linear scan allocator
+  (callee-saved + caller-saved) on all four backends. Register-allocated
+  values bypass stack slots entirely.
 
 - **Text-to-text preprocessor**: The preprocessor operates on raw text, emitting
   GCC-style `# line "file"` markers for source location tracking. Include guard
@@ -274,6 +288,17 @@ representation. The concrete Rust types flowing between phases are:
   `long` distinctions for type checking), while IrType is a flat machine-level
   enumeration (`I8`..`I128`, `U8`..`U128`, `F32`, `F64`, `F128`, `Ptr`,
   `Void`). The lowering phase bridges between them.
+
+- **Tiered optimization dispatch**: Optimization levels are dispatched through
+  six distinct tiers (`-O0` through `-Oz`), each with a different pass
+  configuration. The `-O0` tier skips all passes and mem2reg for fastest
+  compilation, while `-O3` adds loop unrolling and aggressive inlining.
+
+- **C11 conformance**: Full C11 language feature support including `_Atomic`
+  qualifier tracked through the type system with architecture-native atomic
+  instructions, `_Generic` compile-time selection, VLA dynamic stack
+  allocation, `_Complex` Annex G arithmetic, and `restrict` qualifier alias
+  analysis.
 
 ---
 
