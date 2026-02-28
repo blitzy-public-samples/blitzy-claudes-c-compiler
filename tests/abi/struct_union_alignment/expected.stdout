@@ -1,0 +1,11 @@
+sizeof_struct_s: OK
+alignof_struct_s: OK
+sizeof_union_u: OK
+alignof_union_u: OK
+union_size_ge_all: OK
+union_align_propagation: OK
+offset_y_a: OK
+offset_y_b: OK
+return_union_struct: OK
+store_load_struct_member: OK
+All union alignment tests passed
