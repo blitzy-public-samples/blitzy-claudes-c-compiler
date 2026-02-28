@@ -1,0 +1,10 @@
+sizeof_aligned32: OK
+alignof_aligned32: OK
+offsetof_a: OK
+offsetof_b: OK
+offsetof_c: OK
+offsetof_d: OK
+sizeof_larger: OK
+sizeof_default: OK
+value_correctness: OK
+All aligned(32) tests passed
