@@ -1,0 +1,9 @@
+ptr_sizes_equal: OK
+sizeof_struct: OK
+offset_a: OK
+offset_b: OK
+offset_c: OK
+offset_fp: OK
+store_load_ptrs: OK
+call_fp: OK
+All struct pointer member tests passed
