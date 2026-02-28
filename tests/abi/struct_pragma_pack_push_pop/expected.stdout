@@ -1,0 +1,6 @@
+default_align: OK
+pack_push_2: OK
+pack_push_4: OK
+pop_lifo_to_2: OK
+pack_reset: OK
+All pragma pack tests passed
