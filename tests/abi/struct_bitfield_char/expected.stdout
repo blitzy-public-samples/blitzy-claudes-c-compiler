@@ -1,0 +1,7 @@
+sizeof_struct: OK
+alignof_struct: OK
+store_load_all: OK
+byte_boundary: OK
+no_cross_byte_corrupt: OK
+adjacent_independence: OK
+All char bitfield tests passed
