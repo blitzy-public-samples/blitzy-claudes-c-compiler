@@ -1,0 +1,21 @@
+sizeof_char: OK
+sizeof_uchar: OK
+sizeof_short: OK
+sizeof_int: OK
+sizeof_uint: OK
+sizeof_long: OK
+sizeof_longlong: OK
+sizeof_float: OK
+sizeof_double: OK
+sizeof_ptr: OK
+return_char: OK
+return_uchar: OK
+return_short: OK
+return_int: OK
+return_uint: OK
+return_long: OK
+return_longlong: OK
+return_float: OK
+return_double: OK
+return_ptr: OK
+All single-field struct tests passed
