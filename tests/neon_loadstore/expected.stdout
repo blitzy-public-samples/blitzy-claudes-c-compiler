@@ -1,0 +1,8 @@
+vld1q_u32: deadbeef cafebabe 12345678 abcdef01
+vld1q_u8: 10 20 30 40 50 60 70 80 90 a0 b0 c0 d0 e0 f0 ff
+vld2q[0]: 1 2 3 4 5 6 7 8
+vld2q[1]: 100 200 300 400 500 600 700 800
+vld3q[0]: 00 03 06 09 0c 0f 12 15 18 1b 1e 21 24 27 2a 2d
+vld4q[0]: 00 04 08 0c 10 14 18 1c 20 24 28 2c 30 34 38 3c
+vst4q_u8: aa bb cc dd aa bb cc dd
+vld1q_f32: 1.5000 2.2500 3.1250 4.0625
