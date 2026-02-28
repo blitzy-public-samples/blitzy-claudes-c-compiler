@@ -1,0 +1,11 @@
+sizeof_union: OK
+alignof_union: OK
+members_overlap: OK
+store_char: OK
+store_int: OK
+store_double: OK
+return_union_char: OK
+return_union_int: OK
+return_union_double: OK
+type_punning: OK
+All union basic tests passed
