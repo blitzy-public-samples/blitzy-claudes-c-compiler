@@ -31,6 +31,7 @@
  */
 
 #include <stdio.h>
+#include <stddef.h>
 
 /* Struct definition at file scope — matches AAP: struct { short a; long b; } */
 struct PadShortLong {

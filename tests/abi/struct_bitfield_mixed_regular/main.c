@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <stddef.h>
 
 struct S {
     int a:5;

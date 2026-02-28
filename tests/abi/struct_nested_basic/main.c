@@ -26,6 +26,7 @@
  */
 
 #include <stdio.h>
+#include <stddef.h>
 
 struct Inner {
     int x;

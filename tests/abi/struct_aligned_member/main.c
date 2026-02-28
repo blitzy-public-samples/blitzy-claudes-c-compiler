@@ -37,6 +37,7 @@
  */
 
 #include <stdio.h>
+#include <stddef.h>
 
 /* Struct with per-member aligned attribute — THE KEY TEST */
 struct S {

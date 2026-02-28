@@ -29,6 +29,7 @@
  */
 
 #include <stdio.h>
+#include <stddef.h>
 
 /* Struct definition at file scope — matches AAP: struct { char a; double b; } */
 struct PadCharDouble {

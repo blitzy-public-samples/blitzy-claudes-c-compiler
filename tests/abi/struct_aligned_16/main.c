@@ -33,6 +33,7 @@
  */
 
 #include <stdio.h>
+#include <stddef.h>
 
 /* Struct 1: THE KEY TEST - struct-level aligned(16) with two int fields */
 struct __attribute__((aligned(16))) S_aligned16 {

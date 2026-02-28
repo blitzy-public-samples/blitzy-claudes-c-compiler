@@ -41,6 +41,7 @@
  */
 
 #include <stdio.h>
+#include <stddef.h>
 
 /* Three levels of nested structs as specified by the AAP */
 struct L1 { char a; };

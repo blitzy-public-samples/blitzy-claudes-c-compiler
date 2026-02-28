@@ -20,6 +20,7 @@
  */
 
 #include <stdio.h>
+#include <stddef.h>
 
 struct PadCharInt {
     char a;

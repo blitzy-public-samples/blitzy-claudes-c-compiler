@@ -30,6 +30,7 @@
  */
 
 #include <stdio.h>
+#include <stddef.h>
 
 struct PadCharShort {
     char a;

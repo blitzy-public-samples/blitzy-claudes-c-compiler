@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <stddef.h>
 
 /* Inner struct is packed: sizeof = 5, alignment = 1 */
 struct __attribute__((packed)) Inner {

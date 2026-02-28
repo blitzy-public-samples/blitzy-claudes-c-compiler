@@ -21,6 +21,7 @@
  */
 
 #include <stdio.h>
+#include <stddef.h>
 
 struct S {
     char a;

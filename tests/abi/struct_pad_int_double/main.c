@@ -28,6 +28,7 @@
  */
 
 #include <stdio.h>
+#include <stddef.h>
 
 /* Struct definition at file scope — matches AAP: struct { int a; double b; } */
 struct PadIntDouble {

@@ -19,6 +19,7 @@
  *            src/common/types.rs (type alignment computation)
  */
 #include <stdio.h>
+#include <stddef.h>
 
 struct Inner { double x; };
 struct Outer { char a; struct Inner b; };

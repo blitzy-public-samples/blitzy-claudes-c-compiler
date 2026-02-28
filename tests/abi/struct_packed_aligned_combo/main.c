@@ -51,6 +51,7 @@
  */
 
 #include <stdio.h>
+#include <stddef.h>
 
 /* Struct 1: Packed + Aligned combo (THE KEY TEST)
  * packed caps field alignment to 1, but aligned(8) on field b overrides it.

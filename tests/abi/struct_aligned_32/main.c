@@ -35,6 +35,7 @@
  */
 
 #include <stdio.h>
+#include <stddef.h>
 
 /* Struct 1: struct-level aligned(32) with various field types */
 struct __attribute__((aligned(32))) S_aligned32 {

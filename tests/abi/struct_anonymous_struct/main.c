@@ -25,6 +25,7 @@
  */
 
 #include <stdio.h>
+#include <stddef.h>
 
 /* Struct under test: anonymous struct (no tag, no member name) */
 struct S {

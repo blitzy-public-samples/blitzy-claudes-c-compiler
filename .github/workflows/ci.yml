@@ -16,6 +16,10 @@ on:
   pull_request:
     branches: [main]
 
+# Enforce least-privilege principle for GITHUB_TOKEN — only read access needed
+permissions:
+  contents: read
+
 jobs:
   # ---------------------------------------------------------------------------
   # Job 1: Build
@@ -28,13 +32,15 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4.1.7
 
       - name: Install Rust stable toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # master
+        with:
+          toolchain: stable
 
       - name: Cache Cargo registry and build artifacts
-        uses: actions/cache@v4
+        uses: actions/cache@0c45773b623bea8c8e75f6c82b208c3cf94d9d67 # v4.0.2
         with:
           path: |
             ~/.cargo/registry
@@ -66,7 +72,7 @@ jobs:
           echo "All 5 binary targets verified."
 
       - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
         with:
           name: ccc-binaries
           path: |
@@ -87,13 +93,15 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4.1.7
 
       - name: Install Rust stable toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # master
+        with:
+          toolchain: stable
 
       - name: Cache Cargo registry and build artifacts
-        uses: actions/cache@v4
+        uses: actions/cache@0c45773b623bea8c8e75f6c82b208c3cf94d9d67 # v4.0.2
         with:
           path: |
             ~/.cargo/registry
@@ -119,17 +127,17 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4.1.7
 
       - name: Install system packages
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc
+          sudo apt-get install -y gcc dash bison flex libreadline-dev zlib1g-dev
         env:
           DEBIAN_FRONTEND: noninteractive
 
       - name: Download build artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
         with:
           name: ccc-binaries
           path: target/release
@@ -181,14 +189,74 @@ jobs:
               continue
             fi
 
-            # Compile with ccc
-            compile_output=$(./target/release/ccc -o /tmp/ccc_test_bin "$test_dir/main.c" 2>&1) || {
-              echo "FAIL: $test_name (compilation failed)"
-              echo "  Compiler output: $compile_output"
-              FAIL=$((FAIL + 1))
-              ERRORS="${ERRORS}  FAIL: ${test_name} (compilation failed)\n"
-              continue
-            }
+            # Handle cross-link ABI tests (CCC <-> GCC cross-compiled objects)
+            if [ -f "$test_dir/callee.c" ]; then
+              case "$test_name" in
+                cross_ccc_caller_*)
+                  # CCC compiles main.c (caller), GCC compiles callee.c (callee)
+                  compile_output=$(./target/release/ccc -c -o /tmp/ccc_main.o "$test_dir/main.c" 2>&1) || {
+                    echo "FAIL: $test_name (CCC compilation of main.c failed)"
+                    echo "  Compiler output: $compile_output"
+                    FAIL=$((FAIL + 1))
+                    ERRORS="${ERRORS}  FAIL: ${test_name} (CCC compilation of main.c failed)\n"
+                    continue
+                  }
+                  compile_output=$(gcc -std=c11 -c -o /tmp/gcc_callee.o "$test_dir/callee.c" 2>&1) || {
+                    echo "FAIL: $test_name (GCC compilation of callee.c failed)"
+                    echo "  Compiler output: $compile_output"
+                    FAIL=$((FAIL + 1))
+                    ERRORS="${ERRORS}  FAIL: ${test_name} (GCC compilation of callee.c failed)\n"
+                    continue
+                  }
+                  compile_output=$(gcc -o /tmp/ccc_test_bin /tmp/ccc_main.o /tmp/gcc_callee.o 2>&1) || {
+                    echo "FAIL: $test_name (linking failed)"
+                    echo "  Linker output: $compile_output"
+                    FAIL=$((FAIL + 1))
+                    ERRORS="${ERRORS}  FAIL: ${test_name} (linking failed)\n"
+                    continue
+                  }
+                  ;;
+                cross_gcc_caller_*)
+                  # GCC compiles main.c (caller), CCC compiles callee.c (callee)
+                  compile_output=$(gcc -std=c11 -c -o /tmp/gcc_main.o "$test_dir/main.c" 2>&1) || {
+                    echo "FAIL: $test_name (GCC compilation of main.c failed)"
+                    echo "  Compiler output: $compile_output"
+                    FAIL=$((FAIL + 1))
+                    ERRORS="${ERRORS}  FAIL: ${test_name} (GCC compilation of main.c failed)\n"
+                    continue
+                  }
+                  compile_output=$(./target/release/ccc -c -o /tmp/ccc_callee.o "$test_dir/callee.c" 2>&1) || {
+                    echo "FAIL: $test_name (CCC compilation of callee.c failed)"
+                    echo "  Compiler output: $compile_output"
+                    FAIL=$((FAIL + 1))
+                    ERRORS="${ERRORS}  FAIL: ${test_name} (CCC compilation of callee.c failed)\n"
+                    continue
+                  }
+                  compile_output=$(gcc -o /tmp/ccc_test_bin /tmp/gcc_main.o /tmp/ccc_callee.o 2>&1) || {
+                    echo "FAIL: $test_name (linking failed)"
+                    echo "  Linker output: $compile_output"
+                    FAIL=$((FAIL + 1))
+                    ERRORS="${ERRORS}  FAIL: ${test_name} (linking failed)\n"
+                    continue
+                  }
+                  ;;
+                *)
+                  # Unknown cross-link pattern with callee.c — skip
+                  echo "SKIP: $test_name (unrecognized cross-link pattern)"
+                  SKIP=$((SKIP + 1))
+                  continue
+                  ;;
+              esac
+            else
+              # Standard single-file test — compile main.c with CCC
+              compile_output=$(./target/release/ccc -o /tmp/ccc_test_bin "$test_dir/main.c" 2>&1) || {
+                echo "FAIL: $test_name (compilation failed)"
+                echo "  Compiler output: $compile_output"
+                FAIL=$((FAIL + 1))
+                ERRORS="${ERRORS}  FAIL: ${test_name} (compilation failed)\n"
+                continue
+              }
+            fi
 
             # Execute the compiled binary and capture stdout and exit code
             actual_stdout=$(/tmp/ccc_test_bin 2>/dev/null) || true
@@ -245,7 +313,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4.1.7
 
       - name: Install system packages
         run: |
@@ -254,12 +322,13 @@ jobs:
             gcc-aarch64-linux-gnu \
             gcc-riscv64-linux-gnu \
             gcc-i686-linux-gnu \
-            qemu-user
+            qemu-user \
+            dash bison flex libreadline-dev zlib1g-dev
         env:
           DEBIAN_FRONTEND: noninteractive
 
       - name: Download build artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
         with:
           name: ccc-binaries
           path: target/release
@@ -311,14 +380,73 @@ jobs:
               continue
             fi
 
-            # Compile with ccc-arm
-            compile_output=$(./target/release/ccc-arm -o /tmp/ccc_test_bin "$test_dir/main.c" 2>&1) || {
-              echo "FAIL: $test_name (compilation failed)"
-              echo "  Compiler output: $compile_output"
-              FAIL=$((FAIL + 1))
-              ERRORS="${ERRORS}  FAIL: ${test_name} (compilation failed)\n"
-              continue
-            }
+            # Handle cross-link ABI tests (CCC <-> GCC cross-compiled objects)
+            if [ -f "$test_dir/callee.c" ]; then
+              case "$test_name" in
+                cross_ccc_caller_*)
+                  # CCC compiles main.c (caller), GCC compiles callee.c (callee)
+                  compile_output=$(./target/release/ccc-arm -c -o /tmp/ccc_main.o "$test_dir/main.c" 2>&1) || {
+                    echo "FAIL: $test_name (CCC compilation of main.c failed)"
+                    echo "  Compiler output: $compile_output"
+                    FAIL=$((FAIL + 1))
+                    ERRORS="${ERRORS}  FAIL: ${test_name} (CCC compilation of main.c failed)\n"
+                    continue
+                  }
+                  compile_output=$(aarch64-linux-gnu-gcc -std=c11 -c -o /tmp/gcc_callee.o "$test_dir/callee.c" 2>&1) || {
+                    echo "FAIL: $test_name (GCC compilation of callee.c failed)"
+                    echo "  Compiler output: $compile_output"
+                    FAIL=$((FAIL + 1))
+                    ERRORS="${ERRORS}  FAIL: ${test_name} (GCC compilation of callee.c failed)\n"
+                    continue
+                  }
+                  compile_output=$(aarch64-linux-gnu-gcc -o /tmp/ccc_test_bin /tmp/ccc_main.o /tmp/gcc_callee.o 2>&1) || {
+                    echo "FAIL: $test_name (linking failed)"
+                    echo "  Linker output: $compile_output"
+                    FAIL=$((FAIL + 1))
+                    ERRORS="${ERRORS}  FAIL: ${test_name} (linking failed)\n"
+                    continue
+                  }
+                  ;;
+                cross_gcc_caller_*)
+                  # GCC compiles main.c (caller), CCC compiles callee.c (callee)
+                  compile_output=$(aarch64-linux-gnu-gcc -std=c11 -c -o /tmp/gcc_main.o "$test_dir/main.c" 2>&1) || {
+                    echo "FAIL: $test_name (GCC compilation of main.c failed)"
+                    echo "  Compiler output: $compile_output"
+                    FAIL=$((FAIL + 1))
+                    ERRORS="${ERRORS}  FAIL: ${test_name} (GCC compilation of main.c failed)\n"
+                    continue
+                  }
+                  compile_output=$(./target/release/ccc-arm -c -o /tmp/ccc_callee.o "$test_dir/callee.c" 2>&1) || {
+                    echo "FAIL: $test_name (CCC compilation of callee.c failed)"
+                    echo "  Compiler output: $compile_output"
+                    FAIL=$((FAIL + 1))
+                    ERRORS="${ERRORS}  FAIL: ${test_name} (CCC compilation of callee.c failed)\n"
+                    continue
+                  }
+                  compile_output=$(aarch64-linux-gnu-gcc -o /tmp/ccc_test_bin /tmp/gcc_main.o /tmp/ccc_callee.o 2>&1) || {
+                    echo "FAIL: $test_name (linking failed)"
+                    echo "  Linker output: $compile_output"
+                    FAIL=$((FAIL + 1))
+                    ERRORS="${ERRORS}  FAIL: ${test_name} (linking failed)\n"
+                    continue
+                  }
+                  ;;
+                *)
+                  echo "SKIP: $test_name (unrecognized cross-link pattern)"
+                  SKIP=$((SKIP + 1))
+                  continue
+                  ;;
+              esac
+            else
+              # Standard single-file test — compile main.c with CCC
+              compile_output=$(./target/release/ccc-arm -o /tmp/ccc_test_bin "$test_dir/main.c" 2>&1) || {
+                echo "FAIL: $test_name (compilation failed)"
+                echo "  Compiler output: $compile_output"
+                FAIL=$((FAIL + 1))
+                ERRORS="${ERRORS}  FAIL: ${test_name} (compilation failed)\n"
+                continue
+              }
+            fi
 
             # Execute via QEMU with AArch64 sysroot
             actual_stdout=$(qemu-aarch64 -L /usr/aarch64-linux-gnu /tmp/ccc_test_bin 2>/dev/null) || true
@@ -406,14 +534,71 @@ jobs:
               continue
             fi
 
-            # Compile with ccc-riscv
-            compile_output=$(./target/release/ccc-riscv -o /tmp/ccc_test_bin "$test_dir/main.c" 2>&1) || {
-              echo "FAIL: $test_name (compilation failed)"
-              echo "  Compiler output: $compile_output"
-              FAIL=$((FAIL + 1))
-              ERRORS="${ERRORS}  FAIL: ${test_name} (compilation failed)\n"
-              continue
-            }
+            # Handle cross-link ABI tests (CCC <-> GCC cross-compiled objects)
+            if [ -f "$test_dir/callee.c" ]; then
+              case "$test_name" in
+                cross_ccc_caller_*)
+                  compile_output=$(./target/release/ccc-riscv -c -o /tmp/ccc_main.o "$test_dir/main.c" 2>&1) || {
+                    echo "FAIL: $test_name (CCC compilation of main.c failed)"
+                    echo "  Compiler output: $compile_output"
+                    FAIL=$((FAIL + 1))
+                    ERRORS="${ERRORS}  FAIL: ${test_name} (CCC compilation of main.c failed)\n"
+                    continue
+                  }
+                  compile_output=$(riscv64-linux-gnu-gcc -std=c11 -c -o /tmp/gcc_callee.o "$test_dir/callee.c" 2>&1) || {
+                    echo "FAIL: $test_name (GCC compilation of callee.c failed)"
+                    echo "  Compiler output: $compile_output"
+                    FAIL=$((FAIL + 1))
+                    ERRORS="${ERRORS}  FAIL: ${test_name} (GCC compilation of callee.c failed)\n"
+                    continue
+                  }
+                  compile_output=$(riscv64-linux-gnu-gcc -o /tmp/ccc_test_bin /tmp/ccc_main.o /tmp/gcc_callee.o 2>&1) || {
+                    echo "FAIL: $test_name (linking failed)"
+                    echo "  Linker output: $compile_output"
+                    FAIL=$((FAIL + 1))
+                    ERRORS="${ERRORS}  FAIL: ${test_name} (linking failed)\n"
+                    continue
+                  }
+                  ;;
+                cross_gcc_caller_*)
+                  compile_output=$(riscv64-linux-gnu-gcc -std=c11 -c -o /tmp/gcc_main.o "$test_dir/main.c" 2>&1) || {
+                    echo "FAIL: $test_name (GCC compilation of main.c failed)"
+                    echo "  Compiler output: $compile_output"
+                    FAIL=$((FAIL + 1))
+                    ERRORS="${ERRORS}  FAIL: ${test_name} (GCC compilation of main.c failed)\n"
+                    continue
+                  }
+                  compile_output=$(./target/release/ccc-riscv -c -o /tmp/ccc_callee.o "$test_dir/callee.c" 2>&1) || {
+                    echo "FAIL: $test_name (CCC compilation of callee.c failed)"
+                    echo "  Compiler output: $compile_output"
+                    FAIL=$((FAIL + 1))
+                    ERRORS="${ERRORS}  FAIL: ${test_name} (CCC compilation of callee.c failed)\n"
+                    continue
+                  }
+                  compile_output=$(riscv64-linux-gnu-gcc -o /tmp/ccc_test_bin /tmp/gcc_main.o /tmp/ccc_callee.o 2>&1) || {
+                    echo "FAIL: $test_name (linking failed)"
+                    echo "  Linker output: $compile_output"
+                    FAIL=$((FAIL + 1))
+                    ERRORS="${ERRORS}  FAIL: ${test_name} (linking failed)\n"
+                    continue
+                  }
+                  ;;
+                *)
+                  echo "SKIP: $test_name (unrecognized cross-link pattern)"
+                  SKIP=$((SKIP + 1))
+                  continue
+                  ;;
+              esac
+            else
+              # Standard single-file test — compile main.c with CCC
+              compile_output=$(./target/release/ccc-riscv -o /tmp/ccc_test_bin "$test_dir/main.c" 2>&1) || {
+                echo "FAIL: $test_name (compilation failed)"
+                echo "  Compiler output: $compile_output"
+                FAIL=$((FAIL + 1))
+                ERRORS="${ERRORS}  FAIL: ${test_name} (compilation failed)\n"
+                continue
+              }
+            fi
 
             # Execute via QEMU with RISC-V sysroot
             actual_stdout=$(qemu-riscv64 -L /usr/riscv64-linux-gnu /tmp/ccc_test_bin 2>/dev/null) || true
@@ -501,14 +686,71 @@ jobs:
               continue
             fi
 
-            # Compile with ccc-i686
-            compile_output=$(./target/release/ccc-i686 -o /tmp/ccc_test_bin "$test_dir/main.c" 2>&1) || {
-              echo "FAIL: $test_name (compilation failed)"
-              echo "  Compiler output: $compile_output"
-              FAIL=$((FAIL + 1))
-              ERRORS="${ERRORS}  FAIL: ${test_name} (compilation failed)\n"
-              continue
-            }
+            # Handle cross-link ABI tests (CCC <-> GCC cross-compiled objects)
+            if [ -f "$test_dir/callee.c" ]; then
+              case "$test_name" in
+                cross_ccc_caller_*)
+                  compile_output=$(./target/release/ccc-i686 -c -o /tmp/ccc_main.o "$test_dir/main.c" 2>&1) || {
+                    echo "FAIL: $test_name (CCC compilation of main.c failed)"
+                    echo "  Compiler output: $compile_output"
+                    FAIL=$((FAIL + 1))
+                    ERRORS="${ERRORS}  FAIL: ${test_name} (CCC compilation of main.c failed)\n"
+                    continue
+                  }
+                  compile_output=$(i686-linux-gnu-gcc -std=c11 -c -o /tmp/gcc_callee.o "$test_dir/callee.c" 2>&1) || {
+                    echo "FAIL: $test_name (GCC compilation of callee.c failed)"
+                    echo "  Compiler output: $compile_output"
+                    FAIL=$((FAIL + 1))
+                    ERRORS="${ERRORS}  FAIL: ${test_name} (GCC compilation of callee.c failed)\n"
+                    continue
+                  }
+                  compile_output=$(i686-linux-gnu-gcc -o /tmp/ccc_test_bin /tmp/ccc_main.o /tmp/gcc_callee.o 2>&1) || {
+                    echo "FAIL: $test_name (linking failed)"
+                    echo "  Linker output: $compile_output"
+                    FAIL=$((FAIL + 1))
+                    ERRORS="${ERRORS}  FAIL: ${test_name} (linking failed)\n"
+                    continue
+                  }
+                  ;;
+                cross_gcc_caller_*)
+                  compile_output=$(i686-linux-gnu-gcc -std=c11 -c -o /tmp/gcc_main.o "$test_dir/main.c" 2>&1) || {
+                    echo "FAIL: $test_name (GCC compilation of main.c failed)"
+                    echo "  Compiler output: $compile_output"
+                    FAIL=$((FAIL + 1))
+                    ERRORS="${ERRORS}  FAIL: ${test_name} (GCC compilation of main.c failed)\n"
+                    continue
+                  }
+                  compile_output=$(./target/release/ccc-i686 -c -o /tmp/ccc_callee.o "$test_dir/callee.c" 2>&1) || {
+                    echo "FAIL: $test_name (CCC compilation of callee.c failed)"
+                    echo "  Compiler output: $compile_output"
+                    FAIL=$((FAIL + 1))
+                    ERRORS="${ERRORS}  FAIL: ${test_name} (CCC compilation of callee.c failed)\n"
+                    continue
+                  }
+                  compile_output=$(i686-linux-gnu-gcc -o /tmp/ccc_test_bin /tmp/gcc_main.o /tmp/ccc_callee.o 2>&1) || {
+                    echo "FAIL: $test_name (linking failed)"
+                    echo "  Linker output: $compile_output"
+                    FAIL=$((FAIL + 1))
+                    ERRORS="${ERRORS}  FAIL: ${test_name} (linking failed)\n"
+                    continue
+                  }
+                  ;;
+                *)
+                  echo "SKIP: $test_name (unrecognized cross-link pattern)"
+                  SKIP=$((SKIP + 1))
+                  continue
+                  ;;
+              esac
+            else
+              # Standard single-file test — compile main.c with CCC
+              compile_output=$(./target/release/ccc-i686 -o /tmp/ccc_test_bin "$test_dir/main.c" 2>&1) || {
+                echo "FAIL: $test_name (compilation failed)"
+                echo "  Compiler output: $compile_output"
+                FAIL=$((FAIL + 1))
+                ERRORS="${ERRORS}  FAIL: ${test_name} (compilation failed)\n"
+                continue
+              }
+            fi
 
             # Execute via QEMU i386 with i686 sysroot
             actual_stdout=$(qemu-i386 -L /usr/i686-linux-gnu /tmp/ccc_test_bin 2>/dev/null) || true

@@ -44,6 +44,7 @@
  */
 
 #include <stdio.h>
+#include <stddef.h>
 
 /* Struct definition at file scope — matches AAP: struct { char a; int b; char c; double d; short e; } */
 struct PadMultiField {

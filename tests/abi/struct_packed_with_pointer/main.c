@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <stddef.h>
 
 struct __attribute__((packed)) S {
     char a;

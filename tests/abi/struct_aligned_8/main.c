@@ -33,6 +33,7 @@
  */
 
 #include <stdio.h>
+#include <stddef.h>
 
 /* Struct 1: THE KEY TEST - struct-level aligned(8) with char and short fields */
 struct __attribute__((aligned(8))) S_aligned8 {
