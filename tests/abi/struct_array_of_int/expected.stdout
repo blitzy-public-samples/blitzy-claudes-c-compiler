@@ -1,0 +1,8 @@
+sizeof_struct: OK
+offsetof_a: OK
+offsetof_arr: OK
+offsetof_b: OK
+arr_inherits_int_align: OK
+sizeof_arr_member: OK
+value_correctness: OK
+All struct array of int tests passed
