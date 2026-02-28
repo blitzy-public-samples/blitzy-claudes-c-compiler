@@ -1,0 +1,9 @@
+sizeof: OK
+sizeof_ld: OK
+offsetof_a: OK
+offsetof_b: OK
+offsetof_c: OK
+alignof: OK
+return_value: OK
+pass_value: OK
+All long double member tests passed
