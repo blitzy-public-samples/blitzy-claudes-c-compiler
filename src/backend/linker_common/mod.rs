@@ -123,7 +123,7 @@ pub use write::{write_elf64_shdr, write_elf64_phdr, write_elf64_phdr_at, align_u
 pub use args::parse_linker_args;
 
 // check.rs
-pub use check::check_undefined_symbols_elf64;
+pub use check::{check_undefined_symbols_elf64, check_nss_static_warning};
 
 // eh_frame.rs
 pub use eh_frame::{count_eh_frame_fdes, build_eh_frame_hdr};
