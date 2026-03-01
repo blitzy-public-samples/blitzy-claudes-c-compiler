@@ -2530,13 +2530,14 @@ fn try_parse_symbol_diff(expr: &str) -> Option<DataValue> {
     // Decompose sym_a into symbol+offset if it contains a '+' or '-' with a numeric suffix.
     // ELF relocations require separate symbol name and numeric addend, so composite
     // names like "cgroup_bpf_enabled_key+48" must be split into ("cgroup_bpf_enabled_key", 48).
+    // Uses parse_integer_expr to handle hex (0x30), octal (070), and binary (0b11) offsets.
     let (sym_a, extra_addend) = {
         let mut sym = sym_a_raw.clone();
         let mut addend = extra_addend;
         if let Some(plus_idx) = sym_a_raw.rfind('+') {
             let left = sym_a_raw[..plus_idx].trim();
             let right = sym_a_raw[plus_idx + 1..].trim();
-            if let Ok(val) = right.parse::<i64>() {
+            if let Ok(val) = asm_expr::parse_integer_expr(right) {
                 if !left.is_empty() {
                     addend += val;
                     sym = left.to_string();
@@ -2546,7 +2547,7 @@ fn try_parse_symbol_diff(expr: &str) -> Option<DataValue> {
             if minus_idx > 0 {
                 let left = sym_a_raw[..minus_idx].trim();
                 let right = sym_a_raw[minus_idx + 1..].trim();
-                if let Ok(val) = right.parse::<i64>() {
+                if let Ok(val) = asm_expr::parse_integer_expr(right) {
                     if !left.is_empty() {
                         addend -= val;
                         sym = left.to_string();
@@ -2652,4 +2653,154 @@ fn parse_data_value(s: &str) -> Result<i64, String> {
         return Ok(0);
     }
     asm_expr::parse_integer_expr(s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_org_directive_basic() {
+        let stmts = parse_asm(".org .Lventry_start + 128\n").unwrap();
+        let found = stmts.iter().any(|s| matches!(s,
+            AsmStatement::Directive(AsmDirective::Org { expr, fill })
+            if expr == ".Lventry_start + 128" && *fill == 0
+        ));
+        assert!(found, ".org should produce Org variant with fill=0");
+    }
+
+    #[test]
+    fn test_org_directive_with_fill() {
+        let stmts = parse_asm(".org 0x80, 0x90\n").unwrap();
+        let found = stmts.iter().any(|s| matches!(s,
+            AsmStatement::Directive(AsmDirective::Org { expr, fill })
+            if expr == "0x80" && *fill == 0x90
+        ));
+        assert!(found, ".org with fill byte should parse fill correctly");
+    }
+
+    #[test]
+    fn test_org_directive_dot_plus() {
+        let stmts = parse_asm(".org . + 32\n").unwrap();
+        let found = stmts.iter().any(|s| matches!(s,
+            AsmStatement::Directive(AsmDirective::Org { expr, fill })
+            if expr == ". + 32" && *fill == 0
+        ));
+        assert!(found, ".org . + 32 should parse correctly");
+    }
+
+    #[test]
+    fn test_casp_five_operands() {
+        let stmts = parse_asm("caspal x0, x1, x2, x3, [x11]\n").unwrap();
+        let found = stmts.iter().any(|s| {
+            if let AsmStatement::Instruction { mnemonic, operands, .. } = s {
+                mnemonic == "caspal"
+                    && operands.len() == 5
+                    && matches!(&operands[0], Operand::Reg(_))
+                    && matches!(&operands[1], Operand::Reg(_))
+                    && matches!(&operands[2], Operand::Reg(_))
+                    && matches!(&operands[3], Operand::Reg(_))
+                    && matches!(&operands[4], Operand::Mem { .. })
+            } else {
+                false
+            }
+        });
+        assert!(found, "CASP should parse 5 operands (4 Reg + 1 Mem)");
+    }
+
+    #[test]
+    fn test_movw_abs_g2_s_modifier() {
+        let stmts = parse_asm("movz x0, :abs_g2_s:.Lalias\n").unwrap();
+        let found = stmts.iter().any(|s| {
+            if let AsmStatement::Instruction { mnemonic, operands, .. } = s {
+                if mnemonic == "movz" {
+                    if let Some(Operand::Modifier { kind, symbol }) = operands.get(1) {
+                        return kind == "abs_g2_s" && symbol == ".Lalias";
+                    }
+                }
+            }
+            false
+        });
+        assert!(found, ":abs_g2_s: should produce Modifier operand");
+    }
+
+    #[test]
+    fn test_movk_abs_g0_nc_modifier() {
+        let stmts = parse_asm("movk x0, :abs_g0_nc:.Lalias\n").unwrap();
+        let found = stmts.iter().any(|s| {
+            if let AsmStatement::Instruction { mnemonic, operands, .. } = s {
+                if mnemonic == "movk" {
+                    if let Some(Operand::Modifier { kind, symbol }) = operands.get(1) {
+                        return kind == "abs_g0_nc" && symbol == ".Lalias";
+                    }
+                }
+            }
+            false
+        });
+        assert!(found, ":abs_g0_nc: should produce Modifier operand");
+    }
+
+    #[test]
+    fn test_symbol_diff_decimal_offset() {
+        let stmts = parse_asm(".quad cgroup_bpf_enabled_key+48 - .\n").unwrap();
+        let found = stmts.iter().any(|s| {
+            if let AsmStatement::Directive(AsmDirective::Quad(vals)) = s {
+                vals.iter().any(|v| matches!(v,
+                    DataValue::SymbolDiffAddend(a, b, addend)
+                    if a == "cgroup_bpf_enabled_key" && b == "." && *addend == 48
+                ))
+            } else {
+                false
+            }
+        });
+        assert!(found, "symbol+48 - . should produce SymbolDiffAddend");
+    }
+
+    #[test]
+    fn test_symbol_diff_hex_offset() {
+        let stmts = parse_asm(".quad my_symbol+0x30 - .\n").unwrap();
+        let found = stmts.iter().any(|s| {
+            if let AsmStatement::Directive(AsmDirective::Quad(vals)) = s {
+                vals.iter().any(|v| matches!(v,
+                    DataValue::SymbolDiffAddend(a, b, addend)
+                    if a == "my_symbol" && b == "." && *addend == 0x30
+                ))
+            } else {
+                false
+            }
+        });
+        assert!(found, "symbol+0x30 - . should decompose hex offset");
+    }
+
+    #[test]
+    fn test_plain_symbol_diff() {
+        let stmts = parse_asm(".long .LBB3 - .Ljt_0\n").unwrap();
+        let found = stmts.iter().any(|s| {
+            if let AsmStatement::Directive(AsmDirective::Long(vals)) = s {
+                vals.iter().any(|v| matches!(v,
+                    DataValue::SymbolDiff(a, b)
+                    if a == ".LBB3" && b == ".Ljt_0"
+                ))
+            } else {
+                false
+            }
+        });
+        assert!(found, "Plain symbol diff should produce SymbolDiff");
+    }
+
+    #[test]
+    fn test_symbol_offset_in_quad() {
+        let stmts = parse_asm(".quad my_func+8\n").unwrap();
+        let found = stmts.iter().any(|s| {
+            if let AsmStatement::Directive(AsmDirective::Quad(vals)) = s {
+                vals.iter().any(|v| matches!(v,
+                    DataValue::SymbolOffset(sym, off)
+                    if sym == "my_func" && *off == 8
+                ))
+            } else {
+                false
+            }
+        });
+        assert!(found, ".quad sym+8 should produce SymbolOffset");
+    }
 }
