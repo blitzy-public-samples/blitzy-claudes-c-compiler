@@ -504,6 +504,13 @@ very deep nesting). This ensures inner-loop temporaries receive registers
 ahead of straight-line code values, which is critical for compute-heavy
 loops like zlib's `deflate_slow`, `longest_match`, and `slide_hash`.
 
+Spill weight calculation uses loop-depth-aware heuristics derived from
+`loop_analysis.rs` to better prioritize variables that are heavily used
+in hot loops. The loop nesting depth information computed during liveness
+analysis feeds directly into the spill cost formula, so that values
+with frequent uses at deeper nesting levels incur a higher cost when
+spilled, making the allocator prefer to keep them in registers.
+
 ### Eligibility Filtering
 
 The allocator uses a whitelist approach: only values produced by simple,
@@ -755,7 +762,9 @@ cleanup if changes were made.
 **Phase 5 -- Tail call optimization + never-read store elimination**:
 Converts `call` + `ret` sequences into `jmp` (tail calls), then performs
 whole-function analysis removing stores to stack slots that are never
-subsequently loaded.
+subsequently loaded. The x86-64 tail call pass was the original reference
+implementation and has since been ported to all four backends (see
+[Tail Call Optimization (All Architectures)](#tail-call-optimization-all-architectures) below).
 
 **Phase 6 -- Unused callee-save elimination**: Removes prologue
 push/epilogue pop pairs for callee-saved registers that are never actually
@@ -767,18 +776,39 @@ gaps left by eliminated stores, reducing total frame size.
 ### Other Architectures
 
 - **AArch64**: Three-phase structure (8 rounds local, global passes once,
-  4 rounds cleanup). Local passes cover store/load elimination on
-  `[sp, #off]` pairs, redundant branch elimination, self-move elimination
-  (64-bit `mov xN, xN` only -- 32-bit `mov wN, wN` zeros upper bits and
-  is not safe to eliminate), move chain optimization (`mov A, B; mov C, A`
-  becomes `mov C, B`), branch-over-branch fusion (`b.cc .Lskip; b .target;
-  .Lskip:` becomes `b.!cc .target`), and move-immediate chain optimization.
-  Global passes include register copy propagation and dead store
-  elimination.
+  4 rounds cleanup) plus tail call optimization. Local passes cover
+  store/load elimination on `[sp, #off]` pairs, redundant branch
+  elimination, self-move elimination (64-bit `mov xN, xN` only -- 32-bit
+  `mov wN, wN` zeros upper bits and is not safe to eliminate), move chain
+  optimization (`mov A, B; mov C, A` becomes `mov C, B`),
+  branch-over-branch fusion (`b.cc .Lskip; b .target; .Lskip:` becomes
+  `b.!cc .target`), and move-immediate chain optimization. Global passes
+  include register copy propagation and dead store elimination. Tail call
+  optimization converts self-recursive `bl` + `ret` sequences into `b`
+  branch loops.
 - **RISC-V**: Follows the same three-phase structure (8/1/4 rounds)
-  adapted to its instruction set.
+  adapted to its instruction set, with an additional tail call optimization
+  pass that converts self-recursive `call` + `ret` sequences into
+  `j`/`tail` branch loops.
 - **i686**: Four-phase structure (8/1/4 rounds plus never-read store
-  elimination as a final phase) adapted to the 32-bit x86 instruction set.
+  elimination as a final phase) adapted to the 32-bit x86 instruction set,
+  with tail call optimization converting self-recursive `call` + `ret`
+  sequences into `jmp` loops.
+
+### Tail Call Optimization (All Architectures)
+
+Tail call optimization is implemented across all four backends. The optimizer
+detects self-recursive tail calls (a `call` to the current function immediately
+followed by `ret` or epilogue cleanup) and converts them to unconditional
+branches back to the function entry point, eliminating stack frame growth for
+recursive algorithms.
+
+| Architecture | Implementation | Mechanism |
+|-------------|---------------|-----------|
+| x86-64 | `x86/codegen/peephole/passes/tail_call.rs` | `call` + `ret` → `jmp` |
+| AArch64 | `arm/codegen/peephole.rs` | `bl` + `ret` → `b` (branch loop) |
+| RISC-V 64 | `riscv/codegen/peephole.rs` | `call` + `ret` → `j`/`tail` (branch loop) |
+| i686 | `i686/codegen/peephole.rs` | `call` + `ret` → `jmp` (jump loop) |
 
 ---
 
@@ -1175,6 +1205,27 @@ All four linker implementations handle:
 | i686 | Dynamic | R_386_32, PC32, PLT32, GOTPC, GOTOFF, GOT32X, GOT32 | 32-bit ELF, `.rel` (not `.rela`) |
 | AArch64 | Dynamic | ADR_PREL_PG_HI21, ADD_ABS_LO12_NC, CALL26, JUMP26, LDST*, ADR_GOT_PAGE | PLT/GOT, shared library output, IFUNC/IPLT, GLOB_DAT, copy relocations, TLS |
 | RISC-V | Dynamic | HI20, LO12_I, LO12_S, CALL, PCREL_HI20, GOT_HI20, BRANCH | Linker relaxation markers |
+
+### Linker Script Support
+
+The builtin linker supports linker scripts via the `-T script.ld` flag. A
+shared linker script parser in `linker_common/linker_script.rs` handles
+parsing and is integrated into all four architecture linkers. The following
+directives are supported:
+
+- **`SECTIONS { }`**: Controls output section layout and placement, with
+  wildcard input section matching (e.g., `*(.text)`).
+- **`MEMORY { }`**: Defines named memory regions with origin and length
+  attributes for section address assignment.
+- **`ENTRY(symbol)`**: Sets the executable entry point symbol.
+- **`PROVIDE(symbol = expr)`**: Defines a symbol only if it is not already
+  defined by any input object.
+- **`KEEP(...)`**: Prevents `--gc-sections` from discarding matched
+  sections, ensuring critical sections (e.g., `.init_array`) survive
+  garbage collection.
+
+This support is sufficient for Linux kernel linker scripts, which are the
+primary real-world use case for linker script functionality.
 
 ### Linker Files
 
