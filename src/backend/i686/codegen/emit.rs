@@ -1,12 +1,56 @@
 //! i686 (32-bit x86) code generator. Implements the ArchCodegen trait.
 //!
-//! Uses the cdecl calling convention (System V i386 ABI):
+//! # Calling Conventions
+//!
+//! ## cdecl (System V i386 ABI — default)
 //! - All arguments passed on the stack, pushed right-to-left
-//! - Return values: eax (32-bit), eax:edx (64-bit), st(0) for float/double/long double
-//! - Callee-saved: ebx, esi, edi, ebp
-//! - Caller-saved: eax, ecx, edx
-//! - No register-based argument passing (unlike x86-64 SysV ABI)
-//! - Stack aligned to 16 bytes at call sites (modern i386 ABI)
+//! - Caller cleans up the stack after the call (addl $N, %esp)
+//! - Return values:
+//!   - 32-bit integer/pointer: %eax
+//!   - 64-bit integer: %edx:%eax (high:low)
+//!   - float/double: %st(0) (x87 FPU top-of-stack)
+//!   - long double (80-bit): %st(0)
+//! - Callee-saved registers: %ebx, %esi, %edi, %ebp
+//! - Caller-saved registers: %eax, %ecx, %edx (plus x87/SSE state)
+//! - Stack alignment: 16-byte at call sites (modern i386 ABI / GCC default)
+//!   - 4-byte minimum alignment for legacy or -mpreferred-stack-boundary=2 code
+//!
+//! ## fastcall (__attribute__((fastcall)))
+//! - First two DWORD (≤32-bit integer/pointer) arguments in %ecx, %edx
+//! - Remaining arguments on the stack (right-to-left push order)
+//! - Callee pops its own stack arguments (caller does NOT addl $N, %esp)
+//! - Return values same as cdecl
+//! - float/double/struct arguments are NOT eligible for register passing
+//!
+//! ## regparm(N) (__attribute__((regparm(N))))
+//! - Up to N (1-3) integer/pointer arguments in %eax, %edx, %ecx (in that order)
+//! - Remaining arguments on the stack
+//! - Caller cleans up the stack (same as cdecl)
+//!
+//! ## Struct Return Convention
+//! - Structs/unions returned by value: caller allocates space and passes a
+//!   hidden pointer as the first stack argument (or first register arg with regparm/fastcall)
+//! - The callee copies the return value to the pointed-to memory and returns
+//!   the pointer in %eax
+//!
+//! ## Variadic Functions
+//! - All arguments passed on the stack (no register args even with regparm/fastcall)
+//! - va_start uses the address of the last named parameter to locate variadic args
+//! - va_arg: 4-byte aligned sequential reads from the stack
+//!
+//! ## Stack Frame Layout (when frame pointer is used)
+//! ```text
+//!     [higher addresses]
+//!     arg N          ← 8+4*(N-1)(%ebp)
+//!     ...
+//!     arg 1          ← 8(%ebp)
+//!     return address ← 4(%ebp)
+//!     saved %ebp     ← (%ebp)        ← %ebp points here
+//!     local vars     ← -4(%ebp) and below
+//!     callee-saved   ← pushed after %ebp if needed
+//!     [alignment pad]
+//!     [lower addresses] ← %esp
+//! ```
 
 use crate::delegate_to_impl;
 use crate::backend::traits::ArchCodegen;
@@ -640,6 +684,11 @@ impl I686Codegen {
     /// If equal, stores ecx:ebx to memory. If not, loads memory into edx:eax.
     /// We use a loop: load old value, compute new value, try cmpxchg8b.
     ///
+    /// Note: Memory ordering is handled by the caller in atomics.rs (which
+    /// emits fence instructions as needed). The LOCK prefix on cmpxchg8b
+    /// provides full sequential consistency on x86, so no additional
+    /// ordering instructions are required here.
+    ///
     /// Register plan:
     ///   esi = pointer to atomic variable (saved/restored)
     ///   edx:eax = old (expected) value
@@ -751,16 +800,20 @@ impl I686Codegen {
                 // Signed min via CAS loop: new = min(old, val) (64-bit)
                 let loop_label = format!(".Latomic_{}", self.state.next_label_id());
                 let skip_label = format!(".Latomic_skip_{}", self.state.next_label_id());
+                let use_op_label = format!(".Latomic_useop_{}", self.state.next_label_id());
                 emit!(self.state, "{}:", loop_label);
                 self.state.emit("    movl %eax, %ebx");
                 self.state.emit("    movl %edx, %ecx");
-                // Compare old (edx:eax) with val (on stack): if old <= val, keep old
-                self.state.emit("    cmpl 4(%esp), %edx"); // compare high words
-                emit!(self.state, "    jl {}", skip_label);
-                emit!(self.state, "    jg .+8");
-                self.state.emit("    cmpl (%esp), %eax");  // compare low words if high equal
-                emit!(self.state, "    jbe {}", skip_label);
-                // old > val: new = val
+                // 64-bit signed compare: old (edx:eax) vs val (on stack)
+                // if old <= val (signed), keep old in ecx:ebx
+                self.state.emit("    cmpl 4(%esp), %edx"); // compare high words (signed)
+                emit!(self.state, "    jl {}", skip_label);   // old_hi < val_hi → old < val → keep old
+                emit!(self.state, "    jg {}", use_op_label); // old_hi > val_hi → old > val → use operand
+                // High words equal: compare low words (unsigned)
+                self.state.emit("    cmpl (%esp), %eax");
+                emit!(self.state, "    jbe {}", skip_label);  // old_lo <= val_lo → old <= val → keep old
+                // old > val: use operand as new minimum
+                emit!(self.state, "{}:", use_op_label);
                 self.state.emit("    movl (%esp), %ebx");
                 self.state.emit("    movl 4(%esp), %ecx");
                 emit!(self.state, "{}:", skip_label);
@@ -771,16 +824,20 @@ impl I686Codegen {
                 // Signed max via CAS loop: new = max(old, val) (64-bit)
                 let loop_label = format!(".Latomic_{}", self.state.next_label_id());
                 let skip_label = format!(".Latomic_skip_{}", self.state.next_label_id());
+                let use_op_label = format!(".Latomic_useop_{}", self.state.next_label_id());
                 emit!(self.state, "{}:", loop_label);
                 self.state.emit("    movl %eax, %ebx");
                 self.state.emit("    movl %edx, %ecx");
-                // Compare old (edx:eax) with val (on stack): if old >= val, keep old
-                self.state.emit("    cmpl 4(%esp), %edx");
-                emit!(self.state, "    jg {}", skip_label);
-                emit!(self.state, "    jl .+8");
+                // 64-bit signed compare: old (edx:eax) vs val (on stack)
+                // if old >= val (signed), keep old in ecx:ebx
+                self.state.emit("    cmpl 4(%esp), %edx"); // compare high words (signed)
+                emit!(self.state, "    jg {}", skip_label);   // old_hi > val_hi → old > val → keep old
+                emit!(self.state, "    jl {}", use_op_label); // old_hi < val_hi → old < val → use operand
+                // High words equal: compare low words (unsigned)
                 self.state.emit("    cmpl (%esp), %eax");
-                emit!(self.state, "    jae {}", skip_label);
-                // old < val: new = val
+                emit!(self.state, "    jae {}", skip_label);  // old_lo >= val_lo → old >= val → keep old
+                // old < val: use operand as new maximum
+                emit!(self.state, "{}:", use_op_label);
                 self.state.emit("    movl (%esp), %ebx");
                 self.state.emit("    movl 4(%esp), %ecx");
                 emit!(self.state, "{}:", skip_label);
@@ -788,17 +845,23 @@ impl I686Codegen {
                 emit!(self.state, "    jne {}", loop_label);
             }
             AtomicRmwOp::UMin => {
-                // Unsigned min via CAS loop (64-bit)
+                // Unsigned min via CAS loop: new = min(old, val) (64-bit unsigned)
                 let loop_label = format!(".Latomic_{}", self.state.next_label_id());
                 let skip_label = format!(".Latomic_skip_{}", self.state.next_label_id());
+                let use_op_label = format!(".Latomic_useop_{}", self.state.next_label_id());
                 emit!(self.state, "{}:", loop_label);
                 self.state.emit("    movl %eax, %ebx");
                 self.state.emit("    movl %edx, %ecx");
-                self.state.emit("    cmpl 4(%esp), %edx");
-                emit!(self.state, "    jb {}", skip_label);
-                emit!(self.state, "    ja .+8");
+                // 64-bit unsigned compare: old (edx:eax) vs val (on stack)
+                // if old <= val (unsigned), keep old in ecx:ebx
+                self.state.emit("    cmpl 4(%esp), %edx"); // compare high words (unsigned)
+                emit!(self.state, "    jb {}", skip_label);   // old_hi < val_hi → old < val → keep old
+                emit!(self.state, "    ja {}", use_op_label); // old_hi > val_hi → old > val → use operand
+                // High words equal: compare low words (unsigned)
                 self.state.emit("    cmpl (%esp), %eax");
-                emit!(self.state, "    jbe {}", skip_label);
+                emit!(self.state, "    jbe {}", skip_label);  // old_lo <= val_lo → old <= val → keep old
+                // old > val: use operand as new minimum
+                emit!(self.state, "{}:", use_op_label);
                 self.state.emit("    movl (%esp), %ebx");
                 self.state.emit("    movl 4(%esp), %ecx");
                 emit!(self.state, "{}:", skip_label);
@@ -806,17 +869,23 @@ impl I686Codegen {
                 emit!(self.state, "    jne {}", loop_label);
             }
             AtomicRmwOp::UMax => {
-                // Unsigned max via CAS loop (64-bit)
+                // Unsigned max via CAS loop: new = max(old, val) (64-bit unsigned)
                 let loop_label = format!(".Latomic_{}", self.state.next_label_id());
                 let skip_label = format!(".Latomic_skip_{}", self.state.next_label_id());
+                let use_op_label = format!(".Latomic_useop_{}", self.state.next_label_id());
                 emit!(self.state, "{}:", loop_label);
                 self.state.emit("    movl %eax, %ebx");
                 self.state.emit("    movl %edx, %ecx");
-                self.state.emit("    cmpl 4(%esp), %edx");
-                emit!(self.state, "    ja {}", skip_label);
-                emit!(self.state, "    jb .+8");
+                // 64-bit unsigned compare: old (edx:eax) vs val (on stack)
+                // if old >= val (unsigned), keep old in ecx:ebx
+                self.state.emit("    cmpl 4(%esp), %edx"); // compare high words (unsigned)
+                emit!(self.state, "    ja {}", skip_label);   // old_hi > val_hi → old > val → keep old
+                emit!(self.state, "    jb {}", use_op_label); // old_hi < val_hi → old < val → use operand
+                // High words equal: compare low words (unsigned)
                 self.state.emit("    cmpl (%esp), %eax");
-                emit!(self.state, "    jae {}", skip_label);
+                emit!(self.state, "    jae {}", skip_label);  // old_lo >= val_lo → old >= val → keep old
+                // old < val: use operand as new maximum
+                emit!(self.state, "{}:", use_op_label);
                 self.state.emit("    movl (%esp), %ebx");
                 self.state.emit("    movl 4(%esp), %ecx");
                 emit!(self.state, "{}:", skip_label);
@@ -843,6 +912,10 @@ impl I686Codegen {
     /// cmpxchg8b: compares edx:eax with 8 bytes at memory.
     /// If equal, stores ecx:ebx to memory and sets ZF.
     /// If not equal, loads memory into edx:eax and clears ZF.
+    ///
+    /// Note: Memory ordering is handled by the caller in atomics.rs.
+    /// LOCK CMPXCHG8B is always strong (no LL/SC on x86); the `weak`
+    /// parameter in the C11 model is irrelevant here.
     pub(super) fn emit_atomic_cmpxchg_wide(&mut self, dest: &Value, ptr: &Operand, expected: &Operand,
                                 desired: &Operand, returns_bool: bool) {
         // Save callee-saved registers
@@ -904,6 +977,8 @@ impl I686Codegen {
     /// so we set edx:eax = ecx:ebx = 0 and execute cmpxchg8b. If the memory
     /// happens to be 0, the exchange writes 0 (no change). If non-zero,
     /// we get the current value in edx:eax without modifying memory.
+    ///
+    /// Note: Memory ordering is handled by the caller in atomics.rs.
     pub(super) fn emit_atomic_load_wide(&mut self, dest: &Value, ptr: &Operand) {
         self.state.emit("    pushl %ebx");
         self.esp_adjust += 4;
@@ -934,6 +1009,8 @@ impl I686Codegen {
     ///
     /// There is no single instruction for atomic 64-bit stores on i686, so we
     /// use a cmpxchg8b loop: read current value, try to replace with desired.
+    ///
+    /// Note: Memory ordering is handled by the caller in atomics.rs.
     pub(super) fn emit_atomic_store_wide(&mut self, ptr: &Operand, val: &Operand) {
         self.state.emit("    pushl %ebx");
         self.esp_adjust += 4;
