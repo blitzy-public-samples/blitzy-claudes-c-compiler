@@ -252,34 +252,58 @@ impl Driver {
                 "-P" => self.suppress_line_markers = true,
                 "-dM" => self.dump_defines = true,
 
-                // Optimization levels
+                // Pedantic mode: warn about GNU extensions and non-standard C behavior.
+                // Enables WarningKind::Pedantic warnings in the diagnostic engine.
+                // Placed before the -W* prefix handler so it matches exactly.
+                "-pedantic" => self.pedantic = true,
+
+                // Optimization levels: each level uses distinct pass configurations.
+                // -O0: skip all optimization passes and mem2reg (fastest compile)
+                // -O1: limited passes (const fold + copy prop + DCE + mem2reg)
+                // -O2: full pipeline (current behavior)
+                // -O3: full pipeline + loop unrolling + raised inlining threshold
+                // -Os: full pipeline, reduced inlining, no loop unrolling
+                // -Oz: full pipeline, no inlining, no loop unrolling
                 //
-                // IMPORTANT: All optimization levels internally use the same pipeline
-                // (opt_level=2). This is intentional — see the comment in passes/mod.rs
-                // for the full rationale. In short: having multiple optimization tiers
-                // is exponentially harder to test, and while the compiler is maturing,
-                // running all passes at every level maximizes test coverage and prevents
-                // hard-to-find bugs that only surface at specific tiers.
-                //
-                // The `optimize` and `optimize_size` booleans only control predefined
+                // The `optimize` and `optimize_size` booleans control predefined
                 // macros (__OPTIMIZE__, __OPTIMIZE_SIZE__), which build systems like
                 // the Linux kernel rely on.
                 "-O0" => {
-                    self.opt_level = 2; // internally always optimize
+                    self.opt_level = 0;
                     self.optimize = false;
                     self.optimize_size = false;
                     self.omit_frame_pointer = false;
                 }
-                "-O" | "-O1" | "-O2" | "-O3" => {
+                "-O" | "-O1" => {
+                    self.opt_level = 1;
+                    self.optimize = true;
+                    self.optimize_size = false;
+                    self.omit_frame_pointer = true;
+                }
+                "-O2" => {
                     self.opt_level = 2;
                     self.optimize = true;
                     self.optimize_size = false;
                     self.omit_frame_pointer = true;
                 }
-                "-Os" | "-Oz" => {
-                    self.opt_level = 2;
+                "-O3" => {
+                    self.opt_level = 3;
+                    self.optimize = true;
+                    self.optimize_size = false;
+                    self.omit_frame_pointer = true;
+                }
+                "-Os" => {
+                    self.opt_level = 2; // -Os uses the O2 pipeline with size adjustments
                     self.optimize = true;
                     self.optimize_size = true;
+                    self.size_opt_aggressive = false;
+                    self.omit_frame_pointer = true;
+                }
+                "-Oz" => {
+                    self.opt_level = 2; // -Oz uses the O2 pipeline with aggressive size minimization
+                    self.optimize = true;
+                    self.optimize_size = true;
+                    self.size_opt_aggressive = true;
                     self.omit_frame_pointer = true;
                 }
 
@@ -576,6 +600,21 @@ impl Driver {
                 "-nostdinc" => self.nostdinc = true,
                 "-nodefaultlibs" => {}
 
+                // Linker script: -T <path> or -T<path>
+                // Specifies a linker script for section placement, memory layout,
+                // and symbol generation. Used by embedded and kernel builds.
+                "-T" => {
+                    i += 1;
+                    if i < args.len() {
+                        self.linker_script_path = Some(std::path::PathBuf::from(&args[i]));
+                    } else {
+                        return Err("-T requires an argument".to_string());
+                    }
+                }
+                arg if arg.starts_with("-T") && arg.len() > 2 => {
+                    self.linker_script_path = Some(std::path::PathBuf::from(&arg[2..]));
+                }
+
                 // Language selection
                 "-x" => {
                     i += 1;
@@ -626,6 +665,10 @@ impl Driver {
                 "-pthread" => {
                     self.pthread = true;
                 }
+
+                // Trigraph processing: -trigraphs enables C11 trigraph sequences
+                // in preprocessing Phase 1. Off by default (matching modern GCC behavior).
+                "-trigraphs" => self.trigraphs_enabled = true,
 
                 // GCC --param flag: --param <name>=<value> or --param=<name>=<value>
                 // Used by nix CC wrapper for hardening flags like ssp-buffer-size=4
