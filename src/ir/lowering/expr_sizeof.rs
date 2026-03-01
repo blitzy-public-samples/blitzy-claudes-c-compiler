@@ -11,14 +11,34 @@ use crate::frontend::parser::ast::{
     TypeSpecifier,
     UnaryOp,
 };
-use crate::common::types::CType;
+use crate::common::types::{CType, IrType};
+use crate::ir::instruction::{Value, Instruction, Operand};
+use crate::ir::ops::IrBinOp;
+use crate::ir::constants::IrConst;
 use super::lower::Lowerer;
 
 impl Lowerer {
 
     /// Get the sizeof for an identifier expression.
+    ///
+    /// Returns a compile-time `usize` size. For VLA (variable-length array) locals,
+    /// this returns `0` as a sentinel value indicating that the size is not a
+    /// compile-time constant. Callers that need the actual runtime size of a VLA
+    /// variable should use `try_sizeof_expr_runtime()` first, which returns
+    /// `Some(Value)` containing the runtime-computed size when the expression
+    /// involves a VLA type.
     fn sizeof_identifier(&self, name: &str) -> usize {
         if let Some(info) = self.func_state.as_ref().and_then(|fs| fs.locals.get(name)) {
+            // VLA locals require runtime sizeof computation — return 0 as sentinel.
+            // The actual runtime size is stored in info.vla_size and is accessible
+            // via try_sizeof_expr_runtime() which generates appropriate IR.
+            if info.vla_size.is_some() {
+                if let Some(ref ct) = info.c_type {
+                    if ct.is_vla() {
+                        return 0;
+                    }
+                }
+            }
             if info.is_array || info.is_struct {
                 return info.alloc_size;
             }
@@ -495,6 +515,164 @@ impl Lowerer {
             CType::Array(elem_ct, _) => self.ctype_size(elem_ct).max(1),
             CType::Vector(elem_ct, _) => elem_ct.size().max(1),
             _ => self.sizeof_type(ts),
+        }
+    }
+
+    /// Attempt to compute `sizeof` at runtime for an expression that may involve
+    /// a VLA (variable-length array) type.
+    ///
+    /// When `sizeof` is applied to a VLA-typed expression or a variable with a VLA
+    /// type, the size is not a compile-time constant — it must be computed at runtime.
+    /// This method checks whether the given expression requires runtime sizeof
+    /// evaluation and, if so, returns a `Value` representing the runtime-computed size.
+    ///
+    /// Returns `Some(runtime_size_value)` if the sizeof requires runtime computation
+    /// (VLA case), or `None` if the size is a compile-time constant (callers should
+    /// fall back to `sizeof_expr`).
+    ///
+    /// # Runtime VLA sizeof computation
+    ///
+    /// For a VLA like `int arr[n]`, `sizeof(arr)` generates: `4 * n`
+    /// For multi-dimensional VLAs like `int arr[m][n]`, `sizeof(arr)` generates: `4 * m * n`
+    ///
+    /// The VLA dimension sizes are runtime Values stored during VLA declaration
+    /// lowering, accessible via `func_state.locals[name].vla_size` for local
+    /// VLA variables and `func_state.vla_typedef_sizes[name]` for VLA typedefs.
+    pub(super) fn try_sizeof_expr_runtime(&mut self, expr: &Expr) -> Option<Value> {
+        match expr {
+            // sizeof(identifier) — check if the identifier is a VLA local variable
+            // or a VLA typedef name with a pre-computed runtime size.
+            Expr::Identifier(name, _) => {
+                // Check local VLA variables for the pre-computed runtime sizeof
+                // value that was stored during VLA declaration lowering.
+                let vla_size = self.func_state.as_ref()
+                    .and_then(|fs| fs.locals.get(name))
+                    .and_then(|info| info.vla_size);
+                if let Some(sz) = vla_size {
+                    return Some(sz);
+                }
+
+                // Check VLA typedef names for pre-computed runtime sizeof.
+                // E.g., `typedef int vla_t[n]; sizeof(vla_t)` where the typedef
+                // size was recorded in func_state.vla_typedef_sizes during lowering.
+                let typedef_size = self.func_state.as_ref()
+                    .and_then(|fs| fs.vla_typedef_sizes.get(name).copied());
+                if let Some(sz) = typedef_size {
+                    return Some(sz);
+                }
+
+                // Check if the variable has a VLA CType with stride information
+                // but no pre-computed vla_size (e.g., VLA function parameters
+                // where only per-dimension strides are available). In this case,
+                // generate runtime multiplication IR: elem_size * dim1 * dim2 * ...
+                //
+                // Extract needed data first to avoid holding a borrow on self
+                // while emitting IR instructions.
+                let stride_info: Option<(usize, Vec<Value>)> = self.func_state.as_ref()
+                    .and_then(|fs| fs.locals.get(name))
+                    .and_then(|info| {
+                        let ct = info.c_type.as_ref()?;
+                        if !ct.is_vla() {
+                            return None;
+                        }
+                        // Collect runtime dimension strides into owned Vec
+                        let strides: Vec<Value> = info.vla_strides.iter()
+                            .filter_map(|s| *s)
+                            .collect();
+                        if strides.is_empty() {
+                            return None;
+                        }
+                        // Get element type's size (compile-time for non-VLA elements)
+                        let elem_size = match ct {
+                            CType::Vla(ref elem) => elem.size(),
+                            _ => 0,
+                        };
+                        if elem_size > 0 {
+                            Some((elem_size, strides))
+                        } else {
+                            None
+                        }
+                    });
+
+                if let Some((elem_size, strides)) = stride_info {
+                    // Generate runtime multiplication: elem_size * stride1 * stride2 * ...
+                    // Use IrType::I64 for 64-bit targets (pointer-width size_t values).
+                    let result_ty = IrType::I64;
+                    let elem_const = Operand::Const(IrConst::I64(elem_size as i64));
+                    let first_stride = strides[0];
+
+                    // First multiplication: elem_size * first_stride
+                    let mut size_val = self.fresh_value();
+                    self.emit(Instruction::BinOp {
+                        dest: size_val,
+                        op: IrBinOp::Mul,
+                        lhs: elem_const,
+                        rhs: Operand::Value(first_stride),
+                        ty: result_ty,
+                    });
+
+                    // Chain additional dimension multiplications for multi-dimensional VLAs
+                    for &stride in &strides[1..] {
+                        let new_val = self.fresh_value();
+                        self.emit(Instruction::BinOp {
+                            dest: new_val,
+                            op: IrBinOp::Mul,
+                            lhs: Operand::Value(size_val),
+                            rhs: Operand::Value(stride),
+                            ty: result_ty,
+                        });
+                        size_val = new_val;
+                    }
+
+                    return Some(size_val);
+                }
+
+                None
+            }
+            // For non-identifier expressions, check if the expression's CType
+            // indicates a VLA type requiring runtime sizeof computation.
+            _ => {
+                if let Some(ctype) = self.get_expr_ctype(expr) {
+                    return self.sizeof_vla_runtime(&ctype);
+                }
+                None
+            }
+        }
+    }
+
+    /// Check if a CType requires runtime sizeof computation due to VLA.
+    ///
+    /// When `sizeof` is applied to a `CType::Vla(elem)` type, the size cannot be
+    /// determined at compile time — it requires runtime evaluation by multiplying
+    /// the element size by the runtime dimension count.
+    ///
+    /// This method returns `Some(runtime_value)` if the type is a VLA and the
+    /// runtime size can be computed from available context, or `None` if either:
+    /// - The type is not a VLA (caller should use compile-time `sizeof_expr`), or
+    /// - The type is a VLA but the runtime dimension value is not available from
+    ///   the type alone (caller must use the variable-specific lookup path via
+    ///   `try_sizeof_expr_runtime`, which accesses `func_state.locals[name].vla_size`).
+    ///
+    /// For `CType::Vla(elem)`, the element type's size is known at compile time
+    /// (e.g., `sizeof(int) == 4`), but the array dimension count is a runtime value
+    /// stored per-variable, not embedded in the CType. This method therefore returns
+    /// `None` for standalone VLA types, serving primarily as a type-checking helper
+    /// that identifies VLA types requiring runtime computation.
+    pub(super) fn sizeof_vla_runtime(&mut self, vla_ctype: &CType) -> Option<Value> {
+        match vla_ctype {
+            CType::Vla(_elem) => {
+                // VLA size must be computed at runtime. The element type's size
+                // is known at compile time (e.g., sizeof(int) == 4), but the
+                // array dimension count is a runtime value stored per-variable
+                // in func_state.locals[name].vla_size during VLA declaration
+                // lowering. Since we only have the CType without variable context,
+                // we cannot complete the runtime computation here.
+                //
+                // Callers should use try_sizeof_expr_runtime() for the full
+                // expression-level lookup that accesses the stored VLA size.
+                None
+            }
+            _ => None,
         }
     }
 }
