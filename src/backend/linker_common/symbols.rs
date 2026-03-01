@@ -4,6 +4,8 @@
 //! shared across x86 and ARM 64-bit linkers. Also defines the set of
 //! linker-provided symbols and `__start_`/`__stop_` resolution logic.
 
+use std::collections::HashMap;
+
 use super::types::{Elf64Symbol, DynSymbol};
 
 /// Reference to one input section placed within an output section.
@@ -144,4 +146,112 @@ pub fn resolve_start_stop_symbols(
         }
     }
     result
+}
+
+// ── Linker script symbol resolution ─────────────────────────────────────
+//
+// These functions support `PROVIDE(symbol = expr)` and `ENTRY(symbol)`
+// directives from parsed linker scripts. They are called by each backend
+// linker after section layout but before the undefined-symbol check.
+
+/// Resolve `PROVIDE(symbol = expr)` directives from a linker script.
+///
+/// PROVIDE creates a symbol only if it is currently undefined in the global
+/// symbol table. If the symbol is already defined (from an object file or
+/// library), the PROVIDE directive is ignored — this is the standard GNU ld
+/// behavior specified in the linker script language.
+///
+/// `provide_symbols` is a list of (name, address) pairs from the parsed
+/// linker script. `globals` is the current global symbol table.
+///
+/// Returns a vector of (name, address) pairs for symbols that were actually
+/// provided (i.e., were previously undefined or absent). The caller is
+/// responsible for inserting these into the backend-specific global symbol
+/// table, since the actual `GlobalSymbol` struct varies per architecture.
+///
+/// # Examples
+///
+/// ```ignore
+/// // In a linker script: PROVIDE(__heap_start = 0x80000000);
+/// // If __heap_start is not defined by any object file, the linker
+/// // creates it at address 0x80000000.
+/// let provides = vec![("__heap_start".to_string(), 0x80000000)];
+/// let to_add = resolve_provide_symbols(&provides, &globals);
+/// // to_add contains ("__heap_start", 0x80000000) if not already defined
+/// ```
+pub fn resolve_provide_symbols<G: GlobalSymbolOps>(
+    provide_symbols: &[(String, u64)],
+    globals: &HashMap<String, G>,
+) -> Vec<(String, u64)> {
+    let mut result = Vec::new();
+    for (name, addr) in provide_symbols {
+        // PROVIDE only creates a symbol if it is not already defined.
+        // If the symbol exists in the global table and is defined (from an
+        // object file or library), the PROVIDE directive is silently ignored.
+        let already_defined = globals
+            .get(name.as_str())
+            .map_or(false, |sym| sym.is_defined());
+        if !already_defined {
+            result.push((name.clone(), *addr));
+        }
+    }
+    result
+}
+
+/// Resolve the `ENTRY(symbol)` directive from a linker script.
+///
+/// Returns the entry point address if the specified symbol is found and
+/// defined in the global symbol table. Falls back to checking
+/// `__start_<section>` / `__stop_<section>` patterns against the output
+/// section layout. Returns `None` if the symbol is not found or not defined.
+///
+/// The caller (per-architecture linker) uses this to override the default
+/// entry point address in the ELF header's `e_entry` field. If `None` is
+/// returned, the caller should emit a warning and fall back to the default
+/// entry point (typically `_start`).
+///
+/// # Examples
+///
+/// ```ignore
+/// // In a linker script: ENTRY(my_entry)
+/// if let Some(addr) = resolve_entry_symbol("my_entry", &globals, &sections) {
+///     elf_header.e_entry = addr;
+/// }
+/// ```
+pub fn resolve_entry_symbol<G: GlobalSymbolOps>(
+    entry_name: &str,
+    globals: &HashMap<String, G>,
+    output_sections: &[OutputSection],
+) -> Option<u64> {
+    // Check the global symbol table for the entry symbol.
+    if globals.contains_key(entry_name) {
+        if let Some(sym) = globals.get(entry_name) {
+            if sym.is_defined() {
+                return Some(sym.value());
+            }
+        }
+    }
+
+    // If not found (or not defined) in globals, check if the entry name
+    // matches a `__start_<section>` or `__stop_<section>` pattern and
+    // resolve against the output section layout.
+    if let Some(suffix) = entry_name.strip_prefix("__start_") {
+        if is_valid_c_identifier_for_section(suffix) {
+            for sec in output_sections {
+                if sec.name == suffix {
+                    return Some(sec.addr);
+                }
+            }
+        }
+    } else if let Some(suffix) = entry_name.strip_prefix("__stop_") {
+        if is_valid_c_identifier_for_section(suffix) {
+            for sec in output_sections {
+                if sec.name == suffix {
+                    return Some(sec.addr + sec.mem_size);
+                }
+            }
+        }
+    }
+
+    None
 }
