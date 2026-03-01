@@ -215,7 +215,7 @@ fn run_inline_phase(module: &mut IrModule, disabled: &str) {
     if disabled.contains("inline") {
         return;
     }
-    inline::run(module);
+    inline::run(module, inline::InlineConfig::default_o2());
 
     // After inlining, convert extern inline gnu_inline functions to declarations.
     // These function bodies were only needed for inlining; they must not be emitted
