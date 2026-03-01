@@ -178,10 +178,14 @@ impl Lowerer {
     /// Strip _Atomic and restrict qualifiers from a CType for compatibility purposes.
     /// Returns Some(inner) if a qualifier was stripped, None if no stripping needed.
     /// Per GCC semantics, __builtin_types_compatible_p ignores top-level qualifiers.
+    /// Recursively strips nested qualifiers (e.g., `_Atomic(Restrict(int))` → `int`),
+    /// consistent with `unwrap_qualifiers` which also recurses through qualifier layers.
     fn strip_ctype_qualifiers(ct: &CType) -> Option<CType> {
         match ct {
-            CType::Atomic(inner) => Some(inner.as_ref().clone()),
-            CType::Restrict(inner) => Some(inner.as_ref().clone()),
+            CType::Atomic(inner) | CType::Restrict(inner) => {
+                let stripped = inner.as_ref().clone();
+                Some(Self::strip_ctype_qualifiers(&stripped).unwrap_or(stripped))
+            }
             _ => None,
         }
     }

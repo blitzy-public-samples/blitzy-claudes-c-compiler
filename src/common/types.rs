@@ -1747,9 +1747,13 @@ impl CType {
     }
 
     /// Whether this is a pointer type (including arrays which decay to pointers,
-    /// and restrict-qualified pointers).
+    /// restrict-qualified pointers, and _Atomic-qualified pointer types).
     pub fn is_pointer_like(&self) -> bool {
-        matches!(self, CType::Pointer(_, _) | CType::Array(_, _) | CType::Restrict(_))
+        match self {
+            CType::Pointer(_, _) | CType::Array(_, _) | CType::Restrict(_) => true,
+            CType::Atomic(inner) => inner.is_pointer_like(),
+            _ => false,
+        }
     }
 
     /// Whether this is a function pointer type: Pointer(Function(_)),
