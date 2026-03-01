@@ -103,25 +103,34 @@ impl Lowerer {
         }
 
         // --- Compare-exchange ---
+        // GCC signature: __atomic_compare_exchange_n(ptr, expected, desired, weak, success_order, fail_order)
+        //   args[3] is the `weak` boolean: nonzero → weak CAS (may spuriously fail),
+        //   zero → strong CAS (guaranteed success if *ptr == *expected).
         if name == "__atomic_compare_exchange_n" && args.len() >= 6 {
             let ptr = self.lower_expr(&args[0]);
             let expected_ptr_op = self.lower_expr(&args[1]);
             let expected = self.load_through_ptr(expected_ptr_op, val_ty);
             let desired = self.lower_expr(&args[2]);
+            let weak = matches!(&args[3], Expr::IntLiteral(v, _) if *v != 0);
             return Some(self.emit_cmpxchg_with_writeback(
                 ptr, expected_ptr_op, expected, desired, val_ty,
                 Self::parse_ordering(&args[4]), Self::parse_ordering(&args[5]),
+                weak,
             ));
         }
+        // GCC signature: __atomic_compare_exchange(ptr, expected_ptr, desired_ptr, weak, success_order, fail_order)
+        //   args[3] is the `weak` boolean (same semantics as _n variant).
         if name == "__atomic_compare_exchange" && args.len() >= 6 {
             let ptr = self.lower_expr(&args[0]);
             let expected_ptr_op = self.lower_expr(&args[1]);
             let desired_ptr_op = self.lower_expr(&args[2]);
             let expected = self.load_through_ptr(expected_ptr_op, val_ty);
             let desired = self.load_through_ptr(desired_ptr_op, val_ty);
+            let weak = matches!(&args[3], Expr::IntLiteral(v, _) if *v != 0);
             return Some(self.emit_cmpxchg_with_writeback(
                 ptr, expected_ptr_op, expected, Operand::Value(desired), val_ty,
                 Self::parse_ordering(&args[4]), Self::parse_ordering(&args[5]),
+                weak,
             ));
         }
 
@@ -238,12 +247,21 @@ impl Lowerer {
     // Atomic helpers
     // -----------------------------------------------------------------------
 
-    /// Parse a memory ordering constant from an expression.
+    /// Parse a C11 memory ordering constant from an expression.
+    ///
+    /// C11 §7.17.3 memory_order values:
+    ///   0 → memory_order_relaxed  → Relaxed
+    ///   1 → memory_order_consume  → Consume (backends treat as Acquire per GCC/Clang convention)
+    ///   2 → memory_order_acquire  → Acquire
+    ///   3 → memory_order_release  → Release
+    ///   4 → memory_order_acq_rel  → AcqRel
+    ///   5 → memory_order_seq_cst  → SeqCst (default for non-literal expressions)
     pub(super) fn parse_ordering(arg: &Expr) -> AtomicOrdering {
         match arg {
             Expr::IntLiteral(v, _) => match *v as i32 {
                 0 => AtomicOrdering::Relaxed,
-                1 | 2 => AtomicOrdering::Acquire, // consume maps to acquire
+                1 => AtomicOrdering::Consume,
+                2 => AtomicOrdering::Acquire,
                 3 => AtomicOrdering::Release,
                 4 => AtomicOrdering::AcqRel,
                 _ => AtomicOrdering::SeqCst,
@@ -321,6 +339,11 @@ impl Lowerer {
     }
 
     /// Emit a compare-exchange with writeback to expected_ptr and equality comparison.
+    ///
+    /// When `weak` is true, the CAS may fail spuriously (useful on LL/SC architectures
+    /// like AArch64 and RISC-V where a single LL/SC attempt is cheaper than a retry loop).
+    /// C11 `atomic_compare_exchange_weak` maps to `weak: true`;
+    /// `atomic_compare_exchange_strong` maps to `weak: false`.
     fn emit_cmpxchg_with_writeback(
         &mut self,
         ptr: Operand,
@@ -330,12 +353,13 @@ impl Lowerer {
         ty: IrType,
         success_ordering: AtomicOrdering,
         failure_ordering: AtomicOrdering,
+        weak: bool,
     ) -> Operand {
         let old_val = self.fresh_value();
         self.emit(Instruction::AtomicCmpxchg {
             dest: old_val, ptr, expected: Operand::Value(expected), desired,
             ty, success_ordering, failure_ordering, returns_bool: false,
-            weak: false,
+            weak,
         });
         self.store_through_ptr(expected_ptr_op, Operand::Value(old_val), ty);
         let result = self.emit_cmp_val(IrCmpOp::Eq, Operand::Value(old_val), Operand::Value(expected), ty);
@@ -362,5 +386,89 @@ impl Lowerer {
             return Some(IrType::from_ctype(&inner));
         }
         None
+    }
+
+    // -----------------------------------------------------------------------
+    // Implicit _Atomic variable operation helpers
+    //
+    // These methods provide a clean interface for other lowering files (expr.rs,
+    // expr_assign.rs, lower.rs) to generate atomic IR instructions when accessing
+    // _Atomic-qualified variables. Centralizing atomic instruction generation
+    // here keeps the atomic logic in one place.
+    // -----------------------------------------------------------------------
+
+    /// Emit an atomic load for reading an `_Atomic`-qualified variable.
+    ///
+    /// C11 §6.2.6.1: Accessing an `_Atomic`-qualified lvalue performs an atomic load
+    /// with sequentially consistent ordering by default.
+    ///
+    /// Returns the loaded value.
+    pub(super) fn emit_atomic_load(
+        &mut self,
+        ptr: Operand,
+        ty: IrType,
+        ordering: AtomicOrdering,
+    ) -> Value {
+        let dest = self.fresh_value();
+        self.emit(Instruction::AtomicLoad { dest, ptr, ty, ordering });
+        dest
+    }
+
+    /// Emit an atomic store for writing to an `_Atomic`-qualified variable.
+    ///
+    /// C11 §6.2.6.1: Storing to an `_Atomic`-qualified lvalue performs an atomic store
+    /// with sequentially consistent ordering by default.
+    pub(super) fn emit_atomic_store(
+        &mut self,
+        ptr: Operand,
+        val: Operand,
+        ty: IrType,
+        ordering: AtomicOrdering,
+    ) {
+        self.emit(Instruction::AtomicStore { ptr, val, ty, ordering });
+    }
+
+    /// Emit an atomic read-modify-write for compound assignment on an `_Atomic` variable.
+    ///
+    /// C11 §6.5.16.2: Compound assignment on `_Atomic` variables (`+=`, `-=`, `&=`, `|=`, `^=`)
+    /// is performed as an atomic RMW operation. The caller maps the C operator to the
+    /// appropriate `AtomicRmwOp`:
+    ///   `+=` → Add, `-=` → Sub, `&=` → And, `|=` → Or, `^=` → Xor
+    ///
+    /// Returns the old value (before the operation). The caller can compute the new value
+    /// if needed (e.g., for the expression result of `x += 1` which yields the new value).
+    pub(super) fn emit_atomic_compound_assign(
+        &mut self,
+        ptr: Operand,
+        val: Operand,
+        op: AtomicRmwOp,
+        ty: IrType,
+        ordering: AtomicOrdering,
+    ) -> Value {
+        let dest = self.fresh_value();
+        self.emit(Instruction::AtomicRmw { dest, op, ptr, val, ty, ordering });
+        dest
+    }
+
+    /// Emit an atomic increment or decrement on an `_Atomic` variable.
+    ///
+    /// C11 §6.5.2.4, §6.5.3.1: `x++`, `++x`, `x--`, `--x` on `_Atomic int x` perform
+    /// an atomic fetch-add(1) or fetch-sub(1).
+    ///
+    /// Returns the old value (before the operation). For post-increment/decrement, the
+    /// returned old value is the expression result. For pre-increment/decrement, the caller
+    /// should add/subtract 1 from the returned value to get the expression result.
+    pub(super) fn emit_atomic_inc_dec(
+        &mut self,
+        ptr: Operand,
+        is_inc: bool,
+        ty: IrType,
+        ordering: AtomicOrdering,
+    ) -> Value {
+        let op = if is_inc { AtomicRmwOp::Add } else { AtomicRmwOp::Sub };
+        let one = Operand::Const(IrConst::from_i64(1, ty));
+        let dest = self.fresh_value();
+        self.emit(Instruction::AtomicRmw { dest, op, ptr, val: one, ty, ordering });
+        dest
     }
 }
