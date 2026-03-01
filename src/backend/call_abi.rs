@@ -9,6 +9,91 @@
 //! - `ParamClass`: callee-side classification (tracks stack offsets for loading params)
 //! - `classify_args_core`: single implementation of the classification algorithm
 //! - `classify_call_args` / `classify_params_full`: thin wrappers over the core
+//!
+//! # Architecture-Specific Calling Conventions
+//!
+//! This module handles four distinct calling conventions through a unified
+//! [`CallAbiConfig`] struct. Below is a reference summary of each ABI.
+//!
+//! ## x86-64 — SysV AMD64 ABI
+//!
+//! | Property              | Detail                                                      |
+//! |-----------------------|-------------------------------------------------------------|
+//! | GP argument registers | `rdi`, `rsi`, `rdx`, `rcx`, `r8`, `r9` (6 registers)       |
+//! | FP argument registers | `xmm0`–`xmm7` (8 registers)                                |
+//! | Integer return        | `rax` (64-bit), `rdx:rax` (128-bit)                         |
+//! | Float return          | `xmm0` (scalar float/double), `xmm0:xmm1` (struct SSE)     |
+//! | Struct return (sret)  | Hidden first argument in `rdi`; consumes a GP register slot |
+//! | Variadic convention   | Float count passed in `al`; float args in XMM registers     |
+//! | Stack alignment       | 16-byte aligned before `call` instruction                   |
+//! | Callee-saved regs     | `rbx`, `rbp`, `r12`–`r15`                                  |
+//! | Red zone              | 128 bytes below `rsp` (disabled with `-mno-red-zone`)       |
+//!
+//! The SysV AMD64 ABI classifies struct fields per-eightbyte into INTEGER or SSE
+//! classes, allowing small structs to be passed in a mix of GP and XMM registers.
+//! This is controlled by [`CallAbiConfig::use_sysv_struct_classification`].
+//!
+//! ## AArch64 — AAPCS64 (ARM 64-bit Procedure Call Standard)
+//!
+//! | Property              | Detail                                                            |
+//! |-----------------------|-------------------------------------------------------------------|
+//! | GP argument registers | `x0`–`x7` (8 registers)                                          |
+//! | FP argument registers | `v0`–`v7` / `d0`–`d7` (8 registers)                              |
+//! | Integer return        | `x0` (64-bit), `x0:x1` (128-bit)                                 |
+//! | Float return          | `d0` (scalar), `v0` (NEON vector)                                 |
+//! | Struct return (sret)  | Dedicated `x8` register (indirect result location); does NOT      |
+//! |                       | consume a GP argument slot — see [`CallAbiConfig::sret_uses_dedicated_reg`] |
+//! | Variadic convention   | Float args promoted to GP registers after the last named param    |
+//! | Stack alignment       | 16-byte aligned at public interfaces                              |
+//! | Callee-saved regs     | `x19`–`x28`, `x29` (frame pointer), `x30` (link register)        |
+//! | Large structs (>16B)  | Passed by reference: pointer in GP register or on stack           |
+//!
+//! AArch64 does not use per-eightbyte classification like x86-64. Small structs
+//! (≤16 bytes) are passed in 1–2 GP registers as opaque blobs. Large structs
+//! (>16 bytes) are passed by reference (pointer in a GP register), controlled by
+//! [`CallAbiConfig::large_struct_by_ref`].
+//!
+//! ## RISC-V 64 — LP64D ABI (Double-Float Calling Convention)
+//!
+//! | Property              | Detail                                                                  |
+//! |-----------------------|-------------------------------------------------------------------------|
+//! | GP argument registers | `a0`–`a7` (8 registers)                                                |
+//! | FP argument registers | `fa0`–`fa7` (8 registers)                                              |
+//! | Integer return        | `a0` (64-bit), `a0:a1` (128-bit)                                       |
+//! | Float return          | `fa0` (scalar float/double)                                             |
+//! | Struct return (sret)  | Hidden first argument in `a0`; consumes a GP register slot              |
+//! | Variadic convention   | Float args promoted to GP registers for variadic calls                  |
+//! | Stack alignment       | 16-byte aligned                                                         |
+//! | Callee-saved regs     | `s0` (frame pointer), `s1`, `s2`–`s11`, `ra` (return address)           |
+//! | Struct splitting      | 2×XLEN structs may split across last GP reg and stack                   |
+//! | F128 (long double)    | Passed in GP register pair (`a0:a1`-style), not FP registers            |
+//! | Even-align pairs      | 2×XLEN-aligned composites require even-aligned register pairs           |
+//!
+//! RISC-V LP64D uses hardware floating-point struct classification: small structs
+//! containing only float/double fields can be passed in FP registers. This is
+//! controlled by [`CallAbiConfig::use_riscv_float_struct_classification`].
+//! A 2-register struct may be split across the last GP register and the stack
+//! when [`CallAbiConfig::allow_struct_split_reg_stack`] is set.
+//!
+//! ## i686 — cdecl (ILP32, IA-32 System V ABI)
+//!
+//! | Property              | Detail                                                        |
+//! |-----------------------|---------------------------------------------------------------|
+//! | GP argument registers | 0 by default (all arguments on stack); up to 3 with           |
+//! |                       | `-mregparm=N` (`eax`, `edx`, `ecx`)                          |
+//! | FP argument registers | None (x87 floating-point stack)                               |
+//! | Integer return        | `eax` (32-bit), `edx:eax` (64-bit)                            |
+//! | Float return          | `st(0)` (x87 top-of-stack for float, double, long double)     |
+//! | Struct return (sret)  | Hidden first argument on stack; callee pops the sret pointer  |
+//! | Variadic convention   | All arguments on stack; no register promotion                 |
+//! | Stack alignment       | 4-byte minimum; 16-byte for SSE operations                    |
+//! | Callee-saved regs     | `ebx`, `esi`, `edi`, `ebp`                                   |
+//! | Long double (F128)    | 12 bytes (80-bit extended padded to 12), 4-byte aligned       |
+//!
+//! On i686, the default cdecl convention passes all arguments on the stack
+//! (right-to-left push order). The `-mregparm=N` extension allows up to 3
+//! integer arguments in GP registers. Floating-point values always use the
+//! x87 FPU stack for passing and returning.
 
 use crate::ir::reexports::{IrConst, IrFunction, Operand};
 use crate::common::types::IrType;
@@ -217,44 +302,140 @@ impl ParamClass {
 // ---------------------------------------------------------------------------
 
 /// ABI configuration for call argument classification.
+///
+/// Each field in this struct captures a specific dimension of ABI behavior that
+/// varies across the four supported architectures. The per-architecture configurations
+/// are constructed by each backend's codegen module and passed to
+/// [`classify_call_args`] (caller side) and [`classify_params_full`] (callee side).
+///
+/// ## Typical Per-Architecture Values
+///
+/// | Field                                   | x86-64 | AArch64 | RISC-V 64 | i686  |
+/// |-----------------------------------------|--------|---------|-----------|-------|
+/// | `max_int_regs`                          | 6      | 8       | 8         | 0–3*  |
+/// | `max_float_regs`                        | 8      | 8       | 8         | 0     |
+/// | `align_i128_pairs`                      | false  | true    | true      | false |
+/// | `f128_in_fp_regs`                       | false  | true    | false     | false |
+/// | `f128_in_gp_pairs`                      | false  | false   | true      | false |
+/// | `variadic_floats_in_gp`                 | false  | false** | true      | false |
+/// | `large_struct_by_ref`                   | false  | true    | true      | false |
+/// | `use_sysv_struct_classification`        | true   | false   | false     | false |
+/// | `use_riscv_float_struct_classification`  | false  | false   | true      | false |
+/// | `allow_struct_split_reg_stack`           | false  | false   | true      | false |
+/// | `align_struct_pairs`                     | false  | false   | true      | false |
+/// | `sret_uses_dedicated_reg`                | false  | true    | false     | false |
+///
+/// *i686 `max_int_regs` is 0 by default (cdecl); `-mregparm=N` raises it to 1–3.
+///
+/// **AArch64 variadic float promotion is handled by the caller setting
+/// `variadic_floats_in_gp = true` specifically for variadic call sites, rather than
+/// as a global ABI property. For non-variadic calls the flag is always false.
 pub struct CallAbiConfig {
-    /// Maximum GP registers for arguments (x86: 6, ARM/RISC-V: 8).
+    /// Maximum number of general-purpose (integer/pointer) registers available for
+    /// argument passing.
+    ///
+    /// - **x86-64 (SysV):** 6 — `rdi`, `rsi`, `rdx`, `rcx`, `r8`, `r9`
+    /// - **AArch64 (AAPCS64):** 8 — `x0`–`x7`
+    /// - **RISC-V 64 (LP64D):** 8 — `a0`–`a7`
+    /// - **i686 (cdecl):** 0 by default (all on stack); up to 3 (`eax`, `edx`, `ecx`)
+    ///   when `-mregparm=N` is active
     pub max_int_regs: usize,
-    /// Maximum FP registers for arguments (all: 8).
+    /// Maximum number of floating-point registers available for argument passing.
+    ///
+    /// - **x86-64:** 8 — `xmm0`–`xmm7` (SSE registers)
+    /// - **AArch64:** 8 — `v0`–`v7` / `d0`–`d7` (NEON/FP registers)
+    /// - **RISC-V 64:** 8 — `fa0`–`fa7` (hardware FP registers)
+    /// - **i686:** 0 — no FP argument registers; all floats passed on the x87 stack
     pub max_float_regs: usize,
-    /// Whether i128 register pairs must be even-aligned (ARM/RISC-V: true, x86: false).
+    /// Whether `__int128` / `i128` register pairs must start at an even-numbered
+    /// register index.
+    ///
+    /// - **AArch64:** true — AAPCS64 requires `__int128` in an even-aligned pair
+    /// - **RISC-V 64:** true — LP64D requires 2×XLEN-aligned pairs at even registers
+    /// - **x86-64:** false — SysV AMD64 has no pair alignment requirement
+    /// - **i686:** false — i128 always goes on stack (no GP argument registers by default)
     pub align_i128_pairs: bool,
-    /// Whether F128 uses FP registers (ARM: true) or always goes to stack/x87 (x86: true = stack).
-    /// On RISC-V, F128 goes in GP register pairs like i128.
+    /// Whether `long double` (`_Float128` / F128) values are passed in FP registers.
+    ///
+    /// - **AArch64:** true — F128 goes in Q-registers (`v0`–`v7`)
+    /// - **x86-64:** false — x87 `long double` is 80-bit extended; always on x87 stack
+    /// - **RISC-V 64:** false — F128 uses GP register pairs instead (see `f128_in_gp_pairs`)
+    /// - **i686:** false — x87 `long double` is 80-bit extended, 12-byte padded, on stack
     pub f128_in_fp_regs: bool,
-    /// Whether F128 uses GP register pairs (RISC-V: true).
+    /// Whether `long double` (F128) values are passed in GP register pairs (like `i128`).
+    ///
+    /// - **RISC-V 64:** true — `long double` is 128-bit IEEE 754 quad, passed in a GP pair
+    ///   (`a0:a1`-style), subject to even-alignment via `align_i128_pairs`
+    /// - **x86-64 / AArch64 / i686:** false
     pub f128_in_gp_pairs: bool,
-    /// Whether variadic float args must go in GP registers instead of FP regs (RISC-V: true, x86: false, ARM: false).
+    /// Whether floating-point arguments in variadic calls must be promoted to GP registers
+    /// instead of being placed in FP registers.
+    ///
+    /// - **RISC-V 64:** true — variadic float args are passed in `a0`–`a7` GP registers
+    /// - **AArch64:** conditionally true for variadic call sites (float args after the
+    ///   last named parameter are promoted to GP registers per AAPCS64 §6.4)
+    /// - **x86-64:** false — variadic floats go in XMM registers; the count is passed in `al`
+    /// - **i686:** false — all arguments already on stack regardless
     pub variadic_floats_in_gp: bool,
-    /// Whether large structs (>16 bytes) are passed by reference (pointer in GP reg).
-    /// ARM/RISC-V: true (pointer in GP reg or on stack), x86: false (copy to stack).
+    /// Whether large structs (>16 bytes) are passed by reference (pointer in a GP register)
+    /// rather than being copied directly onto the stack.
+    ///
+    /// - **AArch64:** true — caller copies the struct to temporary storage and passes a
+    ///   pointer in a GP register (or on the stack if GP registers are exhausted)
+    /// - **RISC-V 64:** true — same by-reference semantics as AArch64
+    /// - **x86-64:** false — large structs are classified as MEMORY and copied to the stack
+    /// - **i686:** false — structs are pushed onto the stack by value
     pub large_struct_by_ref: bool,
-    /// Whether to use SysV per-eightbyte struct classification (x86-64 only).
-    /// When true, struct eightbytes classified as SSE are passed in xmm registers.
+    /// Whether to use the SysV AMD64 per-eightbyte struct classification.
+    ///
+    /// When true, each 8-byte chunk ("eightbyte") of a small struct (≤16 bytes) is
+    /// independently classified as INTEGER or SSE based on its constituent fields.
+    /// This allows structs like `struct { double x; int y; }` to be passed with the
+    /// first half in an XMM register and the second half in a GP register.
+    ///
+    /// - **x86-64:** true — SysV AMD64 ABI §3.2.3 mandates per-eightbyte classification
+    /// - **AArch64 / RISC-V 64 / i686:** false — these ABIs treat small structs as
+    ///   opaque blobs in GP registers (or use the RISC-V float struct classification)
     pub use_sysv_struct_classification: bool,
     /// Whether to use RISC-V LP64D hardware floating-point struct classification.
-    /// When true, small structs with float/double fields are passed in FP registers
-    /// per the RISC-V psABI.
+    ///
+    /// When true, small structs containing only float/double fields (up to 2 members)
+    /// can be passed directly in FP registers (`fa0`–`fa7`). Mixed int+float structs
+    /// with exactly one of each can split across a GP and an FP register.
+    ///
+    /// - **RISC-V 64:** true — RISC-V psABI §2.1 "Hardware Floating-Point Calling Convention"
+    /// - **x86-64 / AArch64 / i686:** false
     pub use_riscv_float_struct_classification: bool,
-    /// Whether 2-register structs can be split across the last GP register and the stack.
-    /// RISC-V psABI: if a 2×XLEN struct has only 1 GP register left, the first XLEN bytes
-    /// go in that register and the rest go on the stack. ARM AAPCS64 does NOT split.
+    /// Whether a 2-register struct can be split across the last available GP register
+    /// and the stack when only 1 GP register remains.
+    ///
+    /// - **RISC-V 64:** true — psABI §2.1: the first XLEN bytes go in the last GP register
+    ///   and the remaining bytes are placed on the stack
+    /// - **AArch64:** false — AAPCS64 does not split composites; if insufficient registers
+    ///   remain, the entire struct goes on the stack
+    /// - **x86-64 / i686:** false — structs are either fully in registers or fully on stack
     pub allow_struct_split_reg_stack: bool,
-    /// Whether 2-register structs with >XLEN alignment must start at an even register.
-    /// RISC-V psABI: true (2×XLEN-aligned composites require even-aligned register pairs).
-    /// ARM AAPCS64: false (composite types never require even-aligned pairs; only
-    /// fundamental types like __int128 do, which is handled by align_i128_pairs).
+    /// Whether 2-register structs with alignment greater than XLEN must start at an
+    /// even-numbered register index.
+    ///
+    /// - **RISC-V 64:** true — psABI requires 2×XLEN-aligned composites to use
+    ///   even-aligned register pairs, mirroring the `__int128` alignment rule
+    /// - **AArch64:** false — AAPCS64 does not require even-aligned pairs for composite
+    ///   types; only fundamental types like `__int128` trigger even alignment (handled
+    ///   separately by `align_i128_pairs`)
+    /// - **x86-64 / i686:** false
     pub align_struct_pairs: bool,
-    /// Whether sret (struct return) uses a dedicated register (x8 on AArch64) instead of
-    /// consuming a regular GP argument register slot. When true, the classification must
-    /// promote the first stack-overflow GP argument to the freed GP register slot so that
-    /// caller and callee agree on where each argument lives.
-    /// ARM AAPCS64: true (sret pointer in x8), x86/RISC-V: false (sret in x0/a0).
+    /// Whether struct return (sret) uses a dedicated register that does NOT consume
+    /// a regular GP argument slot, freeing that slot for actual arguments.
+    ///
+    /// - **AArch64:** true — the sret pointer is passed in the dedicated `x8` register,
+    ///   so all 8 GP argument registers (`x0`–`x7`) remain available for arguments.
+    ///   When this is true, the classification must promote the first stack-overflow
+    ///   GP argument to the freed register slot so that caller and callee agree.
+    /// - **x86-64:** false — sret consumes `rdi` (the first GP argument register),
+    ///   leaving 5 GP registers for remaining arguments
+    /// - **RISC-V 64:** false — sret consumes `a0`, leaving 7 GP registers for arguments
+    /// - **i686:** false — sret is pushed on the stack (callee pops)
     pub sret_uses_dedicated_reg: bool,
 }
 
