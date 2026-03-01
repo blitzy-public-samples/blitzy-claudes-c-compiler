@@ -4067,17 +4067,19 @@ vqsub_s32(int32x2_t __a, int32x2_t __b)
     return __ret;
 }
 
-/* vqdmulhq_s16: saturating doubling multiply high half (128-bit) */
+/* vqdmulhq_s16: saturating doubling multiply high half (128-bit)
+   Formula per ARM ARM: result[i] = sat_s32(a[i] * b[i] * 2) >> 16
+   Uses long long to avoid int overflow for the -32768 * -32768 * 2 case
+   which produces 2147483648, exceeding INT32_MAX. */
 static __inline__ int16x8_t __attribute__((__always_inline__))
 vqdmulhq_s16(int16x8_t __a, int16x8_t __b)
 {
     int16x8_t __ret;
     for (int __i = 0; __i < 8; __i++) {
-        int __prod = (int)__a.__val[__i] * (int)__b.__val[__i] * 2;
-        int __result = __prod >> 16;
-        if (__result > 32767) __result = 32767;
-        else if (__result < -32768) __result = -32768;
-        __ret.__val[__i] = (short)__result;
+        long long __prod = (long long)__a.__val[__i] * (long long)__b.__val[__i] * 2;
+        if (__prod > 2147483647LL) __prod = 2147483647LL;
+        else if (__prod < -2147483648LL) __prod = -2147483648LL;
+        __ret.__val[__i] = (short)(__prod >> 16);
     }
     return __ret;
 }
@@ -4097,17 +4099,17 @@ vqdmulhq_s32(int32x4_t __a, int32x4_t __b)
     return __ret;
 }
 
-/* vqdmulh_s16: saturating doubling multiply high half (64-bit) */
+/* vqdmulh_s16: saturating doubling multiply high half (64-bit)
+   Uses long long to avoid int overflow for the -32768 * -32768 * 2 case. */
 static __inline__ int16x4_t __attribute__((__always_inline__))
 vqdmulh_s16(int16x4_t __a, int16x4_t __b)
 {
     int16x4_t __ret;
     for (int __i = 0; __i < 4; __i++) {
-        int __prod = (int)__a.__val[__i] * (int)__b.__val[__i] * 2;
-        int __result = __prod >> 16;
-        if (__result > 32767) __result = 32767;
-        else if (__result < -32768) __result = -32768;
-        __ret.__val[__i] = (short)__result;
+        long long __prod = (long long)__a.__val[__i] * (long long)__b.__val[__i] * 2;
+        if (__prod > 2147483647LL) __prod = 2147483647LL;
+        else if (__prod < -2147483648LL) __prod = -2147483648LL;
+        __ret.__val[__i] = (short)(__prod >> 16);
     }
     return __ret;
 }
