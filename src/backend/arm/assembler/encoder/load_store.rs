@@ -843,6 +843,44 @@ pub(crate) fn encode_cas(mnemonic: &str, operands: &[Operand]) -> Result<EncodeR
     Ok(EncodeResult::Word(word))
 }
 
+/// Encode CASP/CASPA/CASPAL/CASPL (Compare and Swap Pair).
+/// CASP Rs, Rs+1, Rt, Rt+1, [Xn|SP]
+/// Encoding: size 001000 0 L 1 Rs o0 11111 Rn Rt
+/// Key difference from CAS: bit 23 = 0 (CAS has bit 23 = 1)
+/// No byte/halfword variants — CASP only operates on 32-bit or 64-bit register pairs.
+/// Size encoding differs from CAS:
+///   size=0b00 → 32-bit pair (W registers)
+///   size=0b01 → 64-bit pair (X registers)
+pub(crate) fn encode_casp(mnemonic: &str, operands: &[Operand]) -> Result<EncodeResult, String> {
+    // CASP requires 5 operands: Rs, Rs+1, Rt, Rt+1, [Xn|SP]
+    if operands.len() < 5 {
+        return Err(format!("{} requires 5 operands (Rs, Rs+1, Rt, Rt+1, [Xn|SP])", mnemonic));
+    }
+    let (rs, is_64) = get_reg(operands, 0)?;
+    let (_rs1, _) = get_reg(operands, 1)?;   // Rs+1 (must be consecutive pair, validated by assembler user)
+    let (rt, _) = get_reg(operands, 2)?;
+    let (_rt1, _) = get_reg(operands, 3)?;    // Rt+1 (must be consecutive pair)
+    let rn = match operands.get(4) {
+        Some(Operand::Mem { base, .. }) => parse_reg_num(base).ok_or("casp: invalid base register")?,
+        _ => return Err(format!("{} requires memory operand [Xn|SP] as 5th operand", mnemonic)),
+    };
+    let mn = mnemonic.to_lowercase();
+    let suffix = mn.strip_prefix("casp").unwrap_or("");
+    // CASP size encoding (different from CAS!):
+    // W registers → size=0b00 (32-bit pair), X registers → size=0b01 (64-bit pair)
+    // No byte/halfword variants exist for CASP
+    let size = if is_64 { 0b01u32 } else { 0b00u32 };
+    // L bit (acquire): set for caspa, caspal
+    let l = if suffix.contains('a') { 1u32 } else { 0u32 };
+    // o0 bit (release): set for caspl, caspal
+    let o0 = if suffix.contains('l') { 1u32 } else { 0u32 };
+    // CASP encoding: size 001000 0 L 1 Rs o0 11111 Rn Rt
+    // Note: bit 23 = 0 distinguishes CASP from CAS (which has bit 23 = 1)
+    let word = (size << 30) | (0b001000 << 24) | (0 << 23) | (l << 22) | (1 << 21)
+        | (rs << 16) | (o0 << 15) | (0b11111 << 10) | (rn << 5) | rt;
+    Ok(EncodeResult::Word(word))
+}
+
 /// Encode SWP/SWPA/SWPAL/SWPL and byte/halfword variants (Swap).
 /// SWP Xs, Xt, [Xn]: size 111000 AR 1 Rs 1 000 00 Rn Rt
 /// Variants: swp, swpa, swpal, swpl, swpb, swpab, swpalb, swplb, swph, swpah, swpalh, swplh
