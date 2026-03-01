@@ -183,12 +183,35 @@ impl RiscvCodegen {
             }
             AtomicRmwOp::Min => {
                 // Signed min: new_field = smin(old_field, val_field)
-                // Extract old field, sign-extend, compare, select min, re-insert
+                // Extract old and val fields to low bits, sign-extend for
+                // correct signed comparison, select minimum, re-insert.
+                let skip_label = self.state.fresh_label("sw_min_skip");
                 self.state.emit("    and t3, t0, a4"); // t3 = old field (shifted)
-                self.state.emit("    srl t3, t3, a3"); // shift to low bits
+                self.state.emit("    srl t3, t3, a3"); // t3 = old field in low bits
                 self.state.emit("    srl t5, t2, a3"); // t5 = val field in low bits
-                self.state.emit("    blt t3, t5, 8");  // if old < val (signed), skip
-                self.state.emit("    mv t3, t5");      // else t3 = val
+                // Sign-extend both operands to full register width for blt
+                if bits == 8 {
+                    self.state.emit("    slli t3, t3, 56");
+                    self.state.emit("    srai t3, t3, 56");
+                    self.state.emit("    slli t5, t5, 56");
+                    self.state.emit("    srai t5, t5, 56");
+                } else {
+                    self.state.emit("    slli t3, t3, 48");
+                    self.state.emit("    srai t3, t3, 48");
+                    self.state.emit("    slli t5, t5, 48");
+                    self.state.emit("    srai t5, t5, 48");
+                }
+                // If old < val (signed), old is the min — keep t3
+                self.state.emit_fmt(format_args!("    blt t3, t5, {}", skip_label));
+                self.state.emit("    mv t3, t5"); // old >= val: use val as min
+                self.state.emit_fmt(format_args!("{}:", skip_label));
+                // Mask back to sub-word field width, shift into position, insert
+                if bits == 8 {
+                    self.state.emit("    andi t3, t3, 0xff");
+                } else {
+                    self.state.emit("    slli t3, t3, 48");
+                    self.state.emit("    srli t3, t3, 48");
+                }
                 self.state.emit("    sllw t3, t3, a3"); // shift back
                 self.state.emit("    and t3, t3, a4"); // mask to field
                 self.state.emit("    and t4, t0, a5"); // clear old field
@@ -196,11 +219,34 @@ impl RiscvCodegen {
             }
             AtomicRmwOp::Max => {
                 // Signed max: new_field = smax(old_field, val_field)
+                // Same as Min but keep old when old >= val (signed).
+                let skip_label = self.state.fresh_label("sw_max_skip");
                 self.state.emit("    and t3, t0, a4");
                 self.state.emit("    srl t3, t3, a3");
                 self.state.emit("    srl t5, t2, a3");
-                self.state.emit("    bgt t3, t5, 8");  // if old > val (signed), skip
-                self.state.emit("    mv t3, t5");
+                // Sign-extend both operands for correct signed comparison
+                if bits == 8 {
+                    self.state.emit("    slli t3, t3, 56");
+                    self.state.emit("    srai t3, t3, 56");
+                    self.state.emit("    slli t5, t5, 56");
+                    self.state.emit("    srai t5, t5, 56");
+                } else {
+                    self.state.emit("    slli t3, t3, 48");
+                    self.state.emit("    srai t3, t3, 48");
+                    self.state.emit("    slli t5, t5, 48");
+                    self.state.emit("    srai t5, t5, 48");
+                }
+                // If old >= val (signed), old is the max — keep t3
+                self.state.emit_fmt(format_args!("    bge t3, t5, {}", skip_label));
+                self.state.emit("    mv t3, t5"); // old < val: use val as max
+                self.state.emit_fmt(format_args!("{}:", skip_label));
+                // Mask back to sub-word field width, shift into position, insert
+                if bits == 8 {
+                    self.state.emit("    andi t3, t3, 0xff");
+                } else {
+                    self.state.emit("    slli t3, t3, 48");
+                    self.state.emit("    srli t3, t3, 48");
+                }
                 self.state.emit("    sllw t3, t3, a3");
                 self.state.emit("    and t3, t3, a4");
                 self.state.emit("    and t4, t0, a5");
@@ -208,11 +254,15 @@ impl RiscvCodegen {
             }
             AtomicRmwOp::UMin => {
                 // Unsigned min: new_field = umin(old_field, val_field)
+                // Zero-extended values (from srl) are correct for bltu.
+                let skip_label = self.state.fresh_label("sw_umin_skip");
                 self.state.emit("    and t3, t0, a4");
                 self.state.emit("    srl t3, t3, a3");
                 self.state.emit("    srl t5, t2, a3");
-                self.state.emit("    bltu t3, t5, 8"); // if old < val (unsigned), skip
-                self.state.emit("    mv t3, t5");
+                // If old < val (unsigned), old is the min — keep t3
+                self.state.emit_fmt(format_args!("    bltu t3, t5, {}", skip_label));
+                self.state.emit("    mv t3, t5"); // old >= val: use val as min
+                self.state.emit_fmt(format_args!("{}:", skip_label));
                 self.state.emit("    sllw t3, t3, a3");
                 self.state.emit("    and t3, t3, a4");
                 self.state.emit("    and t4, t0, a5");
@@ -220,11 +270,15 @@ impl RiscvCodegen {
             }
             AtomicRmwOp::UMax => {
                 // Unsigned max: new_field = umax(old_field, val_field)
+                // Zero-extended values (from srl) are correct for bgeu.
+                let skip_label = self.state.fresh_label("sw_umax_skip");
                 self.state.emit("    and t3, t0, a4");
                 self.state.emit("    srl t3, t3, a3");
                 self.state.emit("    srl t5, t2, a3");
-                self.state.emit("    bgtu t3, t5, 8"); // if old > val (unsigned), skip
-                self.state.emit("    mv t3, t5");
+                // If old >= val (unsigned), old is the max — keep t3
+                self.state.emit_fmt(format_args!("    bgeu t3, t5, {}", skip_label));
+                self.state.emit("    mv t3, t5"); // old < val: use val as max
+                self.state.emit_fmt(format_args!("{}:", skip_label));
                 self.state.emit("    sllw t3, t3, a3");
                 self.state.emit("    and t3, t3, a4");
                 self.state.emit("    and t4, t0, a5");
@@ -652,7 +706,7 @@ impl RiscvCodegen {
                 IrType::U16 => self.state.emit("    lhu t0, 0(t0)"),
                 _ => unreachable!("non-subword type in subword atomic load: {:?}", ty),
             }
-            if matches!(ordering, AtomicOrdering::Acquire | AtomicOrdering::AcqRel | AtomicOrdering::SeqCst) {
+            if matches!(ordering, AtomicOrdering::Acquire | AtomicOrdering::Consume | AtomicOrdering::AcqRel | AtomicOrdering::SeqCst) {
                 self.state.emit("    fence r, rw");
             }
         } else {
