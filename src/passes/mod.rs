@@ -22,6 +22,7 @@ pub(crate) mod ipcp;
 pub(crate) mod iv_strength_reduce;
 pub(crate) mod licm;
 pub(crate) mod loop_analysis;
+pub(crate) mod loop_unroll;
 pub(crate) mod narrow;
 mod resolve_asm;
 pub(crate) mod simplify;
