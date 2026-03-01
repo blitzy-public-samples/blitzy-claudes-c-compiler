@@ -69,6 +69,7 @@ mod args;
 mod check;
 mod eh_frame;
 mod gc_sections;
+pub(crate) mod linker_script;
 
 // ── Re-exports ──────────────────────────────────────────────────────────
 //
@@ -126,3 +127,9 @@ pub use eh_frame::{count_eh_frame_fdes, build_eh_frame_hdr};
 
 // gc_sections.rs
 pub use gc_sections::gc_collect_sections_elf64;
+
+// linker_script.rs
+pub use linker_script::{
+    LinkerScript, ScriptSection, InputPattern, MemoryRegion, ProvideSymbol, SymbolExpr,
+    parse_linker_script,
+};
