@@ -112,6 +112,15 @@ impl Lowerer {
             // lowered element-wise and never rely on this round-trip for sizing.
             // TODO: Vector subscript (v[i]) and unary ops (-v, ~v) not yet implemented
             CType::Vector(elem, _) => Self::ctype_to_type_spec(elem),
+            // _Atomic qualifier: strip and convert inner type (atomic not tracked in TypeSpecifier)
+            CType::Atomic(inner) => Self::ctype_to_type_spec(inner),
+            // restrict qualifier: strip and convert inner type (restrict not tracked in TypeSpecifier)
+            CType::Restrict(inner) => Self::ctype_to_type_spec(inner),
+            // VLA: convert to incomplete array with element type
+            CType::Vla(elem) => TypeSpecifier::Array(
+                Box::new(Self::ctype_to_type_spec(elem)),
+                None,
+            ),
         }
     }
 

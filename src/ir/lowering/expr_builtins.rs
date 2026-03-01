@@ -890,5 +890,11 @@ fn classify_ctype(ty: &CType) -> i64 {
         CType::Struct(_) => 12,      // record_type_class
         CType::Union(_) => 13,       // union_type_class
         CType::Vector(_, _) => 14,   // array_type_class (GCC classifies vectors here)
+        // _Atomic qualifier: classify based on inner type
+        CType::Atomic(inner) => classify_ctype(inner),
+        // restrict-qualified pointer: pointer_type_class
+        CType::Restrict(_) => 5,     // pointer_type_class
+        // VLA: decays to pointer like arrays
+        CType::Vla(_) => 5,          // pointer_type_class (VLA decays to pointer)
     }
 }
