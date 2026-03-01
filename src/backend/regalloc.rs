@@ -116,6 +116,13 @@ pub fn allocate_registers(
     // deflate_slow, longest_match, and slide_hash.
     let mut use_count: FxHashMap<u32, u64> = FxHashMap::default();
 
+    // Per-value maximum loop depth: tracks the deepest loop nesting of any
+    // block where a value is defined or used. This complements the per-use
+    // weighted count by adding a per-value spill cost factor — values touching
+    // deeper loops are more expensive to spill (each reload would execute
+    // inside the hot loop) and get higher priority for register allocation.
+    let mut value_max_depth: FxHashMap<u32, u32> = FxHashMap::default();
+
     // Precompute per-block loop weight: 10^depth, capped to avoid overflow.
     let block_loop_weight: Vec<u64> = liveness.block_loop_depth.iter()
         .map(|&d| {
@@ -150,6 +157,13 @@ pub fn allocate_registers(
             block_loop_weight[block_idx]
         } else {
             1
+        };
+
+        // Raw loop depth for this block — used for per-value max depth tracking.
+        let depth: u32 = if block_idx < liveness.block_loop_depth.len() {
+            liveness.block_loop_depth[block_idx]
+        } else {
+            0
         };
 
         for inst in &block.instructions {
@@ -225,16 +239,46 @@ pub fn allocate_registers(
                 _ => {}
             }
 
+            // Track maximum loop depth for the destination value. This factors
+            // into spill cost: a value defined inside a hot loop is more
+            // expensive to spill because its definition-site store would
+            // execute repeatedly inside the loop.
+            if depth > 0 {
+                if let Some(dest) = inst.dest() {
+                    let entry = value_max_depth.entry(dest.0).or_insert(0);
+                    if depth > *entry {
+                        *entry = depth;
+                    }
+                }
+            }
+
             // Count uses of operands, weighted by loop depth of the containing block.
             for_each_operand_in_instruction(inst, |op| {
                 if let Operand::Value(v) = op {
                     *use_count.entry(v.0).or_insert(0) += weight;
+                    // Track max loop depth for operand uses — if this use is
+                    // inside a deeper loop than any previous use, record it.
+                    // Spilling this value would require a reload at each such
+                    // use site inside the hot loop.
+                    if depth > 0 {
+                        let entry = value_max_depth.entry(v.0).or_insert(0);
+                        if depth > *entry {
+                            *entry = depth;
+                        }
+                    }
                 }
             });
         }
         for_each_operand_in_terminator(&block.terminator, |op| {
             if let Operand::Value(v) = op {
                 *use_count.entry(v.0).or_insert(0) += weight;
+                // Max loop depth tracking for terminator operands.
+                if depth > 0 {
+                    let entry = value_max_depth.entry(v.0).or_insert(0);
+                    if depth > *entry {
+                        *entry = depth;
+                    }
+                }
             }
         });
     }
@@ -247,7 +291,8 @@ pub fn allocate_registers(
 
     // Phase 1: Callee-saved registers for call-spanning values.
     let candidates = build_sorted_candidates(
-        &liveness, &eligible, &FxHashMap::default(), call_points, &use_count, Some(true),
+        &liveness, &eligible, &FxHashMap::default(), call_points, &use_count,
+        &value_max_depth, Some(true),
     );
 
     let num_regs = config.available_regs.len();
@@ -269,7 +314,8 @@ pub fn allocate_registers(
     // Phase 2: Caller-saved registers for non-call-spanning values.
     if !config.caller_saved_regs.is_empty() {
         let caller_candidates = build_sorted_candidates(
-            &liveness, &eligible, &assignments, call_points, &use_count, Some(false),
+            &liveness, &eligible, &assignments, call_points, &use_count,
+            &value_max_depth, Some(false),
         );
 
         let num_caller_regs = config.caller_saved_regs.len();
@@ -301,7 +347,8 @@ pub fn allocate_registers(
     // remaining callee-saved registers to these overflow values.
     {
         let spillover_candidates = build_sorted_candidates(
-            &liveness, &eligible, &assignments, call_points, &use_count, Some(false),
+            &liveness, &eligible, &assignments, call_points, &use_count,
+            &value_max_depth, Some(false),
         );
 
         for interval in &spillover_candidates {
@@ -499,14 +546,25 @@ fn spans_any_call(iv: &LiveInterval, call_points: &[u32]) -> bool {
 /// - `spans_call == Some(false)`: only intervals that do NOT span a call
 /// - `spans_call == None`: all eligible intervals
 ///
-/// Results are sorted by weighted use count (descending), with interval length
-/// as tiebreaker.
+/// Results are sorted by an enhanced spill cost score (descending) that combines:
+/// 1. **Weighted use count** (dominant factor): each use is weighted by 10^(loop depth)
+///    of its containing block, so uses inside hot loops count far more heavily.
+/// 2. **Max loop depth bonus** (complementary factor): an additive bonus of 10^(max_depth)
+///    for the deepest loop any def/use of the value touches. This ensures values living
+///    inside hot loops get priority even when their raw weighted use counts are similar
+///    to straight-line values — spilling such values would require reloading inside the
+///    loop body, which is disproportionately expensive.
+/// 3. **Max loop depth tiebreaker**: when enhanced scores are equal, prefer the value
+///    touching a deeper loop (more expensive to spill).
+/// 4. **Interval length tiebreaker**: longer intervals benefit more from register
+///    allocation (more instructions avoid stack access).
 fn build_sorted_candidates<'a>(
     liveness: &'a LivenessResult,
     eligible: &FxHashSet<u32>,
     already_assigned: &FxHashMap<u32, PhysReg>,
     call_points: &[u32],
     use_count: &FxHashMap<u32, u64>,
+    value_max_depth: &FxHashMap<u32, u32>,
     spans_call: Option<bool>,
 ) -> Vec<&'a LiveInterval> {
     let mut candidates: Vec<&LiveInterval> = liveness.intervals.iter()
@@ -521,9 +579,34 @@ fn build_sorted_candidates<'a>(
         .collect();
 
     candidates.sort_by(|a, b| {
-        let score_a = use_count.get(&a.value_id).copied().unwrap_or(1);
-        let score_b = use_count.get(&b.value_id).copied().unwrap_or(1);
+        // Compute the loop-depth spill cost bonus for a value. This follows
+        // the same 10^depth scale as block_loop_weight used for per-use
+        // weighting, capped at 10,000 to prevent overflow in the combined
+        // score. When all loops have depth 0, the bonus is 0 and scoring
+        // degrades to the original weighted-use-count-only behavior.
+        let depth_bonus = |vid: u32| -> u64 {
+            match value_max_depth.get(&vid).copied().unwrap_or(0) {
+                0 => 0,
+                1 => 10,
+                2 => 100,
+                3 => 1_000,
+                _ => 10_000, // capped to match block_loop_weight ceiling
+            }
+        };
+
+        let score_a = use_count.get(&a.value_id).copied().unwrap_or(1)
+            .saturating_add(depth_bonus(a.value_id));
+        let score_b = use_count.get(&b.value_id).copied().unwrap_or(1)
+            .saturating_add(depth_bonus(b.value_id));
+
         score_b.cmp(&score_a)
+            .then_with(|| {
+                // Tiebreaker: prefer values in deeper loops (more expensive
+                // to spill — each reload executes inside the hot loop).
+                let da = value_max_depth.get(&a.value_id).copied().unwrap_or(0);
+                let db = value_max_depth.get(&b.value_id).copied().unwrap_or(0);
+                db.cmp(&da)
+            })
             .then_with(|| {
                 let len_a = (a.end - a.start) as u64;
                 let len_b = (b.end - b.start) as u64;
