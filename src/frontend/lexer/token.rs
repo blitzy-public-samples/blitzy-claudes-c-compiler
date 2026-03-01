@@ -122,12 +122,19 @@ pub enum TokenKind {
     PragmaVisibilityPop,
 
     // Punctuation
+    // Note: C11 §6.4.6 digraphs are transparently mapped to their canonical
+    // token kinds by the lexer (scan.rs). Digraph spellings:
+    //   <: → LBracket ([)    :> → RBracket (])
+    //   <% → LBrace ({)      %> → RBrace (})
+    //   %: → Hash (#)         %:%: → HashHash (##)
+    // No separate digraph variants exist; the parser never distinguishes
+    // digraph-originated tokens from their primary punctuation forms.
     LParen,     // (
     RParen,     // )
-    LBrace,     // {
-    RBrace,     // }
-    LBracket,   // [
-    RBracket,   // ]
+    LBrace,     // { (also <% digraph)
+    RBrace,     // } (also %> digraph)
+    LBracket,   // [ (also <: digraph)
+    RBracket,   // ] (also :> digraph)
     Semicolon,  // ;
     Comma,      // ,
     Dot,        // .
@@ -172,8 +179,8 @@ pub enum TokenKind {
     GreaterEqual, // >=
     AmpAmp,     // &&
     PipePipe,   // ||
-    Hash,       // # (used in preprocessor)
-    HashHash,   // ## (used in preprocessor)
+    Hash,       // # (used in preprocessor; also %: digraph)
+    HashHash,   // ## (used in preprocessor; also %:%: digraph)
 
     // Special
     Eof,
