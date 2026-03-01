@@ -9,9 +9,17 @@ impl Preprocessor {
     pub(super) fn handle_pragma(&mut self, rest: &str) -> Option<String> {
         let rest = rest.trim();
         if rest == "once" {
-            // Mark the current file as "include once"
+            // Mark the current file as "include once" using device+inode for
+            // reliable deduplication across symlinks and hard links (C11 §6.10.6).
             if let Some(current_file) = self.include_stack.last() {
-                self.pragma_once_files.insert(current_file.clone());
+                use std::os::unix::fs::MetadataExt;
+                if let Ok(metadata) = std::fs::metadata(current_file) {
+                    self.pragma_once_inodes.insert((metadata.dev(), metadata.ino()));
+                } else {
+                    // Fallback to path-based tracking when metadata is unavailable
+                    // (e.g., virtual filesystems or permission errors).
+                    self.pragma_once_files.insert(current_file.clone());
+                }
             }
             return None;
         }
@@ -163,12 +171,18 @@ impl Preprocessor {
     }
 
     /// Handle #pragma pack directives and emit synthetic tokens for the parser.
+    ///
+    /// Also maintains the preprocessor-side pack alignment stack for _Pragma
+    /// desugaring coordination and future preprocessor-level queries.
+    ///
     /// Supported forms:
-    ///   #pragma pack(N)        - set alignment to N
-    ///   #pragma pack()         - reset to default alignment
-    ///   #pragma pack(push, N)  - push current and set to N
-    ///   #pragma pack(push)     - push current (no change)
-    ///   #pragma pack(pop)      - restore previous alignment
+    ///   #pragma pack(N)                   - set alignment to N
+    ///   #pragma pack()                    - reset to default alignment
+    ///   #pragma pack(push, N)             - push current and set to N
+    ///   #pragma pack(push)                - push current (no change)
+    ///   #pragma pack(push, identifier, N) - GCC extension: push with named id, set to N
+    ///   #pragma pack(pop)                 - restore previous alignment
+    ///   #pragma pack(pop, identifier)     - GCC extension: pop with named id
     fn handle_pragma_pack(&mut self, content: &str) -> Option<String> {
         let content = content.trim();
         // Must start with '('
@@ -178,33 +192,280 @@ impl Preprocessor {
         let inner = content.trim_start_matches('(').trim_end_matches(')').trim();
 
         if inner.is_empty() {
-            // #pragma pack() - reset
+            // #pragma pack() - reset to default alignment
+            self.current_pack_alignment = None;
             return Some("__ccc_pack_reset ;\n".to_string());
         }
 
-        // Check for push/pop
-        if inner == "pop" {
-            return Some("__ccc_pack_pop ;\n".to_string());
+        // Check for pop (with optional named identifier — GCC/MSVC extension).
+        // The identifier after pop is used by MSVC for targeted named pop;
+        // GCC and CCC simply pop the top of the alignment stack regardless.
+        if inner.starts_with("pop") {
+            let after_pop = inner["pop".len()..].trim();
+            if after_pop.is_empty() || after_pop.starts_with(',') {
+                // #pragma pack(pop) or #pragma pack(pop, identifier)
+                self.current_pack_alignment = self.pack_alignment_stack.pop().unwrap_or(None);
+                return Some("__ccc_pack_pop ;\n".to_string());
+            }
         }
 
         if let Some(rest) = inner.strip_prefix("push") {
             let rest = rest.trim().trim_start_matches(',').trim();
             if rest.is_empty() {
                 // #pragma pack(push) - push current alignment, don't change
+                self.pack_alignment_stack.push(self.current_pack_alignment);
                 return Some("__ccc_pack_push_only ;\n".to_string());
             }
             // #pragma pack(push, N) - push current and set to N (0 means default)
             if let Ok(n) = rest.parse::<usize>() {
+                self.pack_alignment_stack.push(self.current_pack_alignment);
+                self.current_pack_alignment = if n == 0 { None } else { Some(n) };
                 return Some(format!("__ccc_pack_push_{} ;\n", n));
+            }
+            // GCC extension: #pragma pack(push, identifier, N) — push with named
+            // identifier. The identifier is used by MSVC for named pop targeting;
+            // GCC/CCC ignores the identifier and treats this as push + set N.
+            if let Some(comma_pos) = rest.find(',') {
+                let after_comma = rest[comma_pos + 1..].trim();
+                if let Ok(n) = after_comma.parse::<usize>() {
+                    self.pack_alignment_stack.push(self.current_pack_alignment);
+                    self.current_pack_alignment = if n == 0 { None } else { Some(n) };
+                    return Some(format!("__ccc_pack_push_{} ;\n", n));
+                }
             }
             return None;
         }
 
-        // #pragma pack(N) - set alignment
+        // #pragma pack(N) - set alignment (0 means reset to default)
         if let Ok(n) = inner.parse::<usize>() {
+            self.current_pack_alignment = if n == 0 { None } else { Some(n) };
             return Some(format!("__ccc_pack_set_{} ;\n", n));
         }
 
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::frontend::preprocessor::pipeline::Preprocessor;
+
+    /// Helper: call handle_pragma on a fresh or provided Preprocessor.
+    fn pragma(pp: &mut Preprocessor, rest: &str) -> Option<String> {
+        pp.handle_pragma(rest)
+    }
+
+    // ---- Existing #pragma pack forms (regression) ----
+
+    #[test]
+    fn test_pack_set_n() {
+        let mut pp = Preprocessor::new();
+        assert_eq!(pragma(&mut pp, "pack(4)"), Some("__ccc_pack_set_4 ;\n".to_string()));
+        assert_eq!(pragma(&mut pp, "pack(1)"), Some("__ccc_pack_set_1 ;\n".to_string()));
+        assert_eq!(pragma(&mut pp, "pack(16)"), Some("__ccc_pack_set_16 ;\n".to_string()));
+    }
+
+    #[test]
+    fn test_pack_reset() {
+        let mut pp = Preprocessor::new();
+        assert_eq!(pragma(&mut pp, "pack()"), Some("__ccc_pack_reset ;\n".to_string()));
+    }
+
+    #[test]
+    fn test_pack_push_only() {
+        let mut pp = Preprocessor::new();
+        assert_eq!(pragma(&mut pp, "pack(push)"), Some("__ccc_pack_push_only ;\n".to_string()));
+    }
+
+    #[test]
+    fn test_pack_push_n() {
+        let mut pp = Preprocessor::new();
+        assert_eq!(pragma(&mut pp, "pack(push, 2)"), Some("__ccc_pack_push_2 ;\n".to_string()));
+        assert_eq!(pragma(&mut pp, "pack(push, 8)"), Some("__ccc_pack_push_8 ;\n".to_string()));
+    }
+
+    #[test]
+    fn test_pack_pop() {
+        let mut pp = Preprocessor::new();
+        assert_eq!(pragma(&mut pp, "pack(pop)"), Some("__ccc_pack_pop ;\n".to_string()));
+    }
+
+    // ---- New GCC extension forms ----
+
+    #[test]
+    fn test_pack_push_identifier_n() {
+        let mut pp = Preprocessor::new();
+        // #pragma pack(push, myid, 1) should emit __ccc_pack_push_1
+        assert_eq!(pragma(&mut pp, "pack(push, myid, 1)"), Some("__ccc_pack_push_1 ;\n".to_string()));
+        // Different identifier and value
+        assert_eq!(pragma(&mut pp, "pack(push, another_id, 8)"), Some("__ccc_pack_push_8 ;\n".to_string()));
+    }
+
+    #[test]
+    fn test_pack_pop_identifier() {
+        let mut pp = Preprocessor::new();
+        // #pragma pack(pop, myid) should emit __ccc_pack_pop
+        assert_eq!(pragma(&mut pp, "pack(pop, myid)"), Some("__ccc_pack_pop ;\n".to_string()));
+        assert_eq!(pragma(&mut pp, "pack(pop, other)"), Some("__ccc_pack_pop ;\n".to_string()));
+    }
+
+    // ---- Pack alignment stack tracking ----
+
+    #[test]
+    fn test_pack_stack_set_tracks_alignment() {
+        let mut pp = Preprocessor::new();
+        assert_eq!(pp.current_pack_alignment, None);
+        pragma(&mut pp, "pack(4)");
+        assert_eq!(pp.current_pack_alignment, Some(4));
+        assert!(pp.pack_alignment_stack.is_empty(), "set does not push to stack");
+    }
+
+    #[test]
+    fn test_pack_stack_reset_clears_alignment() {
+        let mut pp = Preprocessor::new();
+        pragma(&mut pp, "pack(4)");
+        assert_eq!(pp.current_pack_alignment, Some(4));
+        pragma(&mut pp, "pack()");
+        assert_eq!(pp.current_pack_alignment, None);
+    }
+
+    #[test]
+    fn test_pack_stack_push_pop_cycle() {
+        let mut pp = Preprocessor::new();
+
+        // Set initial alignment to 4
+        pragma(&mut pp, "pack(4)");
+        assert_eq!(pp.current_pack_alignment, Some(4));
+
+        // Push current (4), set to 2
+        pragma(&mut pp, "pack(push, 2)");
+        assert_eq!(pp.current_pack_alignment, Some(2));
+        assert_eq!(pp.pack_alignment_stack.len(), 1);
+        assert_eq!(pp.pack_alignment_stack[0], Some(4));
+
+        // Pop: restore to 4
+        pragma(&mut pp, "pack(pop)");
+        assert_eq!(pp.current_pack_alignment, Some(4));
+        assert!(pp.pack_alignment_stack.is_empty());
+
+        // Pop on empty stack: reset to None (default)
+        pragma(&mut pp, "pack(pop)");
+        assert_eq!(pp.current_pack_alignment, None);
+    }
+
+    #[test]
+    fn test_pack_stack_push_only_preserves_current() {
+        let mut pp = Preprocessor::new();
+        pragma(&mut pp, "pack(8)");
+        pragma(&mut pp, "pack(push)");
+        // push-only should NOT change current alignment
+        assert_eq!(pp.current_pack_alignment, Some(8));
+        assert_eq!(pp.pack_alignment_stack.len(), 1);
+        assert_eq!(pp.pack_alignment_stack[0], Some(8));
+    }
+
+    #[test]
+    fn test_pack_stack_push_identifier_n_tracks() {
+        let mut pp = Preprocessor::new();
+        pragma(&mut pp, "pack(4)");
+        pragma(&mut pp, "pack(push, myname, 1)");
+        assert_eq!(pp.current_pack_alignment, Some(1));
+        assert_eq!(pp.pack_alignment_stack.len(), 1);
+        assert_eq!(pp.pack_alignment_stack[0], Some(4));
+    }
+
+    #[test]
+    fn test_pack_stack_pop_identifier_tracks() {
+        let mut pp = Preprocessor::new();
+        pragma(&mut pp, "pack(push, 2)");
+        assert_eq!(pp.current_pack_alignment, Some(2));
+        pragma(&mut pp, "pack(pop, myname)");
+        assert_eq!(pp.current_pack_alignment, None); // restored from stack (None was default)
+        assert!(pp.pack_alignment_stack.is_empty());
+    }
+
+    #[test]
+    fn test_pack_zero_means_default() {
+        let mut pp = Preprocessor::new();
+        pragma(&mut pp, "pack(4)");
+        pragma(&mut pp, "pack(0)");
+        assert_eq!(pp.current_pack_alignment, None, "pack(0) means default");
+
+        pragma(&mut pp, "pack(push, 0)");
+        assert_eq!(pp.current_pack_alignment, None, "push,0 means push and default");
+        assert_eq!(pp.pack_alignment_stack.len(), 1);
+    }
+
+    #[test]
+    fn test_pack_nested_push_pop_sequence() {
+        let mut pp = Preprocessor::new();
+
+        // Push level 1
+        pragma(&mut pp, "pack(push, 1)");
+        assert_eq!(pp.current_pack_alignment, Some(1));
+
+        // Push level 2 with identifier
+        pragma(&mut pp, "pack(push, id2, 2)");
+        assert_eq!(pp.current_pack_alignment, Some(2));
+        assert_eq!(pp.pack_alignment_stack.len(), 2);
+
+        // Set without push
+        pragma(&mut pp, "pack(4)");
+        assert_eq!(pp.current_pack_alignment, Some(4));
+        assert_eq!(pp.pack_alignment_stack.len(), 2, "set doesn't affect stack");
+
+        // Pop with identifier: restores to level 1's alignment (1)
+        pragma(&mut pp, "pack(pop, id2)");
+        assert_eq!(pp.current_pack_alignment, Some(1));
+        assert_eq!(pp.pack_alignment_stack.len(), 1);
+
+        // Pop: restores to initial None
+        pragma(&mut pp, "pack(pop)");
+        assert_eq!(pp.current_pack_alignment, None);
+        assert!(pp.pack_alignment_stack.is_empty());
+    }
+
+    // ---- Other pragma handlers unchanged ----
+
+    #[test]
+    fn test_pragma_once_returns_none() {
+        let mut pp = Preprocessor::new();
+        assert_eq!(pragma(&mut pp, "once"), None);
+    }
+
+    #[test]
+    fn test_pragma_weak_returns_none() {
+        let mut pp = Preprocessor::new();
+        assert_eq!(pragma(&mut pp, "weak mysym"), None);
+    }
+
+    #[test]
+    fn test_pragma_unknown_returns_none() {
+        let mut pp = Preprocessor::new();
+        assert_eq!(pragma(&mut pp, "something_unknown"), None);
+    }
+
+    #[test]
+    fn test_pragma_gcc_visibility() {
+        let mut pp = Preprocessor::new();
+        assert_eq!(
+            pragma(&mut pp, "GCC visibility push(hidden)"),
+            Some("__ccc_visibility_push_hidden ;\n".to_string())
+        );
+        assert_eq!(
+            pragma(&mut pp, "GCC visibility pop"),
+            Some("__ccc_visibility_pop ;\n".to_string())
+        );
+    }
+
+    #[test]
+    fn test_pack_invalid_returns_none() {
+        let mut pp = Preprocessor::new();
+        // No parentheses
+        assert_eq!(pragma(&mut pp, "pack"), None);
+        // Invalid content
+        assert_eq!(pragma(&mut pp, "pack(push, abc)"), None);
+        // Invalid number in push, id, N form
+        assert_eq!(pragma(&mut pp, "pack(push, id, abc)"), None);
     }
 }
