@@ -1,53 +1,75 @@
-// Test: linker script PROVIDE() and KEEP() directives
+// Test: Linker script PROVIDE(symbol = expr) and KEEP(...) directives
 //
 // Compile: ccc -T script.ld -o test main.c
 //
-// This test verifies:
-//   PROVIDE(provided_magic = 42)  — linker-defined symbol (not in C source)
-//   PROVIDE(user_defined = 99)    — should NOT override C definition (55)
-//   KEEP(*(.keep_section))        — prevents GC of .keep_section
+// The companion linker script (script.ld) contains:
+//   PROVIDE(provided_magic = 42)  -- define symbol only if not in object files
+//   PROVIDE(user_defined = 99)    -- should NOT override program's definition
+//   KEEP(*(.keep_section))        -- retain .keep_section from GC
+//   ENTRY(main)                   -- set entry point
 //
-// The script defines:
-//   provided_magic = 42 (only if not defined by object files)
-//   user_defined = 99 (but we define it as 55 in C, so PROVIDE is ignored)
+// This test verifies:
+//   1. PROVIDE creates symbols for undefined references with correct values
+//   2. PROVIDE does NOT override existing definitions from object files
+//   3. KEEP retains sections that would otherwise be garbage collected
 
-int printf(const char *fmt, ...);
+int puts(const char *s);
 
-// Linker-provided symbol: accessed as an address whose numeric value is 42.
-// We do NOT define provided_magic in C, so the linker's PROVIDE takes effect.
+// ---- Test 1: PROVIDE symbol for undefined reference ----
+//
+// The linker script defines: PROVIDE(provided_magic = 42)
+// Since we do NOT define 'provided_magic' in this file, the linker
+// should create it as a symbol with value 42.
+//
+// In C, linker script symbols are accessed via address-of because
+// the symbol IS the value (not a pointer to a value). Thus:
+//   (unsigned long)&provided_magic == 42
 extern char provided_magic;
 
-// User-defined variable: we define it here with value 55.
-// The linker script has PROVIDE(user_defined = 99), but per PROVIDE semantics
-// this should NOT override our definition.
+// ---- Test 2: PROVIDE does not override existing definition ----
+//
+// The linker script defines: PROVIDE(user_defined = 99)
+// But we define 'user_defined' here as a global int initialized to 55.
+// Per GNU ld PROVIDE semantics, the linker should NOT override our
+// definition. The variable should retain value 55 at runtime.
 int user_defined = 55;
 
-// Place a variable in .keep_section to test KEEP directive.
-// Without KEEP, --gc-sections could remove this unreferenced section.
-__attribute__((section(".keep_section")))
-int kept_value = 77;
+// ---- Test 3: KEEP retains section from garbage collection ----
+//
+// Place data in a custom section '.keep_section'. The linker script
+// includes KEEP(*(.keep_section)) in the .data output section,
+// ensuring this data survives even when --gc-sections is active.
+//
+// We use __attribute__((section(".keep_section"))) to place the
+// variable in the named section, and __attribute__((used)) to
+// prevent the compiler from eliminating it as unused.
+__attribute__((section(".keep_section"), used))
+static int kept_value = 12345;
 
 int main(void) {
-    // Check PROVIDE(provided_magic = 42)
-    // The symbol's "address" is the numeric value 42
+    // Test 1: Verify PROVIDE-defined symbol has the correct value.
+    // Linker script symbols are address values, accessed via &symbol.
     unsigned long magic = (unsigned long)&provided_magic;
-
-    // Check that user_defined retains our C value (55), not the linker's PROVIDE (99)
-    int user_val = user_defined;
-
-    // Check KEEP: kept_value should still be accessible
-    int keep_val = kept_value;
-
-    if (magic == 42 && user_val == 55 && keep_val == 77) {
-        printf("PROVIDE and KEEP OK\n");
-    } else {
-        if (magic != 42)
-            printf("FAIL: provided_magic = %lu, expected 42\n", magic);
-        if (user_val != 55)
-            printf("FAIL: user_defined = %d, expected 55\n", user_val);
-        if (keep_val != 77)
-            printf("FAIL: kept_value = %d, expected 77\n", keep_val);
+    if (magic != 42) {
+        puts("FAIL: provided_magic wrong value");
+        return 1;
     }
 
+    // Test 2: Verify PROVIDE did not override our definition.
+    // user_defined should still be 55 (our value), not 99 (linker script PROVIDE value).
+    if (user_defined != 55) {
+        puts("FAIL: user_defined was overridden by PROVIDE");
+        return 1;
+    }
+
+    // Test 3: Verify KEEP'd section data is intact.
+    // The data in .keep_section should be accessible and have the correct value,
+    // confirming that KEEP prevented the section from being discarded.
+    if (kept_value != 12345) {
+        puts("FAIL: keep_section data corrupted or removed");
+        return 1;
+    }
+
+    puts("PROVIDE and KEEP OK");
     return 0;
 }
