@@ -152,7 +152,10 @@ impl Preprocessor {
             ("__LEAF", ""), ("__LEAF_ATTR", ""), ("__wur", ""),
             // Date/time
             ("__DATE__", "\"Jan  1 2025\""), ("__TIME__", "\"00:00:00\""),
-            // GCC atomic lock-free macros
+            // GCC atomic lock-free macros: value 2 = always lock-free.
+            // Correct for all CCC targets (x86-64, AArch64, RISC-V 64, i686):
+            // - x86-64/AArch64/RISC-V64: native 64-bit atomics
+            // - i686: CMPXCHG8B provides 64-bit atomics (baseline for i686)
             ("__GCC_ATOMIC_BOOL_LOCK_FREE", "2"),
             ("__GCC_ATOMIC_CHAR_LOCK_FREE", "2"),
             ("__GCC_ATOMIC_CHAR16_T_LOCK_FREE", "2"),
@@ -296,6 +299,26 @@ impl Preprocessor {
         } else {
             self.macros.undefine("__STRICT_ANSI__");
         }
+    }
+
+    /// Set `__STDC_VERSION__` to match the selected language standard.
+    ///
+    /// Called by the driver after parsing `-std=<standard>`.
+    /// Maps the standard name to the corresponding `__STDC_VERSION__` value:
+    ///   - `-std=c99`  / `-std=gnu99`  → `199901L`
+    ///   - `-std=c11`  / `-std=gnu11`  → `201112L`
+    ///   - `-std=c17`  / `-std=gnu17`  → `201710L` (default)
+    ///
+    /// When this method is not called, the default `__STDC_VERSION__` value
+    /// of `201710L` (C17) set by `define_predefined_macros()` is preserved.
+    pub fn set_stdc_version(&mut self, version: &str) {
+        let value = match version {
+            "c99" | "gnu99" | "c9x" | "gnu9x" => "199901L",
+            "c11" | "gnu11" | "c1x" | "gnu1x" => "201112L",
+            "c17" | "gnu17" | "c18" | "gnu18" => "201710L",
+            _ => "201710L", // default to C17
+        };
+        self.define_simple_macro("__STDC_VERSION__", value);
     }
 
     /// Set inline semantics mode: GNU89 vs C99.
