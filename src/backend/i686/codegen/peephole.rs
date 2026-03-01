@@ -16,6 +16,9 @@
 //! 3. **Local cleanup** (up to 4 rounds): re-run local and global passes to clean up
 //!    opportunities exposed by the first round.
 //!
+//! 3.5. **Tail call optimization**: convert `call TARGET; <epilogue>; ret` into
+//!    `<epilogue>; jmp TARGET` when safe (no address-of-local, no dynamic alloca).
+//!
 //! 4. **Never-read store elimination**: global analysis to remove stores to
 //!    stack slots that are never read anywhere in the function.
 
@@ -1654,6 +1657,263 @@ fn eliminate_push_pop_pairs(store: &LineStore, infos: &mut [LineInfo]) -> bool {
     changed
 }
 
+// ── Pass: Tail call optimization ─────────────────────────────────────────────
+//
+// Convert `call TARGET; <epilogue>; ret` into `<epilogue>; jmp TARGET` when
+// the epilogue is a pure sequence of callee-save restores + frame teardown +
+// popq %ebp.  This eliminates a call/ret pair, saving stack depth and enabling
+// recursive tail calls to run in O(1) stack space (critical for threaded
+// interpreters and tail-recursive algorithms).
+//
+// SAFETY: We must NOT apply this when:
+//   1. The function passes a pointer to a local (leal offset(%ebp), %reg) —
+//      after frame teardown the pointer would be dangling.
+//   2. The function uses dynamic stack allocation (subl %reg, %esp) —
+//      alloca'd memory lives below %esp and may be clobbered.
+
+/// Convert a `call TARGET` instruction text into `jmp TARGET`.
+/// Returns `None` if the call format is not recognized or if the call target
+/// is a retpoline thunk (unsafe to tail-call).
+fn convert_call_to_jmp_i686(trimmed_call: &str) -> Option<String> {
+    // i686 uses `call` (not `callq`)
+    let rest = trimmed_call.strip_prefix("call ")?;
+
+    if rest.starts_with('*') {
+        // Indirect call: call *%eax → jmp *%eax
+        Some(format!("jmp {}", rest))
+    } else if rest.starts_with("__x86_indirect_thunk_") {
+        // Retpoline thunk — skip for safety (retpoline control-flow integrity
+        // relies on the call/ret pairing)
+        None
+    } else {
+        // Direct call: call foo → jmp foo
+        Some(format!("jmp {}", rest))
+    }
+}
+
+/// Check if the instructions after a call at position `call_idx` form a pure
+/// i686 epilogue sequence ending in `ret`.  Returns the index of the `ret` if
+/// the call can be safely tail-call optimized.
+///
+/// The allowed pattern between call and ret:
+/// - `LoadEbp` (callee-save restores): `movl offset(%ebp), %REG` where REG ≠ %eax
+/// - `Move { dst: REG_ESP, src: REG_EBP }` (frame teardown via `movl %ebp, %esp`)
+/// - `Other` with text matching `leal -N(%ebp), %esp` (alternate frame teardown)
+/// - `Pop { reg: REG_EBP }` (`popl %ebp`)
+/// - `Directive` lines (`.cfi_*`)
+/// - `Nop`/`Empty` lines
+/// - NOTHING that writes to `%eax` (the return value must pass through)
+fn is_tail_call_candidate_i686(
+    store: &LineStore,
+    infos: &[LineInfo],
+    call_idx: usize,
+    len: usize,
+) -> Option<usize> {
+    // Limit how far we scan forward to avoid runaway searches
+    let limit = (call_idx + 30).min(len);
+
+    let mut found_frame_teardown = false;
+    let mut found_pop_ebp = false;
+    let mut j = call_idx + 1;
+
+    while j < limit {
+        if infos[j].is_nop() {
+            j += 1;
+            continue;
+        }
+
+        match infos[j].kind {
+            LineKind::Empty => {
+                j += 1;
+                continue;
+            }
+            LineKind::Directive => {
+                // .cfi_* directives are metadata — skip
+                j += 1;
+                continue;
+            }
+            LineKind::LoadEbp { reg, .. } => {
+                // Callee-save restore from %ebp-relative stack slot.
+                // Must NOT restore into %eax (register family 0) because that
+                // would clobber the return value being forwarded.
+                if reg == REG_EAX {
+                    return None;
+                }
+                j += 1;
+                continue;
+            }
+            LineKind::Move { dst, src } => {
+                // `movl %ebp, %esp` is the standard frame teardown instruction
+                if dst == REG_ESP && src == REG_EBP {
+                    found_frame_teardown = true;
+                    j += 1;
+                    continue;
+                }
+                // Any move writing to %eax clobbers the return value
+                if dst == REG_EAX {
+                    return None;
+                }
+                // Any other register-to-register move is suspicious — bail
+                return None;
+            }
+            LineKind::Other { dest_reg } => {
+                let t = &store.get(j)[infos[j].trim_start as usize..];
+                // `leal -N(%ebp), %esp` is an alternate frame teardown form used
+                // when callee-saved registers were restored via movl (LoadEbp)
+                // and the compiler emits leal to set %esp in one instruction.
+                if t.starts_with("leal ") && t.contains("(%ebp)") && t.ends_with(", %esp") {
+                    found_frame_teardown = true;
+                    j += 1;
+                    continue;
+                }
+                // Any instruction that writes to %eax clobbers the return value
+                if dest_reg == REG_EAX {
+                    return None;
+                }
+                // Any other instruction is not part of a pure epilogue — bail
+                return None;
+            }
+            LineKind::Pop { reg } => {
+                // `popl %ebp` is the frame pointer restore — expected in epilogue
+                if reg == REG_EBP {
+                    found_pop_ebp = true;
+                    j += 1;
+                    continue;
+                }
+                // Any other pop (callee-save via pop) is not handled — bail
+                return None;
+            }
+            LineKind::Ret => {
+                // Found the ret — validate that we saw both required epilogue parts
+                if found_frame_teardown && found_pop_ebp {
+                    return Some(j);
+                }
+                return None;
+            }
+            // Any other instruction kind (labels, jumps, calls, etc.) breaks
+            // the pure epilogue pattern
+            _ => return None,
+        }
+    }
+
+    None
+}
+
+/// Scan assembly for tail call opportunities and convert them.
+///
+/// For each function, tracks whether the function contains address-of-local
+/// (`leal offset(%ebp), %reg`) or dynamic alloca (`subl %reg, %esp`) that
+/// would make tail call optimization unsafe.  For safe functions, any `call`
+/// followed by a pure epilogue (callee-save restores, frame teardown, `popl %ebp`,
+/// `ret`) is converted to a `jmp` with the call removed.
+///
+/// Returns `true` if any changes were made.
+fn optimize_tail_calls(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let len = infos.len();
+    let mut changed = false;
+
+    // Per-function suppression: set to true if the function has address-of-local
+    // or dynamic stack allocation that makes tail calls unsafe.
+    let mut func_suppress_tailcall = false;
+    // Track whether we're inside a function body (seen a global label or .cfi_startproc)
+    let mut in_function = false;
+
+    let mut i = 0;
+    while i < len {
+        if infos[i].is_nop() {
+            i += 1;
+            continue;
+        }
+
+        // Detect function boundaries to reset the suppression flag.
+        // A non-.L label indicates a new function definition.
+        match infos[i].kind {
+            LineKind::Label => {
+                let line = store.get(i);
+                let label_text = &line[infos[i].trim_start as usize..];
+                if !label_text.starts_with(".L") {
+                    func_suppress_tailcall = false;
+                    in_function = true;
+                }
+                i += 1;
+                continue;
+            }
+            LineKind::Directive => {
+                let line = store.get(i);
+                let dir_text = &line[infos[i].trim_start as usize..];
+                if dir_text == ".cfi_startproc" {
+                    func_suppress_tailcall = false;
+                    in_function = true;
+                }
+                i += 1;
+                continue;
+            }
+            _ => {}
+        }
+
+        // Check for instructions that suppress tail call optimization:
+        //   1. leal offset(%ebp), %reg  — address of a local variable; after
+        //      frame teardown the pointer becomes dangling.
+        //      Exclude leal ..(%ebp), %esp which is a frame teardown form.
+        //   2. leal offset(%esp), %reg  — address of a stack variable through
+        //      the stack pointer (same danger as above).
+        //   3. subl %reg, %esp          — dynamic alloca; after frame teardown
+        //      the alloca'd memory may be clobbered by the tail-called function.
+        //      Note: subl $imm, %esp is normal stack allocation and is NOT suppressed.
+        if in_function && !func_suppress_tailcall {
+            if let LineKind::Other { .. } = infos[i].kind {
+                let line = store.get(i);
+                let t = &line[infos[i].trim_start as usize..];
+                // Detect address-of-local: leal offset(%ebp), %reg or leal offset(%esp), %reg
+                // but NOT leal ...(%ebp), %esp (which is a frame teardown form)
+                if t.starts_with("leal ")
+                    && (t.contains("(%ebp)") || t.contains("(%esp)"))
+                    && !t.ends_with(", %esp")
+                {
+                    func_suppress_tailcall = true;
+                }
+                // Detect dynamic alloca: subl %reg, %esp (register subtract, not immediate)
+                if t.starts_with("subl %") && t.ends_with(", %esp") {
+                    func_suppress_tailcall = true;
+                }
+            }
+        }
+
+        if infos[i].kind != LineKind::Call {
+            i += 1;
+            continue;
+        }
+
+        // We found a call instruction.  Skip if the function has unsafe stack
+        // usage (address-of-local or dynamic alloca).
+        if func_suppress_tailcall {
+            i += 1;
+            continue;
+        }
+
+        // Check if the sequence after the call is a pure epilogue
+        if let Some(ret_idx) = is_tail_call_candidate_i686(store, infos, i, len) {
+            let call_line = store.get(i);
+            let trimmed_call = &call_line[infos[i].trim_start as usize..];
+
+            if let Some(jmp_text) = convert_call_to_jmp_i686(trimmed_call) {
+                // NOP the call — it will be skipped in the final output
+                infos[i].kind = LineKind::Nop;
+
+                // Replace the `ret` with `jmp TARGET`
+                store.replace(ret_idx, format!("    {}", jmp_text));
+                infos[ret_idx] = classify_line(store.get(ret_idx));
+
+                changed = true;
+            }
+        }
+
+        i += 1;
+    }
+
+    changed
+}
+
 // ── Utility ──────────────────────────────────────────────────────────────────
 
 /// Find the next non-nop line after index `start`.
@@ -1702,6 +1962,12 @@ pub fn peephole_optimize(asm: String) -> String {
             pass_count2 += 1;
         }
     }
+
+    // Phase 3.5: Tail call optimization
+    // Runs after global cleanup (benefits from dead store/reg elimination having
+    // already cleaned up the epilogue) and before never-read store elimination
+    // (the tail call transformation may create new never-read stores).
+    optimize_tail_calls(&mut store, &mut infos);
 
     // Phase 4: Never-read store elimination
     eliminate_never_read_stores(&store, &mut infos);
@@ -1943,5 +2209,157 @@ mod tests {
         let result = peephole_optimize(asm);
         assert!(result.contains("subl $1, %eax"), "must keep subl before sbbl: {}", result);
         assert!(!result.contains("decl"), "must NOT convert to decl before sbbl: {}", result);
+    }
+
+    // ── Tail call optimization tests ─────────────────────────────────────
+
+    #[test]
+    fn test_tail_call_i686_direct() {
+        // cdecl function with `call foo` followed by a pure epilogue:
+        // callee-save restores (movl from %ebp-relative stack), frame teardown
+        // (movl %ebp, %esp), popl %ebp, ret.  Should be converted to jmp foo.
+        let asm = [
+            "func:",
+            "    pushl %ebp",
+            "    .cfi_def_cfa_offset 8",
+            "    .cfi_offset %ebp, -8",
+            "    movl %esp, %ebp",
+            "    .cfi_def_cfa_register %ebp",
+            "    subl $16, %esp",
+            "    movl %ebx, -16(%ebp)",
+            "    movl %esi, -12(%ebp)",
+            "    call foo",
+            "    movl -16(%ebp), %ebx",
+            "    movl -12(%ebp), %esi",
+            "    movl %ebp, %esp",
+            "    popl %ebp",
+            "    ret",
+        ].join("\n") + "\n";
+        let result = peephole_optimize(asm);
+        assert!(result.contains("jmp foo"),
+            "should convert call to jmp: {}", result);
+        assert!(!result.contains("call foo"),
+            "should not have call: {}", result);
+        assert!(!result.contains("\nret\n") && !result.contains("\n    ret\n")
+            && !result.trim_end().ends_with("ret"),
+            "should not have ret (replaced by jmp): {}", result);
+    }
+
+    #[test]
+    fn test_tail_call_i686_indirect() {
+        // Indirect call through a register: `call *%ecx` → `jmp *%ecx`
+        let asm = [
+            "func:",
+            "    pushl %ebp",
+            "    .cfi_def_cfa_offset 8",
+            "    .cfi_offset %ebp, -8",
+            "    movl %esp, %ebp",
+            "    .cfi_def_cfa_register %ebp",
+            "    subl $16, %esp",
+            "    call *%ecx",
+            "    movl %ebp, %esp",
+            "    popl %ebp",
+            "    ret",
+        ].join("\n") + "\n";
+        let result = peephole_optimize(asm);
+        assert!(result.contains("jmp *%ecx"),
+            "should convert call *%ecx to jmp *%ecx: {}", result);
+        assert!(!result.contains("call *%ecx"),
+            "should not have call: {}", result);
+    }
+
+    #[test]
+    fn test_no_tail_call_i686_lea_local() {
+        // Function that takes address of a local via `leal -8(%ebp), %eax`.
+        // Tail call would leave the pointer dangling after frame teardown.
+        let asm = [
+            "func:",
+            "    pushl %ebp",
+            "    movl %esp, %ebp",
+            "    subl $16, %esp",
+            "    leal -8(%ebp), %eax",
+            "    call foo",
+            "    movl %ebp, %esp",
+            "    popl %ebp",
+            "    ret",
+        ].join("\n") + "\n";
+        let result = peephole_optimize(asm);
+        assert!(result.contains("call foo"),
+            "should NOT convert when lea of local exists: {}", result);
+        assert!(!result.contains("jmp foo"),
+            "should not have jmp foo: {}", result);
+    }
+
+    #[test]
+    fn test_no_tail_call_i686_dyn_alloca() {
+        // Function with dynamic stack allocation (subl %eax, %esp).
+        // After frame teardown, the alloca'd memory may be clobbered.
+        let asm = [
+            "func:",
+            "    pushl %ebp",
+            "    movl %esp, %ebp",
+            "    subl $16, %esp",
+            "    subl %eax, %esp",
+            "    call foo",
+            "    movl %ebp, %esp",
+            "    popl %ebp",
+            "    ret",
+        ].join("\n") + "\n";
+        let result = peephole_optimize(asm);
+        assert!(result.contains("call foo"),
+            "should NOT convert when dynamic alloca exists: {}", result);
+        assert!(!result.contains("jmp foo"),
+            "should not have jmp foo: {}", result);
+    }
+
+    #[test]
+    fn test_no_tail_call_i686_eax_clobber() {
+        // If %eax (the return value register) is written between call and ret,
+        // the return value would be lost — not a tail call.
+        let asm = [
+            "func:",
+            "    pushl %ebp",
+            "    movl %esp, %ebp",
+            "    subl $16, %esp",
+            "    call foo",
+            "    movl $42, %eax",
+            "    movl %ebp, %esp",
+            "    popl %ebp",
+            "    ret",
+        ].join("\n") + "\n";
+        let result = peephole_optimize(asm);
+        assert!(result.contains("call foo"),
+            "should NOT convert when %eax is modified: {}", result);
+        assert!(result.contains("ret"),
+            "should keep ret: {}", result);
+    }
+
+    #[test]
+    fn test_tail_call_i686_callee_save_leal_restore() {
+        // Function using `leal -N(%ebp), %esp` as an alternate frame teardown
+        // (instead of `movl %ebp, %esp`).  Callee-saved registers are restored
+        // via movl (LoadEbp), then leal sets %esp in one instruction.
+        let asm = [
+            "func:",
+            "    pushl %ebp",
+            "    .cfi_def_cfa_offset 8",
+            "    .cfi_offset %ebp, -8",
+            "    movl %esp, %ebp",
+            "    .cfi_def_cfa_register %ebp",
+            "    subl $16, %esp",
+            "    movl %ebx, -16(%ebp)",
+            "    movl %esi, -12(%ebp)",
+            "    call foo",
+            "    movl -16(%ebp), %ebx",
+            "    movl -12(%ebp), %esi",
+            "    leal -4(%ebp), %esp",
+            "    popl %ebp",
+            "    ret",
+        ].join("\n") + "\n";
+        let result = peephole_optimize(asm);
+        assert!(result.contains("jmp foo"),
+            "should convert call to jmp with leal teardown: {}", result);
+        assert!(!result.contains("call foo"),
+            "should not have call: {}", result);
     }
 }
