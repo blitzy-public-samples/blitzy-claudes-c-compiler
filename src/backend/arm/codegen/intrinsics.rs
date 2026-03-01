@@ -289,20 +289,31 @@ impl ArmCodegen {
             // -- Lane manipulation --
             IntrinsicOp::NeonGetLane => {
                 // Extract a lane from vector: args[0] = vector ptr, args[1] = lane index (imm)
-                // Default: extract lower 64-bit doubleword (covers all scalar element sizes)
+                // Use the lane index from args[1] to select the correct 32-bit element.
                 self.operand_to_x0(&args[0]);
                 self.state.emit("    ldr q0, [x0]");
-                self.state.emit("    umov x0, v0.d[0]");
+                // Resolve lane index: if args[1] is an immediate constant, use it directly;
+                // otherwise default to lane 0 for safety.
+                let lane = self.resolve_imm_operand(&args[1]).unwrap_or(0) as u32;
+                let lane_idx = lane & 0x3; // 128-bit vector has at most 4 × 32-bit lanes
+                self.state.emit_fmt(format_args!("    umov w0, v0.s[{}]", lane_idx));
                 self.store_scalar_dest(dest, "x0");
             }
             IntrinsicOp::NeonSetLane => {
                 // Insert scalar into vector lane: args[0] = scalar, args[1] = vector ptr, args[2] = lane
                 if let Some(dptr) = dest_ptr {
+                    // Resolve lane index from args[2]
+                    let lane = if args.len() > 2 {
+                        self.resolve_imm_operand(&args[2]).unwrap_or(0) as u32
+                    } else {
+                        0
+                    };
+                    let lane_idx = lane & 0x3;
                     self.operand_to_x0(&args[0]);
                     self.state.emit("    mov x9, x0");
                     self.operand_to_x0(&args[1]);
                     self.state.emit("    ldr q0, [x0]");
-                    self.state.emit("    ins v0.s[0], w9");
+                    self.state.emit_fmt(format_args!("    ins v0.s[{}], w9", lane_idx));
                     self.load_ptr_to_reg(dptr, "x0");
                     self.state.emit("    str q0, [x0]");
                 }
@@ -618,6 +629,30 @@ impl ArmCodegen {
                     self.state.emit("    str q0, [x0]");
                 }
             }
+        }
+    }
+
+    // ---- Helper: resolve immediate constant from operand ----
+
+    /// Attempt to extract an immediate integer value from an IR operand.
+    /// Returns `Some(value)` if the operand is a constant integer, `None` if
+    /// it's a register/value reference (runtime-computed lane indices are not
+    /// supported for NEON lane operations — the lane must be a compile-time
+    /// constant per the ARM architecture specification).
+    fn resolve_imm_operand(&self, op: &Operand) -> Option<i64> {
+        match op {
+            Operand::Const(c) => {
+                use crate::ir::constants::IrConst;
+                match c {
+                    IrConst::I8(v) => Some(*v as i64),
+                    IrConst::I16(v) => Some(*v as i64),
+                    IrConst::I32(v) => Some(*v as i64),
+                    IrConst::I64(v) => Some(*v),
+                    IrConst::I128(v) => Some(*v as i64),
+                    _ => None,
+                }
+            }
+            _ => None,
         }
     }
 

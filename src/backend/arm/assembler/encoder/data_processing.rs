@@ -199,11 +199,20 @@ pub(crate) fn resolve_abs_g_modifier(kind: &str, symbol: &str) -> Result<Option<
 }
 
 /// Map an `:abs_g*:` modifier kind string to the appropriate MOVW RelocType.
+///
+/// Per the AArch64 ELF specification, `:abs_g0:` (with overflow check) and
+/// `:abs_g0_nc:` (no check) are distinct relocation types with different ELF
+/// numbers. The `_nc` (no-check) variants are typically used with MOVK (which
+/// fills a 16-bit slice without caring about overflow), while the checking
+/// variants are used with MOVZ (which requires the value to fit).
 fn movw_reloc_type_from_modifier(kind: &str) -> Result<RelocType, String> {
     match kind {
-        "abs_g0" | "abs_g0_nc" => Ok(RelocType::MovwUabsG0Nc),
-        "abs_g1" | "abs_g1_nc" => Ok(RelocType::MovwUabsG1Nc),
-        "abs_g2" | "abs_g2_nc" => Ok(RelocType::MovwUabsG2Nc),
+        "abs_g0" => Ok(RelocType::MovwUabsG0),
+        "abs_g0_nc" => Ok(RelocType::MovwUabsG0Nc),
+        "abs_g1" => Ok(RelocType::MovwUabsG1),
+        "abs_g1_nc" => Ok(RelocType::MovwUabsG1Nc),
+        "abs_g2" => Ok(RelocType::MovwUabsG2),
+        "abs_g2_nc" => Ok(RelocType::MovwUabsG2Nc),
         "abs_g3" => Ok(RelocType::MovwUabsG3),
         "abs_g0_s" => Ok(RelocType::MovwSabsG0),
         "abs_g1_s" => Ok(RelocType::MovwSabsG1),

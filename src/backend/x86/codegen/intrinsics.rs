@@ -581,7 +581,9 @@ impl X86Codegen {
             // that should never be dispatched to the x86-64 backend. If reached at
             // runtime, it indicates a dispatch error in generation.rs.
             #[allow(unreachable_patterns)]
-            _ => {}
+            _ => {
+                debug_assert!(false, "unexpected intrinsic dispatched to x86-64 backend: {:?}", op);
+            }
         }
     }
 }

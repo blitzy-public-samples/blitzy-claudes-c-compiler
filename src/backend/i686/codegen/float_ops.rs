@@ -58,6 +58,10 @@ impl I686Codegen {
         dst_ref: &str,
         dst_ref_hi: &str,
     ) {
+        // Invalidate the accumulator cache since we use %eax as a transfer
+        // register below. If %eax held a cached value, the movl instructions
+        // would silently clobber it.
+        self.state.reg_cache.invalidate_acc();
         // Copy low 32 bits (bits [31:0])
         emit!(self.state, "    movl {}, %eax", src_ref);
         emit!(self.state, "    movl %eax, {}", dst_ref);

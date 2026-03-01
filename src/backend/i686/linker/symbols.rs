@@ -390,11 +390,10 @@ pub(super) fn apply_provide_symbols(
             continue;
         }
 
-        // STT_NOTYPE (0) is the standard type for linker-generated symbols
+        // STT_NOTYPE is the standard type for linker-generated symbols
         // that do not correspond to a function or data object in any input
         // file. This matches GNU ld behavior for PROVIDE symbols.
-        const STT_NOTYPE: u8 = 0;
-
+        // Imported from crate::backend::elf::constants via types.rs.
         let provided_sym = LinkerSymbol {
             address: *address as u32,
             size: 0,

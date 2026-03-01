@@ -140,18 +140,33 @@ fn allocate_common_symbol(
 
 /// Mark symbols that need PLT entries (undefined functions found in shared libs)
 /// and collect symbols that need COPY relocations (undefined data objects).
+///
+/// Each copy symbol entry is (name, size, shlib_value) where shlib_value is the
+/// symbol's address in the shared library. This enables alias coalescing: symbols
+/// that point to the same shared-library address (e.g. `environ` and `__environ`
+/// in glibc) will share a single BSS allocation, preserving the aliasing semantics
+/// that the C library depends on.
+///
+/// Critically, this function also detects shared-library aliases: when a COPY symbol
+/// (e.g. `environ`) has aliases in the shared library at the same address (e.g.
+/// `__environ`, `_environ`), those aliases are also added as COPY symbols. This
+/// ensures the dynamic linker redirects ALL aliases to the executable's BSS copy,
+/// so writes through any alias name (e.g. glibc's `__libc_start_main` setting
+/// `__environ = envp`) are visible through every alias.
 pub fn mark_plt_and_copy_symbols(
     global_syms: &mut HashMap<String, GlobalSym>,
     shared_lib_syms: &HashMap<String, DynSymbol>,
-) -> (Vec<String>, Vec<(String, u64)>) {
+) -> (Vec<String>, Vec<(String, u64, u64)>) {
     let mut plt_symbols: Vec<String> = Vec::new();
-    let mut copy_symbols: Vec<(String, u64)> = Vec::new();
+    let mut copy_symbols: Vec<(String, u64, u64)> = Vec::new();
+    let mut copy_sym_set: HashSet<String> = HashSet::new();
 
     for (name, sym) in global_syms.iter_mut() {
         if !sym.defined {
             if let Some(shlib_sym) = shared_lib_syms.get(name) {
                 if shlib_sym.sym_type() == STT_OBJECT {
-                    copy_symbols.push((name.clone(), shlib_sym.size));
+                    copy_symbols.push((name.clone(), shlib_sym.size, shlib_sym.value));
+                    copy_sym_set.insert(name.clone());
                 } else {
                     sym.needs_plt = true;
                     sym.plt_idx = plt_symbols.len();
@@ -159,6 +174,51 @@ pub fn mark_plt_and_copy_symbols(
                 }
             }
         }
+    }
+
+    // Build a reverse map: shlib_value -> list of symbol names at that address.
+    // This lets us find aliases (e.g. `__environ` for `environ`) that the executable
+    // doesn't directly reference but must also COPY to maintain aliasing semantics.
+    if !copy_symbols.is_empty() {
+        let mut value_to_names: HashMap<u64, Vec<(&str, u64)>> = HashMap::new();
+        for (name, dsym) in shared_lib_syms.iter() {
+            if dsym.sym_type() == STT_OBJECT && dsym.value != 0 {
+                value_to_names.entry(dsym.value).or_default().push((name.as_str(), dsym.size));
+            }
+        }
+
+        // For each COPY symbol, find all aliases (other symbols at the same shlib address)
+        // and add them as additional COPY entries with synthetic GlobalSym entries.
+        let mut alias_additions: Vec<(String, u64, u64)> = Vec::new();
+        for (name, _size, shlib_value) in &copy_symbols {
+            if *shlib_value == 0 { continue; }
+            if let Some(aliases) = value_to_names.get(shlib_value) {
+                for &(alias_name, alias_size) in aliases {
+                    if alias_name == name { continue; }
+                    if copy_sym_set.contains(alias_name) { continue; }
+                    // Add a synthetic GlobalSym for the alias so the linker emits it
+                    // in the dynamic symbol table, enabling the dynamic linker to
+                    // redirect the shared library's GOT entry for this alias.
+                    if !global_syms.contains_key(alias_name) {
+                        global_syms.insert(alias_name.to_string(), GlobalSym {
+                            value: 0,
+                            size: alias_size,
+                            binding: STB_GLOBAL,
+                            sym_type: STT_OBJECT,
+                            visibility: 0,
+                            defined: false,
+                            needs_plt: false,
+                            plt_idx: 0,
+                            got_offset: None,
+                            section_idx: None,
+                        });
+                    }
+                    alias_additions.push((alias_name.to_string(), alias_size, *shlib_value));
+                    copy_sym_set.insert(alias_name.to_string());
+                }
+            }
+        }
+        copy_symbols.extend(alias_additions);
     }
 
     (plt_symbols, copy_symbols)

@@ -129,14 +129,25 @@ pub(super) const RISCV_ARG_REGS: [&str; 8] = ["a0", "a1", "a2", "a3", "a4", "a5"
 
 /// RISC-V 64 code generator. Implements the ArchCodegen trait for the shared framework.
 /// Uses standard RISC-V calling convention with register allocation for hot values.
-// TODO(fix_dash): Investigate RISC-V-specific failure in dash shell compilation.
-// The issue may be in code generation, register allocation, or peephole optimization.
-// Symptom: RISC-V dash build fails while x86/i686/ARM succeed.
-// Potential investigation areas:
-//   - Signal handling (sigaction struct layout differences)
-//   - setjmp/longjmp (register save/restore correctness)
-//   - String operations with specific alignment patterns
-//   - Peephole optimization incorrectly transforming a valid sequence
+///
+/// NOTE (fix_dash): The RISC-V dash shell compilation failure was caused by TWO bugs
+/// in the RISC-V linker (emit_exec.rs and symbols.rs), not in codegen:
+///
+/// Bug 1 — Empty version section headers (emit_exec.rs):
+/// The linker emitted .gnu.version / .gnu.version_r section headers with zero-length
+/// data that aliased the following .rela.dyn section at the same file offset. The
+/// dynamic linker misinterpreted relocation bytes as version indices. Fix: section
+/// headers are now omitted when version data is empty.
+///
+/// Bug 2 — COPY relocation alias breakage (symbols.rs, emit_exec.rs):
+/// When a COPY-relocated symbol (e.g. `environ`) has aliases in the shared library
+/// at the same address (e.g. `__environ`, `_environ` in glibc), glibc's startup code
+/// sets the canonical name (`__environ`) but the executable only had a COPY for
+/// `environ`. Since `__environ` was not redirected to the executable's BSS, the write
+/// went to glibc's memory and the executable's `environ` stayed NULL, causing a
+/// segfault when dash dereferenced it. Fix: `mark_plt_and_copy_symbols` now detects
+/// shared-library aliases and adds COPY entries for all of them, with BSS address
+/// coalescing so all aliases share one slot.
 pub struct RiscvCodegen {
     pub(crate) state: CodegenState,
     pub(super) current_return_type: IrType,

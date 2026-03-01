@@ -857,9 +857,17 @@ pub(crate) fn encode_casp(mnemonic: &str, operands: &[Operand]) -> Result<Encode
         return Err(format!("{} requires 5 operands (Rs, Rs+1, Rt, Rt+1, [Xn|SP])", mnemonic));
     }
     let (rs, is_64) = get_reg(operands, 0)?;
-    let (_rs1, _) = get_reg(operands, 1)?;   // Rs+1 (must be consecutive pair, validated by assembler user)
+    let (_rs1, _) = get_reg(operands, 1)?;   // Rs+1 (must be consecutive pair)
     let (rt, _) = get_reg(operands, 2)?;
     let (_rt1, _) = get_reg(operands, 3)?;    // Rt+1 (must be consecutive pair)
+    // Per ARM ARM, CASP requires both Rs and Rt to be even-numbered registers
+    // to form valid register pairs (Rs, Rs+1) and (Rt, Rt+1).
+    if rs % 2 != 0 {
+        return Err(format!("{}: Rs must be an even register (got x{}/w{})", mnemonic, rs, rs));
+    }
+    if rt % 2 != 0 {
+        return Err(format!("{}: Rt must be an even register (got x{}/w{})", mnemonic, rt, rt));
+    }
     let rn = match operands.get(4) {
         Some(Operand::Mem { base, .. }) => parse_reg_num(base).ok_or("casp: invalid base register")?,
         _ => return Err(format!("{} requires memory operand [Xn|SP] as 5th operand", mnemonic)),

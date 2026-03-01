@@ -1434,4 +1434,96 @@ mod tests {
         assert!(result.contains("str w0, [sp, #16]"));
     }
 
+    // ── Tail call optimization tests ─────────────────────────────────
+
+    #[test]
+    fn test_tail_call_basic() {
+        // A self-recursive tail call: bl self + ret → b self
+        let input = "\
+my_func:\n\
+    .cfi_startproc\n\
+    stp x29, x30, [sp, #-16]!\n\
+    bl my_func\n\
+    ldp x29, x30, [sp], #16\n\
+    ret\n\
+    .cfi_endproc\n";
+        let result = peephole_optimize(input.to_string());
+        // After optimization: bl+ret should become just b
+        assert!(result.contains("b my_func"), "expected tail call to branch: {}", result);
+        // The bl should be removed or replaced
+        assert!(!result.contains("bl my_func"), "bl should be replaced: {}", result);
+    }
+
+    #[test]
+    fn test_tail_call_suppressed_by_address_of_local() {
+        // Tail call must be suppressed when address-of-local is taken
+        let input = "\
+my_func:\n\
+    .cfi_startproc\n\
+    stp x29, x30, [sp, #-16]!\n\
+    add x1, sp, #8\n\
+    bl my_func\n\
+    ldp x29, x30, [sp], #16\n\
+    ret\n\
+    .cfi_endproc\n";
+        let result = peephole_optimize(input.to_string());
+        // Should NOT optimize: address-of-local suppresses tail call
+        assert!(result.contains("bl my_func"), "tail call should be suppressed: {}", result);
+    }
+
+    #[test]
+    fn test_tail_call_non_self_also_optimized() {
+        // The AArch64 tail call optimizer handles ANY direct call in tail position,
+        // not just self-recursive calls (general tail call optimization).
+        let input = "\
+my_func:\n\
+    .cfi_startproc\n\
+    stp x29, x30, [sp, #-16]!\n\
+    bl other_func\n\
+    ldp x29, x30, [sp], #16\n\
+    ret\n\
+    .cfi_endproc\n";
+        let result = peephole_optimize(input.to_string());
+        // Non-self calls in tail position are also optimized
+        assert!(result.contains("b other_func"), "non-self tail call should be optimized: {}", result);
+        assert!(!result.contains("bl other_func"), "bl should be replaced with b: {}", result);
+    }
+
+    #[test]
+    fn test_tail_call_suppressed_by_alloca() {
+        // Dynamic stack allocation (sub sp, sp, xN) suppresses tail calls
+        let input = "\
+my_func:\n\
+    .cfi_startproc\n\
+    stp x29, x30, [sp, #-16]!\n\
+    sub sp, sp, x0\n\
+    bl my_func\n\
+    ldp x29, x30, [sp], #16\n\
+    ret\n\
+    .cfi_endproc\n";
+        let result = peephole_optimize(input.to_string());
+        // Should NOT optimize: dynamic alloca suppresses tail call
+        assert!(result.contains("bl my_func"), "tail call should be suppressed with alloca: {}", result);
+    }
+
+    #[test]
+    fn test_tail_call_with_ldp_restore() {
+        // Verify pattern with callee-saved register pair restore using ldp.
+        // The epilogue scanner accepts ldp pairs (callee-save restores).
+        let input = "\
+factorial:\n\
+    .cfi_startproc\n\
+    stp x29, x30, [sp, #-32]!\n\
+    stp x19, x20, [sp, #16]\n\
+    mov x19, x0\n\
+    bl factorial\n\
+    ldp x19, x20, [sp, #16]\n\
+    ldp x29, x30, [sp], #32\n\
+    ret\n\
+    .cfi_endproc\n";
+        let result = peephole_optimize(input.to_string());
+        // The bl+ldp restore+ldp frame+ret pattern should be optimized
+        assert!(result.contains("b factorial"), "expected tail call with ldp restores: {}", result);
+    }
+
 }
