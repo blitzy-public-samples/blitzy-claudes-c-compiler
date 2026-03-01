@@ -99,7 +99,10 @@ pub use symbols::{
 };
 
 // merge.rs
-pub use merge::{merge_sections_elf64, merge_sections_elf64_gc, allocate_common_symbols_elf64};
+pub use merge::{
+    merge_sections_elf64, merge_sections_elf64_gc, allocate_common_symbols_elf64,
+    merge_sections_with_script, is_section_kept,
+};
 
 // dynamic.rs
 pub use dynamic::{
