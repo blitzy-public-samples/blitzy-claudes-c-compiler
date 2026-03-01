@@ -147,6 +147,17 @@ pub struct Lowerer {
     /// compound literals in arithmetic contexts must first call
     /// `materialize_compound_literals_in_expr()` to populate this map.
     pub(super) materialized_compound_literals: FxHashMap<usize, String>,
+    /// Deduplication cache for narrow string literals.
+    /// Maps string content bytes to the already-interned label name.
+    /// When the same string literal appears multiple times, the second and
+    /// subsequent occurrences reuse the existing label instead of allocating
+    /// a new `.Lstr<N>` entry. This reduces .rodata size and matches GCC/Clang
+    /// behavior for identical string constants (C11 §6.4.5p7 allows merging).
+    pub(super) string_dedup_cache: FxHashMap<String, String>,
+    /// Deduplication cache for wide string literals.
+    pub(super) wide_string_dedup_cache: FxHashMap<String, String>,
+    /// Deduplication cache for char16_t string literals.
+    pub(super) char16_string_dedup_cache: FxHashMap<String, String>,
     /// Whether GNU89 inline semantics are in effect (-fgnu89-inline, -std=c89, etc).
     /// When true, `extern inline` without `__attribute__((gnu_inline__))` is treated
     /// as an inline-only definition (no external def emitted), matching the behaviour
@@ -214,6 +225,9 @@ impl Lowerer {
             expr_ctype_cache: RefCell::new(FxHashMap::default()),
             diagnostics: RefCell::new(diagnostics),
             materialized_compound_literals: FxHashMap::default(),
+            string_dedup_cache: FxHashMap::default(),
+            wide_string_dedup_cache: FxHashMap::default(),
+            char16_string_dedup_cache: FxHashMap::default(),
             gnu89_inline,
         }
     }
@@ -1055,32 +1069,51 @@ impl Lowerer {
 
     /// Intern a string literal: add it to the module's .rodata string table and
     /// return its unique label.
+    /// Deduplicates identical string literals — if the same byte sequence was
+    /// already interned, the existing label is returned without allocating a
+    /// new `.Lstr<N>` entry. C11 §6.4.5p7 permits merging identical string
+    /// literals, and this matches GCC/Clang behavior for `-fmerge-constants`.
     pub(super) fn intern_string_literal(&mut self, s: &str) -> String {
+        // Deduplication: return existing label if this exact string was already interned.
+        if let Some(existing_label) = self.string_dedup_cache.get(s) {
+            return existing_label.clone();
+        }
         let label = format!(".Lstr{}", self.next_string);
         self.next_string += 1;
         self.module.string_literals.push((label.clone(), s.to_string()));
+        self.string_dedup_cache.insert(s.to_string(), label.clone());
         label
     }
 
     /// Intern a wide string literal (L"...") and return its label.
     /// Each character is stored as a u32 (wchar_t), plus a null terminator.
+    /// Deduplicates identical wide string literals to reduce .rodata size.
     pub(super) fn intern_wide_string_literal(&mut self, s: &str) -> String {
+        if let Some(existing_label) = self.wide_string_dedup_cache.get(s) {
+            return existing_label.clone();
+        }
         let label = format!(".Lwstr{}", self.next_string);
         self.next_string += 1;
         let mut chars: Vec<u32> = s.chars().map(|c| c as u32).collect();
         chars.push(0); // null terminator
         self.module.wide_string_literals.push((label.clone(), chars));
+        self.wide_string_dedup_cache.insert(s.to_string(), label.clone());
         label
     }
 
     /// Intern a char16_t string literal (u"...") and return its label.
     /// Each character is stored as a u16 (char16_t), plus a null terminator.
+    /// Deduplicates identical char16_t string literals to reduce .rodata size.
     pub(super) fn intern_char16_string_literal(&mut self, s: &str) -> String {
+        if let Some(existing_label) = self.char16_string_dedup_cache.get(s) {
+            return existing_label.clone();
+        }
         let label = format!(".Lc16str{}", self.next_string);
         self.next_string += 1;
         let mut chars: Vec<u16> = s.chars().map(|c| c as u16).collect();
         chars.push(0); // null terminator
         self.module.char16_string_literals.push((label.clone(), chars));
+        self.char16_string_dedup_cache.insert(s.to_string(), label.clone());
         label
     }
 
