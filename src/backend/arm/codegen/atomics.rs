@@ -86,6 +86,50 @@ impl ArmCodegen {
         self.store_x0_to(dest);
     }
 
+    /// Weak compare-exchange: allowed to fail spuriously (no retry on stxr
+    /// failure). On AArch64 this emits a single LDXR/STXR attempt — if the
+    /// exclusive store fails due to contention, the operation reports failure
+    /// rather than retrying. This is correct because the C11 memory model
+    /// explicitly permits spurious failure for `atomic_compare_exchange_weak`.
+    pub(super) fn emit_atomic_cmpxchg_weak_impl(&mut self, dest: &Value, ptr: &Operand, expected: &Operand, desired: &Operand, ty: IrType, success_ordering: AtomicOrdering, _failure_ordering: AtomicOrdering, returns_bool: bool) {
+        self.operand_to_x0(ptr);
+        self.state.emit("    mov x1, x0");
+        self.operand_to_x0(desired);
+        self.state.emit("    mov x3, x0");
+        self.operand_to_x0(expected);
+        self.state.emit("    mov x2, x0");
+
+        let (ldxr, stxr, reg_prefix) = Self::exclusive_instrs(ty, success_ordering);
+        let old_reg = format!("{}0", reg_prefix);
+        let desired_reg = format!("{}3", reg_prefix);
+        let expected_reg = format!("{}2", reg_prefix);
+
+        let label_id = self.state.next_label_id();
+        let fail_label = format!(".Lcas_fail_{}", label_id);
+        let done_label = format!(".Lcas_done_{}", label_id);
+
+        // No loop — weak cmpxchg does NOT retry on stxr failure.
+        self.state.emit_fmt(format_args!("    {} {}, [x1]", ldxr, old_reg));
+        self.state.emit_fmt(format_args!("    cmp {}, {}", old_reg, expected_reg));
+        self.state.emit_fmt(format_args!("    b.ne {}", fail_label));
+        self.state.emit_fmt(format_args!("    {} w4, {}, [x1]", stxr, desired_reg));
+        // KEY DIFFERENCE from strong: stxr failure goes to fail, not retry.
+        self.state.emit_fmt(format_args!("    cbnz w4, {}", fail_label));
+        if returns_bool {
+            self.state.emit("    mov x0, #1");
+        }
+        self.state.emit_fmt(format_args!("    b {}", done_label));
+        self.state.emit_fmt(format_args!("{}:", fail_label));
+        if returns_bool {
+            self.state.emit("    mov x0, #0");
+            self.state.emit("    clrex");
+        } else {
+            self.state.emit("    clrex");
+        }
+        self.state.emit_fmt(format_args!("{}:", done_label));
+        self.store_x0_to(dest);
+    }
+
     pub(super) fn emit_atomic_load_impl(&mut self, dest: &Value, ptr: &Operand, ty: IrType, ordering: AtomicOrdering) {
         self.operand_to_x0(ptr);
         let need_acquire = matches!(ordering, AtomicOrdering::Acquire | AtomicOrdering::AcqRel | AtomicOrdering::SeqCst);
