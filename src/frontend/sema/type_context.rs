@@ -322,6 +322,42 @@ impl TypeContext {
         for (name, ct) in builtins {
             self.typedefs.insert(name.to_string(), ct.clone());
         }
+
+        // C11 <stdatomic.h> type aliases — standard atomic type names per §7.17.6.
+        // Programs using <stdatomic.h> get these typedefs; we pre-seed them so
+        // sema resolves them even without the header include.
+        // Re-derive target-dependent base types since the originals were consumed
+        // by the builtins array above.
+        let atomic_intptr = if is_32bit { CType::Int } else { CType::Long };
+        let atomic_uintptr = if is_32bit { CType::UInt } else { CType::ULong };
+        let atomic_size = if is_32bit { CType::UInt } else { CType::ULong };
+        let atomic_ptrdiff = if is_32bit { CType::Int } else { CType::Long };
+        let atomic_i64 = if is_32bit { CType::LongLong } else { CType::Long };
+        let atomic_u64 = if is_32bit { CType::ULongLong } else { CType::ULong };
+
+        let atomic_builtins: &[(&str, CType)] = &[
+            ("atomic_bool", CType::Atomic(Box::new(CType::Bool))),
+            ("atomic_char", CType::Atomic(Box::new(CType::Char))),
+            ("atomic_schar", CType::Atomic(Box::new(CType::Char))),
+            ("atomic_uchar", CType::Atomic(Box::new(CType::UChar))),
+            ("atomic_short", CType::Atomic(Box::new(CType::Short))),
+            ("atomic_ushort", CType::Atomic(Box::new(CType::UShort))),
+            ("atomic_int", CType::Atomic(Box::new(CType::Int))),
+            ("atomic_uint", CType::Atomic(Box::new(CType::UInt))),
+            ("atomic_long", CType::Atomic(Box::new(CType::Long))),
+            ("atomic_ulong", CType::Atomic(Box::new(CType::ULong))),
+            ("atomic_llong", CType::Atomic(Box::new(CType::LongLong))),
+            ("atomic_ullong", CType::Atomic(Box::new(CType::ULongLong))),
+            ("atomic_intptr_t", CType::Atomic(Box::new(atomic_intptr))),
+            ("atomic_uintptr_t", CType::Atomic(Box::new(atomic_uintptr))),
+            ("atomic_size_t", CType::Atomic(Box::new(atomic_size))),
+            ("atomic_ptrdiff_t", CType::Atomic(Box::new(atomic_ptrdiff))),
+            ("atomic_intmax_t", CType::Atomic(Box::new(atomic_i64))),
+            ("atomic_uintmax_t", CType::Atomic(Box::new(atomic_u64))),
+        ];
+        for (name, ct) in atomic_builtins {
+            self.typedefs.insert(name.to_string(), ct.clone());
+        }
     }
 
     /// Borrow the struct layouts map immutably.
@@ -514,3 +550,4 @@ impl TypeContext {
         }
     }
 }
+
