@@ -18,6 +18,7 @@
 //! - `check`: Post-link undefined symbol checking
 //! - `eh_frame`: .eh_frame_hdr builder for stack unwinding
 //! - `gc_sections`: Garbage collection (`--gc-sections`) for ELF64 linkers
+//! - `linker_script`: GNU ld-compatible linker script parser (SECTIONS, MEMORY, ENTRY, PROVIDE, KEEP)
 //!
 //! This module extracts the duplicated linker code that was copied across x86,
 //! ARM, RISC-V, and (partially) i686 backends. It provides:
@@ -44,6 +45,9 @@
 //!   `-Wl,` flag parsing across backends.
 //! - **Undefined symbol checking**: `check_undefined_symbols_elf64()` for
 //!   post-link validation via the `GlobalSymbolOps` trait.
+//! - **Linker script parsing**: `parse_linker_script()` and `LinkerScript` for
+//!   `-T script.ld` section placement, MEMORY regions, ENTRY/PROVIDE symbols,
+//!   and KEEP directives consumed by per-architecture linkers.
 //!
 //! Each backend linker still handles its own:
 //! - Architecture-specific relocation application
