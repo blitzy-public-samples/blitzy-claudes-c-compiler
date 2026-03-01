@@ -575,6 +575,13 @@ impl X86Codegen {
             | IntrinsicOp::NeonShl | IntrinsicOp::NeonShr => {
                 unreachable!("NEON intrinsic {:?} not available on x86-64", op);
             }
+
+            // Catch-all for architecture-specific intrinsics not applicable to x86-64.
+            // Handles any future IntrinsicOp variants (e.g., additional ARM NEON ops)
+            // that should never be dispatched to the x86-64 backend. If reached at
+            // runtime, it indicates a dispatch error in generation.rs.
+            #[allow(unreachable_patterns)]
+            _ => {}
         }
     }
 }
