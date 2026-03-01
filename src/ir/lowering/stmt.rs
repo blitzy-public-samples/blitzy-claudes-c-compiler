@@ -120,6 +120,12 @@ impl Lowerer {
 
             let vla_size = if da.is_array {
                 self.compute_vla_runtime_size(type_spec, &declarator.derived)
+            } else if da.c_type.as_ref().map_or(false, |ct| ct.is_vla()) {
+                // CType::Vla detected — compute runtime size from the VLA type.
+                // This handles cases where the VLA information comes through the
+                // CType system (e.g., typedef'd VLAs) rather than through
+                // DerivedDeclarator::Array entries.
+                self.compute_vla_runtime_size(type_spec, &declarator.derived)
             } else {
                 None
             };
@@ -1084,6 +1090,15 @@ impl Lowerer {
                 // Emit cleanup calls for all active scopes before returning
                 let all_cleanups = self.collect_all_scope_cleanup_vars();
                 self.emit_cleanup_calls(&all_cleanups);
+                // Restore the function-level VLA stack pointer before returning.
+                // This ensures all dynamically-allocated VLA stack memory is
+                // reclaimed even when returning from nested VLA scopes. While
+                // the stack frame is torn down on return anyway, explicit
+                // restoration keeps the IR consistent with break/continue/goto
+                // paths and aids correctness for backends that track SP offsets.
+                if let Some(save_val) = self.func().vla_stack_save {
+                    self.emit(Instruction::StackRestore { ptr: save_val });
+                }
                 self.terminate(Terminator::Return(op));
                 let label = self.fresh_label();
                 self.start_block(label);
