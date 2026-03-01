@@ -1,0 +1,14 @@
+basic: -5.0 10.0
+by_real: 6.0 8.0
+by_imag: -8.0 6.0
+square: 0.0 2.0
+conjugate: 25.0 0.0
+negative: 7.0 22.0
+zero_mul: 0.0 0.0
+identity: 5.0 7.0
+pure_imag: -6.0 0.0
+float_mul: 5.0 14.0
+inf_times_finite: 1
+finite_times_inf: 1
+neg_sign: -3.0 -4.0
+large: -50000.0 100000.0
