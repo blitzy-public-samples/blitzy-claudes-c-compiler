@@ -10,7 +10,7 @@
 // Each module adds methods to the Parser struct via `impl Parser` blocks.
 // Methods are pub(super) so they can be called across modules within the parser.
 
-use crate::common::error::DiagnosticEngine;
+use crate::common::error::{DiagnosticEngine, WarningKind};
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::source::Span;
 use crate::common::types::AddressSpace;
@@ -97,6 +97,23 @@ pub(super) mod parsed_attr_flag {
     pub const NAKED: u32            = 1 << 18;
     /// `_Alignas` keyword was used (not `__attribute__((aligned(N)))`).
     pub const C11_ALIGNAS: u32       = 1 << 19;
+
+    // --- Extended GCC function/variable attributes ---
+    /// `__attribute__((deprecated))` or `__attribute__((deprecated("msg")))` encountered.
+    pub const DEPRECATED: u32        = 1 << 20;
+    /// `__attribute__((warn_unused_result))` encountered.
+    pub const WARN_UNUSED_RESULT: u32 = 1 << 21;
+    /// `__attribute__((malloc))` encountered — function returns freshly allocated memory.
+    pub const MALLOC: u32            = 1 << 22;
+    /// `__attribute__((pure))` encountered — function has no side effects (reads global memory).
+    pub const PURE: u32              = 1 << 23;
+    /// `__attribute__((const))` encountered — function depends only on arguments (no global reads).
+    /// NOTE: This is distinct from the `const` type qualifier (CONST flag at bit 5).
+    pub const CONST_ATTR: u32        = 1 << 24;
+    /// `__attribute__((cold))` encountered — function is unlikely to be called.
+    pub const COLD: u32              = 1 << 25;
+    /// `__attribute__((hot))` encountered — function is likely to be called frequently.
+    pub const HOT: u32               = 1 << 26;
 }
 
 /// Accumulated storage-class specifiers, type qualifiers, and GCC attributes
@@ -138,6 +155,13 @@ pub(super) struct ParsedDeclAttrs {
     /// Converted to total byte size in lowering using sizeof(element_type) * N.
     pub parsing_ext_vector_nelem: Option<usize>,
 
+    // --- Extended attribute values ---
+    /// `__attribute__((format(archetype, string_index, first_to_check)))` parameters.
+    /// Stored as (archetype, string_index, first_to_check).
+    pub parsing_format: Option<(String, u32, u32)>,
+    /// `__attribute__((deprecated("message")))` optional deprecation message.
+    pub parsing_deprecated_msg: Option<String>,
+
     // --- Alignment ---
     /// `_Alignas(N)` or `__attribute__((aligned(N)))` value.
     pub parsed_alignas: Option<usize>,
@@ -171,6 +195,13 @@ impl ParsedDeclAttrs {
     #[inline] pub fn parsing_fastcall(&self) -> bool         { self.flags & parsed_attr_flag::FASTCALL != 0 }
     #[inline] pub fn parsing_naked(&self) -> bool            { self.flags & parsed_attr_flag::NAKED != 0 }
     #[inline] pub fn has_c11_alignas(&self) -> bool          { self.flags & parsed_attr_flag::C11_ALIGNAS != 0 }
+    #[inline] pub fn parsing_deprecated(&self) -> bool       { self.flags & parsed_attr_flag::DEPRECATED != 0 }
+    #[inline] pub fn parsing_warn_unused_result(&self) -> bool { self.flags & parsed_attr_flag::WARN_UNUSED_RESULT != 0 }
+    #[inline] pub fn parsing_malloc(&self) -> bool           { self.flags & parsed_attr_flag::MALLOC != 0 }
+    #[inline] pub fn parsing_pure(&self) -> bool             { self.flags & parsed_attr_flag::PURE != 0 }
+    #[inline] pub fn parsing_const_attr(&self) -> bool       { self.flags & parsed_attr_flag::CONST_ATTR != 0 }
+    #[inline] pub fn parsing_cold(&self) -> bool             { self.flags & parsed_attr_flag::COLD != 0 }
+    #[inline] pub fn parsing_hot(&self) -> bool              { self.flags & parsed_attr_flag::HOT != 0 }
 
     // --- flag setters ---
 
@@ -194,6 +225,13 @@ impl ParsedDeclAttrs {
     #[inline] pub fn set_fastcall(&mut self, v: bool)         { self.set_flag(parsed_attr_flag::FASTCALL, v) }
     #[inline] pub fn set_naked(&mut self, v: bool)           { self.set_flag(parsed_attr_flag::NAKED, v) }
     #[inline] pub fn set_c11_alignas(&mut self, v: bool)     { self.set_flag(parsed_attr_flag::C11_ALIGNAS, v) }
+    #[inline] pub fn set_deprecated(&mut self, v: bool)      { self.set_flag(parsed_attr_flag::DEPRECATED, v) }
+    #[inline] pub fn set_warn_unused_result(&mut self, v: bool) { self.set_flag(parsed_attr_flag::WARN_UNUSED_RESULT, v) }
+    #[inline] pub fn set_malloc(&mut self, v: bool)          { self.set_flag(parsed_attr_flag::MALLOC, v) }
+    #[inline] pub fn set_pure(&mut self, v: bool)            { self.set_flag(parsed_attr_flag::PURE, v) }
+    #[inline] pub fn set_const_attr(&mut self, v: bool)      { self.set_flag(parsed_attr_flag::CONST_ATTR, v) }
+    #[inline] pub fn set_cold(&mut self, v: bool)            { self.set_flag(parsed_attr_flag::COLD, v) }
+    #[inline] pub fn set_hot(&mut self, v: bool)             { self.set_flag(parsed_attr_flag::HOT, v) }
 
     #[inline]
     fn set_flag(&mut self, mask: u32, v: bool) {
@@ -237,12 +275,21 @@ impl std::fmt::Debug for ParsedDeclAttrs {
             .field("parsing_error_attr", &self.parsing_error_attr())
             .field("parsing_transparent_union", &self.parsing_transparent_union())
             .field("parsing_fastcall", &self.parsing_fastcall())
+            .field("parsing_deprecated", &self.parsing_deprecated())
+            .field("parsing_warn_unused_result", &self.parsing_warn_unused_result())
+            .field("parsing_malloc", &self.parsing_malloc())
+            .field("parsing_pure", &self.parsing_pure())
+            .field("parsing_const_attr", &self.parsing_const_attr())
+            .field("parsing_cold", &self.parsing_cold())
+            .field("parsing_hot", &self.parsing_hot())
             .field("parsing_alias_target", &self.parsing_alias_target)
             .field("parsing_visibility", &self.parsing_visibility)
             .field("parsing_section", &self.parsing_section)
             .field("parsing_cleanup_fn", &self.parsing_cleanup_fn)
             .field("parsing_vector_size", &self.parsing_vector_size)
             .field("parsing_ext_vector_nelem", &self.parsing_ext_vector_nelem)
+            .field("parsing_format", &self.parsing_format)
+            .field("parsing_deprecated_msg", &self.parsing_deprecated_msg)
             .field("parsed_alignas", &self.parsed_alignas)
             .field("parsed_alignas_type", &self.parsed_alignas_type)
             .field("parsed_alignment_sizeof_type", &self.parsed_alignment_sizeof_type)
@@ -273,6 +320,9 @@ pub struct Parser {
     pub(super) pragma_default_visibility: Option<String>,
     /// Count of parse errors encountered (invalid tokens at top level, etc.)
     pub error_count: usize,
+    /// Set to true when `error_count` reaches the 20-diagnostic limit.
+    /// Once set, the parser stops processing further declarations.
+    pub(super) too_many_errors: bool,
     /// Structured diagnostic engine for error/warning reporting with source snippets.
     pub(super) diagnostics: DiagnosticEngine,
     /// Map of enum constant names to their integer values.
@@ -304,6 +354,7 @@ impl Parser {
             pragma_visibility_stack: Vec::new(),
             pragma_default_visibility: None,
             error_count: 0,
+            too_many_errors: false,
             diagnostics: DiagnosticEngine::new(),
             enum_constants: FxHashMap::default(),
             unevaluable_enum_constants: FxHashSet::default(),
@@ -323,11 +374,22 @@ impl Parser {
         std::mem::take(&mut self.diagnostics)
     }
 
+    /// Maximum number of diagnostics before the parser aborts.
+    /// Matches GCC's default limit of 20 errors per translation unit.
+    const MAX_ERRORS: usize = 20;
+
     /// Emit a parse error at the given span. Updates error_count and prints
     /// the error with source location and snippet (if source manager is set).
+    /// Once `MAX_ERRORS` (20) diagnostics have been emitted, sets the
+    /// `too_many_errors` flag and emits a final "too many errors" message,
+    /// causing the parser to stop processing further declarations.
     pub(super) fn emit_error(&mut self, message: impl Into<String>, span: Span) {
         self.error_count += 1;
         self.diagnostics.error(message, span);
+        if self.error_count >= Self::MAX_ERRORS && !self.too_many_errors {
+            self.too_many_errors = true;
+            self.diagnostics.error("too many errors emitted, stopping now", span);
+        }
     }
 
     /// Standard C typedef names commonly provided by system headers.
@@ -386,9 +448,10 @@ impl Parser {
         ].iter().map(|s| s.to_string()).collect()
     }
 
+    // grammar: translation-unit
     pub fn parse(&mut self) -> TranslationUnit {
         let mut decls = Vec::new();
-        while !self.at_eof() {
+        while !self.at_eof() && !self.too_many_errors {
             if let Some(decl) = self.parse_external_decl() {
                 decls.push(decl);
             } else {
@@ -538,6 +601,37 @@ impl Parser {
         }
     }
 
+    // === Error recovery ===
+
+    /// Skip tokens until a "recovery point" is found, enabling the parser to
+    /// continue after encountering a syntax error. Recovery points are:
+    /// - `;` (consumed, since it terminates a statement)
+    /// - `}`, `)`, EOF (NOT consumed — the caller may need the closing delimiter)
+    /// - Declaration/statement start keywords (NOT consumed — they start new constructs)
+    ///
+    /// This implements synchronization-based error recovery: after emitting an
+    /// error diagnostic, calling `synchronize()` skips past the malformed tokens
+    /// so parsing can resume at the next plausible statement or declaration boundary.
+    pub(super) fn synchronize(&mut self) {
+        loop {
+            match self.peek() {
+                TokenKind::Semicolon => {
+                    self.advance(); // consume the semicolon — it terminates the bad statement
+                    return;
+                }
+                TokenKind::RBrace | TokenKind::Eof => return, // don't consume closing delimiter
+                TokenKind::RParen => return, // don't consume — caller handles balanced parens
+                // Declaration/statement start tokens indicate a good recovery point
+                TokenKind::If | TokenKind::While | TokenKind::For | TokenKind::Return
+                | TokenKind::Switch | TokenKind::Case | TokenKind::Default
+                | TokenKind::Break | TokenKind::Continue | TokenKind::Goto
+                | TokenKind::Struct | TokenKind::Union | TokenKind::Enum
+                | TokenKind::Typedef | TokenKind::Static | TokenKind::Extern => return,
+                _ => { self.advance(); }
+            }
+        }
+    }
+
     // === Type and qualifier helpers ===
 
     /// Check if the current position is a typedef name followed by ':',
@@ -646,6 +740,7 @@ impl Parser {
         }
     }
 
+    // grammar: attribute-specifier (GNU extension)
     /// Parse __attribute__((...)) and __extension__, returning struct attribute flags.
     /// Returns (is_packed, aligned_value, mode_kind, is_common).
     pub(super) fn parse_gcc_attributes(&mut self) -> (bool, Option<usize>, Option<ModeKind>, bool) {
@@ -686,6 +781,7 @@ impl Parser {
         (is_packed, aligned, mode_kind, is_common)
     }
 
+    // grammar: attribute-list (GNU extension)
     /// Parse the comma-separated attribute list inside __attribute__((...)).
     fn parse_gcc_attribute_list(&mut self, is_packed: &mut bool, aligned: &mut Option<usize>,
                                 mode_kind: &mut Option<ModeKind>, is_common: &mut bool) {
@@ -793,8 +889,56 @@ impl Parser {
                 }
             }
             "address_space" | "__address_space__" => { self.advance(); self.parse_address_space_attr(); }
-            _ => {
+            // --- Extended attributes (format, deprecated, warn_unused_result, malloc, pure, const, cold, hot) ---
+            "format" | "__format__" => {
                 self.advance();
+                self.parse_format_attr();
+            }
+            "deprecated" | "__deprecated__" => {
+                self.attrs.set_deprecated(true);
+                self.advance();
+                // Optional message: __attribute__((deprecated("reason")))
+                if matches!(self.peek(), TokenKind::LParen) {
+                    self.attrs.parsing_deprecated_msg = self.parse_string_attr_arg();
+                }
+            }
+            "warn_unused_result" | "__warn_unused_result__" => {
+                self.attrs.set_warn_unused_result(true);
+                self.advance();
+            }
+            "malloc" | "__malloc__" => {
+                self.attrs.set_malloc(true);
+                self.advance();
+            }
+            "pure" | "__pure__" => {
+                self.attrs.set_pure(true);
+                self.advance();
+            }
+            // NOTE: "const" as an attribute is distinct from the `const` type qualifier.
+            // We use CONST_ATTR flag (bit 24) to avoid confusion with CONST (bit 5).
+            "const" | "__const__" => {
+                self.attrs.set_const_attr(true);
+                self.advance();
+            }
+            "cold" | "__cold__" => {
+                self.attrs.set_cold(true);
+                self.advance();
+            }
+            "hot" | "__hot__" => {
+                self.attrs.set_hot(true);
+                self.advance();
+            }
+            _ => {
+                // Emit -Wattributes warning for unknown/unrecognized attributes.
+                // The DiagnosticEngine handles -Wno-attributes suppression automatically.
+                let attr_span = self.peek_span();
+                let attr_name = name.to_string();
+                self.advance();
+                self.diagnostics.warning_with_kind(
+                    format!("unknown attribute '{}' ignored", attr_name),
+                    attr_span,
+                    WarningKind::Attributes,
+                );
                 if matches!(self.peek(), TokenKind::LParen) { self.skip_balanced_parens(); }
             }
         }
@@ -812,6 +956,68 @@ impl Parser {
         }
         if matches!(self.peek(), TokenKind::RParen) { self.advance(); }
         if result.is_empty() { None } else { Some(result) }
+    }
+
+    /// Parse `format(archetype, string_index, first_to_check)` attribute arguments.
+    /// Archetype is an identifier like "printf", "scanf", "strftime", "strfmon",
+    /// or their double-underscore-wrapped forms (e.g., "__printf__").
+    /// `string_index` is the 1-based position of the format string parameter.
+    /// `first_to_check` is the 1-based position of the first variadic argument to check
+    /// (0 means don't check variadic arguments, e.g., for vprintf-style wrappers).
+    fn parse_format_attr(&mut self) {
+        if !matches!(self.peek(), TokenKind::LParen) { return; }
+        self.advance(); // consume (
+        // Parse archetype identifier
+        let archetype = if let TokenKind::Identifier(name) = self.peek() {
+            let s = name.clone();
+            self.advance();
+            s
+        } else {
+            // Not a valid format attribute — skip to closing paren
+            while !matches!(self.peek(), TokenKind::RParen | TokenKind::Eof) { self.advance(); }
+            if matches!(self.peek(), TokenKind::RParen) { self.advance(); }
+            return;
+        };
+        // Expect comma
+        if !self.consume_if(&TokenKind::Comma) {
+            if matches!(self.peek(), TokenKind::RParen) { self.advance(); }
+            return;
+        }
+        // Parse string_index (integer constant)
+        let string_index = self.parse_format_int_arg();
+        // Expect comma
+        if !self.consume_if(&TokenKind::Comma) {
+            if matches!(self.peek(), TokenKind::RParen) { self.advance(); }
+            return;
+        }
+        // Parse first_to_check (integer constant)
+        let first_to_check = self.parse_format_int_arg();
+        // Consume closing paren
+        if matches!(self.peek(), TokenKind::RParen) { self.advance(); }
+        self.attrs.parsing_format = Some((archetype, string_index, first_to_check));
+    }
+
+    /// Parse an integer argument from a format attribute parameter position.
+    /// Handles `IntLiteral`, `UIntLiteral`, and `LongLiteral` token kinds.
+    fn parse_format_int_arg(&mut self) -> u32 {
+        match self.peek() {
+            TokenKind::IntLiteral(v) => {
+                let val = *v as u32;
+                self.advance();
+                val
+            }
+            TokenKind::UIntLiteral(v) => {
+                let val = *v as u32;
+                self.advance();
+                val
+            }
+            TokenKind::LongLiteral(v) => {
+                let val = *v as u32;
+                self.advance();
+                val
+            }
+            _ => 0,
+        }
     }
 
     /// Skip an optional parenthesized argument (consuming everything inside).
@@ -991,6 +1197,7 @@ impl Parser {
 
     // === Pragma pack handling ===
 
+    // grammar: pragma-pack-directive
     /// Check if current token is a pragma pack directive and handle it.
     /// Returns true if a pragma pack token was consumed.
     pub(super) fn handle_pragma_pack_token(&mut self) -> bool {
@@ -1042,6 +1249,7 @@ impl Parser {
         }
     }
 
+    // grammar: pragma-visibility-directive
     /// Handle #pragma GCC visibility push/pop synthetic tokens.
     /// Returns true if a token was consumed.
     pub(super) fn handle_pragma_visibility_token(&mut self) -> bool {
@@ -1142,6 +1350,7 @@ impl Parser {
         Self::eval_const_int_expr_with_enums(&expr, enums, tag_aligns).map(|v| v as usize)
     }
 
+    // grammar: alignment-specifier
     /// Parse the parenthesized argument of `_Alignas(...)`.
     /// _Alignas can take either a type-name or a constant expression.
     /// Returns Some(alignment) on success, None on failure.
