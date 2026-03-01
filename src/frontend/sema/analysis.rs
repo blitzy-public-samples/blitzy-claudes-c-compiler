@@ -15,7 +15,7 @@
 //! This pass does NOT reject programs with type errors (yet); it collects
 //! information for the lowerer. Full type checking is TODO.
 
-use crate::common::error::DiagnosticEngine;
+use crate::common::error::{DiagnosticEngine, WarningKind};
 use crate::common::source::Span;
 use crate::common::symbol_table::{Symbol, SymbolTable};
 use crate::common::type_builder;
@@ -80,6 +80,14 @@ pub struct FunctionInfo {
     pub is_defined: bool,
     /// Whether the function is declared with __attribute__((noreturn)) or _Noreturn
     pub is_noreturn: bool,
+    /// Whether the function is marked __attribute__((deprecated)) or __attribute__((deprecated("msg"))).
+    pub is_deprecated: bool,
+    /// Optional deprecation message from __attribute__((deprecated("msg"))).
+    pub deprecated_msg: Option<String>,
+    /// Whether the function is marked __attribute__((warn_unused_result)).
+    pub is_warn_unused_result: bool,
+    /// __attribute__((format(printf, N, M))) — (archetype, format_index, first_vararg_index).
+    pub format_attr: Option<(String, u32, u32)>,
 }
 
 /// Results of semantic analysis, used by the lowering phase.
@@ -220,6 +228,10 @@ impl SemanticAnalyzer {
             variadic: func.variadic,
             is_defined: true,
             is_noreturn: func.attrs.is_noreturn() || prior_noreturn,
+            is_deprecated: func.attrs.is_deprecated(),
+            deprecated_msg: func.attrs.deprecated_msg.clone(),
+            is_warn_unused_result: func.attrs.is_warn_unused_result(),
+            format_attr: func.attrs.format_attr.clone(),
         };
 
         // Register in function table
@@ -254,6 +266,13 @@ impl SemanticAnalyzer {
             }
         }
 
+        // Validate _Atomic qualifiers on parameter types (C11 §6.7.2.4).
+        // _Atomic parameters are valid in general; only the inner type restrictions
+        // (no arrays, no functions, no incomplete types) apply.
+        for (ty, _) in &params {
+            self.validate_atomic_inner_type(ty, func.span);
+        }
+
         // Analyze function body
         self.analyze_compound_stmt(&func.body);
 
@@ -273,6 +292,17 @@ impl SemanticAnalyzer {
                 "control reaches end of non-void function",
                 func.span,
                 crate::common::error::WarningKind::ReturnType,
+            );
+        }
+
+        // _Noreturn: warn if a function declared _Noreturn has a return statement.
+        // C11 §6.7.4p12: a _Noreturn function should not contain return statements.
+        let is_noreturn = func.attrs.is_noreturn() || prior_noreturn;
+        if is_noreturn && Self::has_return_stmt(&func.body) {
+            self.diagnostics.borrow_mut().warning_with_kind(
+                "function declared '_Noreturn' has a 'return' statement",
+                func.span,
+                WarningKind::ReturnType,
             );
         }
 
@@ -432,6 +462,10 @@ impl SemanticAnalyzer {
                 }
             }
 
+            // Validate _Atomic inner type constraints (C11 §6.7.2.4):
+            // _Atomic cannot be applied to array, function, or incomplete types.
+            self.validate_atomic_inner_type(&full_type, init_decl.span);
+
             // Check if this is a function declaration (prototype)
             if let CType::Function(ref ft) = full_type {
                 let is_noreturn = init_decl.attrs.is_noreturn();
@@ -439,6 +473,13 @@ impl SemanticAnalyzer {
                 if is_noreturn {
                     if let Some(existing) = self.result.functions.get_mut(&init_decl.name) {
                         existing.is_noreturn = true;
+                        // Propagate deprecated from redeclaration
+                        if init_decl.attrs.is_deprecated() {
+                            existing.is_deprecated = true;
+                            if existing.deprecated_msg.is_none() {
+                                existing.deprecated_msg = init_decl.attrs.deprecated_msg.clone();
+                            }
+                        }
                     } else {
                         let func_info = FunctionInfo {
                             return_type: ft.return_type.clone(),
@@ -446,6 +487,10 @@ impl SemanticAnalyzer {
                             variadic: ft.variadic,
                             is_defined: false,
                             is_noreturn: true,
+                            is_deprecated: init_decl.attrs.is_deprecated(),
+                            deprecated_msg: init_decl.attrs.deprecated_msg.clone(),
+                            is_warn_unused_result: false,
+                            format_attr: None,
                         };
                         self.result.functions.insert(init_decl.name.clone(), func_info);
                     }
@@ -456,6 +501,10 @@ impl SemanticAnalyzer {
                         variadic: ft.variadic,
                         is_defined: false,
                         is_noreturn: false,
+                        is_deprecated: init_decl.attrs.is_deprecated(),
+                        deprecated_msg: init_decl.attrs.deprecated_msg.clone(),
+                        is_warn_unused_result: false,
+                        format_attr: None,
                     };
                     self.result.functions.insert(init_decl.name.clone(), func_info);
                 }
@@ -497,6 +546,30 @@ impl SemanticAnalyzer {
             } else {
                 decl.alignment
             };
+
+            // Validate _Alignas alignment constraints (C11 §6.7.5):
+            // - Alignment must be a positive power of two
+            // - Alignment must be at least the natural alignment of the declared type
+            if let Some(align) = explicit_alignment {
+                if align > 0 && (align & (align - 1)) != 0 {
+                    self.diagnostics.borrow_mut().error(
+                        "requested alignment is not a power of 2",
+                        init_decl.span,
+                    );
+                }
+                let natural_align = full_type.align_ctx(
+                    &*self.result.type_context.borrow_struct_layouts()
+                );
+                if align > 0 && natural_align > 0 && align < natural_align {
+                    self.diagnostics.borrow_mut().error(
+                        format!(
+                            "requested alignment is less than minimum alignment of {} for type",
+                            natural_align
+                        ),
+                        init_decl.span,
+                    );
+                }
+            }
 
             self.symbol_table.declare(Symbol {
                 name: init_decl.name.clone(),
@@ -814,6 +887,10 @@ impl SemanticAnalyzer {
         match stmt {
             Stmt::Expr(Some(expr)) => {
                 self.analyze_expr(expr);
+                // Check for warn_unused_result: if a function call's return value
+                // is discarded in an expression statement, warn if the function has
+                // __attribute__((warn_unused_result)).
+                self.check_unused_result(expr);
             }
             Stmt::Expr(None) => {}
             Stmt::Return(Some(expr), _) => {
@@ -1337,6 +1414,22 @@ impl SemanticAnalyzer {
                         *span,
                     );
                 }
+                // Check for deprecated function usage: emit -Wattributes warning
+                // when referencing a function marked __attribute__((deprecated)).
+                if let Some(func_info) = self.result.functions.get(name) {
+                    if func_info.is_deprecated {
+                        let msg = if let Some(ref deprecation_msg) = func_info.deprecated_msg {
+                            format!("'{}' is deprecated: {}", name, deprecation_msg)
+                        } else {
+                            format!("'{}' is deprecated", name)
+                        };
+                        self.diagnostics.borrow_mut().warning_with_kind(
+                            msg,
+                            *span,
+                            WarningKind::Attributes,
+                        );
+                    }
+                }
             }
             Expr::FunctionCall(callee, args, _) => {
                 // Check for builtin calls
@@ -1358,6 +1451,10 @@ impl SemanticAnalyzer {
                             variadic: true, // unknown params
                             is_defined: false,
                             is_noreturn: false,
+                            is_deprecated: false,
+                            deprecated_msg: None,
+                            is_warn_unused_result: false,
+                            format_attr: None,
                         };
                         self.result.functions.insert(name.clone(), func_info);
                     }
@@ -1372,6 +1469,7 @@ impl SemanticAnalyzer {
                         // Clone to release borrow on self.result.functions before
                         // creating ExprTypeChecker which also borrows it
                         let params = func_info.params.clone();
+                        let format_attr = func_info.format_attr.clone();
                         let checker = super::type_checker::ExprTypeChecker {
                             symbols: &self.symbol_table,
                             types: &self.result.type_context,
@@ -1385,6 +1483,14 @@ impl SemanticAnalyzer {
                                         &arg_ty, &params[i].0, arg.span(),
                                     );
                                 }
+                            }
+                        }
+                        // Check format(printf, N, M) argument type compatibility
+                        if let Some((ref archetype, fmt_idx, first_vararg)) = format_attr {
+                            if archetype == "printf" || archetype == "__printf__" {
+                                self.check_printf_format_args(
+                                    name, args, fmt_idx, first_vararg, expr.span(),
+                                );
                             }
                         }
                     }
@@ -1583,6 +1689,14 @@ impl SemanticAnalyzer {
         let base_ctype = match base_ctype {
             Some(ct) => ct,
             None => return, // Can't determine base type; skip check
+        };
+
+        // Strip _Atomic and restrict qualifiers to access the underlying struct/union type.
+        // E.g., `_Atomic struct S` should still allow member access after stripping.
+        let base_ctype = match &base_ctype {
+            CType::Atomic(inner) => inner.as_ref().clone(),
+            CType::Restrict(inner) => inner.as_ref().clone(),
+            _ => base_ctype,
         };
 
         let key = match &base_ctype {
@@ -1843,6 +1957,285 @@ impl SemanticAnalyzer {
         evaluator.eval_const_expr(expr)?.to_i64()
     }
 
+    // === C11 conformance and attribute helpers ===
+
+    /// Validate that the inner type of an `_Atomic` qualifier is permitted.
+    /// C11 §6.7.2.4p3: `_Atomic` shall not be used if the implementation does not
+    /// support atomic types, and `_Atomic` cannot be applied to array types, function
+    /// types, or incomplete types (forward-declared struct/union without a body).
+    fn validate_atomic_inner_type(&self, ctype: &CType, span: Span) {
+        if !ctype.is_atomic() {
+            return;
+        }
+        let inner = ctype.strip_atomic();
+        match inner {
+            CType::Array(_, _) => {
+                self.diagnostics.borrow_mut().error(
+                    "_Atomic cannot be applied to array type",
+                    span,
+                );
+            }
+            CType::Function(_) => {
+                self.diagnostics.borrow_mut().error(
+                    "_Atomic cannot be applied to function type",
+                    span,
+                );
+            }
+            CType::Struct(key) | CType::Union(key) => {
+                if !self.defined_structs.borrow().contains(&**key) {
+                    self.diagnostics.borrow_mut().error(
+                        "_Atomic cannot be applied to incomplete type",
+                        span,
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Check whether a compound statement contains any `return` statement at any
+    /// nesting depth. Used to detect `_Noreturn` functions with explicit `return`.
+    fn has_return_stmt(compound: &CompoundStmt) -> bool {
+        for item in &compound.items {
+            match item {
+                BlockItem::Statement(stmt) => {
+                    if Self::stmt_has_return(stmt) {
+                        return true;
+                    }
+                }
+                BlockItem::Declaration(_) => {}
+            }
+        }
+        false
+    }
+
+    /// Recursively check whether a statement is or contains a `return` statement.
+    fn stmt_has_return(stmt: &Stmt) -> bool {
+        match stmt {
+            Stmt::Return(_, _) => true,
+            Stmt::If(_, then_br, else_br, _) => {
+                Self::stmt_has_return(then_br)
+                    || else_br.as_ref().map_or(false, |e| Self::stmt_has_return(e))
+            }
+            Stmt::While(_, body, _) | Stmt::DoWhile(body, _, _) => {
+                Self::stmt_has_return(body)
+            }
+            Stmt::For(_, _, _, body, _) => Self::stmt_has_return(body),
+            Stmt::Switch(_, body, _) => Self::stmt_has_return(body),
+            Stmt::Compound(compound) => Self::has_return_stmt(compound),
+            Stmt::Label(_, inner, _)
+            | Stmt::Case(_, inner, _)
+            | Stmt::CaseRange(_, _, inner, _)
+            | Stmt::Default(inner, _) => Self::stmt_has_return(inner),
+            _ => false,
+        }
+    }
+
+    /// Check for discarded return values on functions marked with
+    /// `__attribute__((warn_unused_result))`. Called in expression-statement context
+    /// where the return value is implicitly discarded.
+    fn check_unused_result(&self, expr: &Expr) {
+        // Unwrap casts: (void)func() should NOT trigger the warning (explicit discard)
+        // Only check bare function calls in expression-statement position.
+        if let Expr::FunctionCall(callee, _, span) = expr {
+            if let Expr::Identifier(name, _) = callee.as_ref() {
+                if let Some(func_info) = self.result.functions.get(name) {
+                    if func_info.is_warn_unused_result {
+                        self.diagnostics.borrow_mut().warning_with_kind(
+                            format!(
+                                "ignoring return value of '{}', declared with attribute warn_unused_result",
+                                name
+                            ),
+                            *span,
+                            WarningKind::UnusedResult,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Check format(printf, N, M) argument type compatibility.
+    ///
+    /// Parses the format string (argument at 1-based index `fmt_idx`) for printf-style
+    /// format specifiers and validates that the corresponding variadic arguments
+    /// (starting at 1-based index `first_vararg`) have compatible types.
+    fn check_printf_format_args(
+        &self,
+        func_name: &str,
+        args: &[Expr],
+        fmt_idx: u32,
+        first_vararg: u32,
+        call_span: Span,
+    ) {
+        // Convert 1-based format string index to 0-based
+        let fmt_arg_idx = (fmt_idx as usize).checked_sub(1);
+        let fmt_arg_idx = match fmt_arg_idx {
+            Some(i) if i < args.len() => i,
+            _ => return, // Format index out of range
+        };
+
+        // Extract the format string literal. Only check string literals; computed
+        // format strings are too complex for static analysis.
+        let fmt_str = match &args[fmt_arg_idx] {
+            Expr::StringLiteral(s, _) => s.clone(),
+            _ => return, // Not a string literal; skip check
+        };
+
+        // Parse format specifiers from the format string
+        let specifiers = Self::parse_printf_format_specifiers(&fmt_str);
+
+        // First variadic argument index (0-based)
+        let vararg_start = (first_vararg as usize).checked_sub(1).unwrap_or(0);
+
+        let checker = super::type_checker::ExprTypeChecker {
+            symbols: &self.symbol_table,
+            types: &self.result.type_context,
+            functions: &self.result.functions,
+            expr_types: Some(&self.result.expr_types),
+        };
+
+        for (spec_idx, spec) in specifiers.iter().enumerate() {
+            let arg_idx = vararg_start + spec_idx;
+            if arg_idx >= args.len() {
+                // Too few arguments for format string
+                self.diagnostics.borrow_mut().warning_with_kind(
+                    format!(
+                        "format '{}' in call to '{}' expects more arguments",
+                        spec, func_name
+                    ),
+                    call_span,
+                    WarningKind::Attributes,
+                );
+                break;
+            }
+
+            let arg_type = match checker.infer_expr_ctype(&args[arg_idx]) {
+                Some(ty) => ty,
+                None => continue, // Can't determine type; skip
+            };
+
+            // Validate specifier against argument type
+            let type_ok = match spec.as_str() {
+                "d" | "i" | "o" | "x" | "X" | "u" | "c" => arg_type.is_integer(),
+                "ld" | "li" | "lo" | "lx" | "lX" | "lu" => arg_type.is_integer(),
+                "lld" | "lli" | "llo" | "llx" | "llX" | "llu" => arg_type.is_integer(),
+                "hd" | "hi" | "ho" | "hx" | "hX" | "hu" => arg_type.is_integer(),
+                "hhd" | "hhi" | "hho" | "hhx" | "hhX" | "hhu" => arg_type.is_integer(),
+                "zd" | "zi" | "zu" | "zx" | "zX" => arg_type.is_integer(),
+                "td" | "ti" | "tu" | "tx" | "tX" => arg_type.is_integer(),
+                "jd" | "ji" | "ju" | "jx" | "jX" => arg_type.is_integer(),
+                "f" | "F" | "e" | "E" | "g" | "G" | "a" | "A" => {
+                    arg_type.is_floating() || arg_type.is_integer()
+                }
+                "Lf" | "LF" | "Le" | "LE" | "Lg" | "LG" | "La" | "LA" => {
+                    arg_type.is_floating() || arg_type.is_integer()
+                }
+                "s" => arg_type.is_pointer_like(),
+                "p" => arg_type.is_pointer_like() || arg_type.is_integer(),
+                "n" => arg_type.is_pointer_like(),
+                _ => true, // Unknown specifier; don't warn
+            };
+
+            if !type_ok {
+                let expected = match spec.as_str() {
+                    "s" => "char *",
+                    "p" => "void *",
+                    "d" | "i" => "int",
+                    "u" | "x" | "X" | "o" => "unsigned int",
+                    "ld" | "li" => "long",
+                    "lu" | "lx" | "lX" => "unsigned long",
+                    "lld" | "lli" => "long long",
+                    "llu" | "llx" | "llX" => "unsigned long long",
+                    "f" | "e" | "g" => "double",
+                    "c" => "int",
+                    _ => "compatible type",
+                };
+                self.diagnostics.borrow_mut().warning_with_kind(
+                    format!(
+                        "format '%{}' expects argument of type '{}', but argument {} has type '{}'",
+                        spec, expected, arg_idx + 1, arg_type
+                    ),
+                    args[arg_idx].span(),
+                    WarningKind::Attributes,
+                );
+            }
+        }
+    }
+
+    /// Parse printf-style format specifiers from a format string.
+    /// Returns a list of specifier strings (e.g., "d", "s", "ld", "llu") that
+    /// each consume one argument. `%%` is recognized as an escape and does not
+    /// consume an argument. Width and precision with `*` consume extra arguments
+    /// (returned as "d" specifiers to match the int argument).
+    fn parse_printf_format_specifiers(fmt: &str) -> Vec<String> {
+        let mut specifiers = Vec::new();
+        let bytes = fmt.as_bytes();
+        let len = bytes.len();
+        let mut i = 0;
+
+        while i < len {
+            if bytes[i] == b'%' {
+                i += 1;
+                if i >= len {
+                    break;
+                }
+                // %% — literal percent, no argument consumed
+                if bytes[i] == b'%' {
+                    i += 1;
+                    continue;
+                }
+
+                // Skip flags: -, +, space, 0, #
+                while i < len && matches!(bytes[i], b'-' | b'+' | b' ' | b'0' | b'#') {
+                    i += 1;
+                }
+
+                // Width: number or *
+                if i < len && bytes[i] == b'*' {
+                    specifiers.push("d".to_string()); // * consumes an int argument
+                    i += 1;
+                } else {
+                    while i < len && bytes[i].is_ascii_digit() {
+                        i += 1;
+                    }
+                }
+
+                // Precision: .number or .*
+                if i < len && bytes[i] == b'.' {
+                    i += 1;
+                    if i < len && bytes[i] == b'*' {
+                        specifiers.push("d".to_string()); // .* consumes an int argument
+                        i += 1;
+                    } else {
+                        while i < len && bytes[i].is_ascii_digit() {
+                            i += 1;
+                        }
+                    }
+                }
+
+                // Length modifier and conversion specifier
+                let mut length_mod = String::new();
+                while i < len && matches!(bytes[i], b'h' | b'l' | b'L' | b'z' | b't' | b'j' | b'q') {
+                    length_mod.push(bytes[i] as char);
+                    i += 1;
+                }
+
+                // Conversion character
+                if i < len && bytes[i].is_ascii_alphabetic() {
+                    let conv = bytes[i] as char;
+                    i += 1;
+                    // 'n' counts as consuming a pointer argument
+                    specifiers.push(format!("{}{}", length_mod, conv));
+                }
+            } else {
+                i += 1;
+            }
+        }
+
+        specifiers
+    }
+
     // === Implicit declarations ===
 
     /// Pre-declare common implicit functions that C programs expect.
@@ -1882,6 +2275,10 @@ impl SemanticAnalyzer {
                 variadic: *variadic,
                 is_defined: false,
                 is_noreturn,
+                is_deprecated: false,
+                deprecated_msg: None,
+                is_warn_unused_result: false,
+                format_attr: None,
             };
             self.result.functions.insert(name.to_string(), func_info);
         }
@@ -2030,5 +2427,221 @@ impl type_builder::TypeConvertContext for SemanticAnalyzer {
 impl Default for SemanticAnalyzer {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Test that FunctionInfo has the new attribute fields and they are accessible.
+    #[test]
+    fn test_function_info_new_fields() {
+        let fi = FunctionInfo {
+            return_type: CType::Int,
+            params: Vec::new(),
+            variadic: false,
+            is_defined: false,
+            is_noreturn: false,
+            is_deprecated: true,
+            deprecated_msg: Some("use new_func instead".to_string()),
+            is_warn_unused_result: true,
+            format_attr: Some(("printf".to_string(), 1, 2)),
+        };
+        assert!(fi.is_deprecated);
+        assert_eq!(fi.deprecated_msg.as_deref(), Some("use new_func instead"));
+        assert!(fi.is_warn_unused_result);
+        let (archetype, fmt_idx, first_vararg) = fi.format_attr.unwrap();
+        assert_eq!(archetype, "printf");
+        assert_eq!(fmt_idx, 1);
+        assert_eq!(first_vararg, 2);
+    }
+
+    // Test that implicit functions are populated with correct defaults.
+    #[test]
+    fn test_implicit_functions_have_default_attributes() {
+        let analyzer = SemanticAnalyzer::new();
+        let result = analyzer.into_result();
+        let printf_info = result.functions.get("printf").unwrap();
+        assert!(!printf_info.is_deprecated);
+        assert!(!printf_info.is_warn_unused_result);
+        assert!(printf_info.format_attr.is_none());
+        assert!(printf_info.deprecated_msg.is_none());
+        let exit_info = result.functions.get("exit").unwrap();
+        assert!(exit_info.is_noreturn);
+        assert!(!exit_info.is_deprecated);
+    }
+
+    // Test format string parser - basic specifiers.
+    #[test]
+    fn test_parse_printf_format_basic() {
+        let specs = SemanticAnalyzer::parse_printf_format_specifiers("hello %d world %s");
+        assert_eq!(specs, vec!["d", "s"]);
+    }
+
+    // Test format string parser - percent escape.
+    #[test]
+    fn test_parse_printf_format_percent_escape() {
+        let specs = SemanticAnalyzer::parse_printf_format_specifiers("100%% done %d");
+        assert_eq!(specs, vec!["d"]);
+    }
+
+    // Test format string parser - length modifiers.
+    #[test]
+    fn test_parse_printf_format_length_modifiers() {
+        let specs = SemanticAnalyzer::parse_printf_format_specifiers("%ld %llu %hd %zu %jd");
+        assert_eq!(specs, vec!["ld", "llu", "hd", "zu", "jd"]);
+    }
+
+    // Test format string parser - star width and precision.
+    #[test]
+    fn test_parse_printf_format_star_width() {
+        let specs = SemanticAnalyzer::parse_printf_format_specifiers("%*d %.*s");
+        // * produces "d" for width arg, then "d" for the value;
+        // .* produces "d" for precision arg, then "s" for the value.
+        assert_eq!(specs, vec!["d", "d", "d", "s"]);
+    }
+
+    // Test format string parser - flags and width.
+    #[test]
+    fn test_parse_printf_format_flags() {
+        let specs = SemanticAnalyzer::parse_printf_format_specifiers("%-10d %+5.2f %#x");
+        assert_eq!(specs, vec!["d", "f", "x"]);
+    }
+
+    // Test format string parser - empty and no specifiers.
+    #[test]
+    fn test_parse_printf_format_empty() {
+        let specs = SemanticAnalyzer::parse_printf_format_specifiers("");
+        assert!(specs.is_empty());
+        let specs2 = SemanticAnalyzer::parse_printf_format_specifiers("hello world");
+        assert!(specs2.is_empty());
+    }
+
+    // Test format string parser - pointer and char.
+    #[test]
+    fn test_parse_printf_format_pointer_char() {
+        let specs = SemanticAnalyzer::parse_printf_format_specifiers("%p %c %n");
+        assert_eq!(specs, vec!["p", "c", "n"]);
+    }
+
+    // Test format string parser - long double.
+    #[test]
+    fn test_parse_printf_format_long_double() {
+        let specs = SemanticAnalyzer::parse_printf_format_specifiers("%Lf %Le %Lg");
+        assert_eq!(specs, vec!["Lf", "Le", "Lg"]);
+    }
+
+    // Test WarningKind import is accessible.
+    #[test]
+    fn test_warning_kind_accessible() {
+        assert_eq!(WarningKind::Attributes.flag_name(), "attributes");
+        assert_eq!(WarningKind::UnusedResult.flag_name(), "unused-result");
+        assert_eq!(WarningKind::ReturnType.flag_name(), "return-type");
+    }
+
+    // Test SemaResult default.
+    #[test]
+    fn test_sema_result_default() {
+        let result = SemaResult::default();
+        assert!(result.functions.is_empty());
+        assert!(result.expr_types.is_empty());
+        assert!(result.const_values.is_empty());
+    }
+
+    // Test that CType::Atomic is recognized by validate_atomic_inner_type.
+    // We test indirectly by creating an analyzer and checking that non-atomic
+    // types pass through without error.
+    #[test]
+    fn test_validate_atomic_non_atomic_passthrough() {
+        let analyzer = SemanticAnalyzer::new();
+        // Non-atomic types should not trigger validation errors.
+        let span = Span::dummy();
+        analyzer.validate_atomic_inner_type(&CType::Int, span);
+        analyzer.validate_atomic_inner_type(&CType::Void, span);
+        // No errors emitted — the analyzer's diagnostic engine should have 0 errors.
+        let diag = analyzer.diagnostics.borrow();
+        assert!(!diag.has_errors());
+    }
+
+    // Test that _Atomic on array type triggers an error.
+    #[test]
+    fn test_validate_atomic_array_type_error() {
+        let analyzer = SemanticAnalyzer::new();
+        let span = Span::dummy();
+        let arr_type = CType::Atomic(Box::new(CType::Array(Box::new(CType::Int), Some(10))));
+        analyzer.validate_atomic_inner_type(&arr_type, span);
+        let diag = analyzer.diagnostics.borrow();
+        assert!(diag.has_errors());
+    }
+
+    // Test that _Atomic on function type triggers an error.
+    #[test]
+    fn test_validate_atomic_function_type_error() {
+        let analyzer = SemanticAnalyzer::new();
+        let span = Span::dummy();
+        let func_type = CType::Atomic(Box::new(CType::Function(Box::new(
+            FunctionType {
+                return_type: CType::Void,
+                params: Vec::new(),
+                variadic: false,
+            }
+        ))));
+        analyzer.validate_atomic_inner_type(&func_type, span);
+        let diag = analyzer.diagnostics.borrow();
+        assert!(diag.has_errors());
+    }
+
+    // Test that _Atomic on a scalar type does not trigger an error.
+    #[test]
+    fn test_validate_atomic_scalar_ok() {
+        let analyzer = SemanticAnalyzer::new();
+        let span = Span::dummy();
+        let atomic_int = CType::Atomic(Box::new(CType::Int));
+        analyzer.validate_atomic_inner_type(&atomic_int, span);
+        let diag = analyzer.diagnostics.borrow();
+        assert!(!diag.has_errors());
+    }
+
+    // Test that has_return_stmt detects return in empty body.
+    #[test]
+    fn test_has_return_stmt_empty_body() {
+        let compound = CompoundStmt {
+            items: Vec::new(),
+            local_labels: Vec::new(),
+            has_vla: false,
+        };
+        assert!(!SemanticAnalyzer::has_return_stmt(&compound));
+    }
+
+    // Test that has_return_stmt detects return statement.
+    #[test]
+    fn test_has_return_stmt_with_return() {
+        let span = Span::dummy();
+        let compound = CompoundStmt {
+            items: vec![BlockItem::Statement(Stmt::Return(None, span))],
+            local_labels: Vec::new(),
+            has_vla: false,
+        };
+        assert!(SemanticAnalyzer::has_return_stmt(&compound));
+    }
+
+    // Test that has_return_stmt detects nested return in if.
+    #[test]
+    fn test_has_return_stmt_nested_in_if() {
+        let span = Span::dummy();
+        let return_stmt = Stmt::Return(None, span);
+        let if_stmt = Stmt::If(
+            Expr::IntLiteral(1, span),
+            Box::new(return_stmt),
+            None,
+            span,
+        );
+        let compound = CompoundStmt {
+            items: vec![BlockItem::Statement(if_stmt)],
+            local_labels: Vec::new(),
+            has_vla: false,
+        };
+        assert!(SemanticAnalyzer::has_return_stmt(&compound));
     }
 }
