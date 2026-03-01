@@ -766,14 +766,14 @@ impl Parser {
                     result = TypeSpecifier::Pointer(Box::new(result), AddressSpace::Default);
                     i += 1;
                 }
-                DerivedDeclarator::Array(_) => {
+                DerivedDeclarator::Array { .. } => {
                     // Collect consecutive array dims, apply in reverse (innermost first)
                     let start = i;
-                    while i < derived.len() && matches!(&derived[i], DerivedDeclarator::Array(_)) {
+                    while i < derived.len() && matches!(&derived[i], DerivedDeclarator::Array { .. }) {
                         i += 1;
                     }
                     for j in (start..i).rev() {
-                        if let DerivedDeclarator::Array(size_expr) = &derived[j] {
+                        if let DerivedDeclarator::Array { size: size_expr, .. } = &derived[j] {
                             result = TypeSpecifier::Array(Box::new(result), size_expr.clone());
                         }
                     }

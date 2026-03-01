@@ -87,7 +87,7 @@ impl Parser {
         self.expect_closing(&TokenKind::RBrace, open_brace);
         self.shadowed_typedefs = saved_shadowed;
         self.attrs.restore_flags(saved_attr_flags);
-        CompoundStmt { items, local_labels }
+        CompoundStmt { items, local_labels, has_vla: false }
     }
 
     pub(super) fn parse_stmt(&mut self) -> Stmt {

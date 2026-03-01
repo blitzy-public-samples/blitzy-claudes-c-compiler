@@ -857,7 +857,7 @@ impl Lowerer {
     fn declaration_has_vla(decl: &Declaration) -> bool {
         for init_decl in &decl.declarators {
             for derived in &init_decl.derived {
-                if let DerivedDeclarator::Array(Some(expr)) = derived {
+                if let DerivedDeclarator::Array { size: Some(expr), .. } = derived {
                     if !Self::expr_is_definitely_const(expr) {
                         return true;
                     }

@@ -306,7 +306,7 @@ impl Parser {
             // Apply post-Function derivations (Array/Pointer)
             for d in &derived[fpos+1..] {
                 match d {
-                    DerivedDeclarator::Array(size_expr) => {
+                    DerivedDeclarator::Array { size: size_expr, .. } => {
                         return_type = TypeSpecifier::Array(
                             Box::new(return_type),
                             size_expr.clone(),
@@ -324,7 +324,7 @@ impl Parser {
                     DerivedDeclarator::Pointer => {
                         return_type = TypeSpecifier::Pointer(Box::new(return_type), AddressSpace::Default);
                     }
-                    DerivedDeclarator::Array(size_expr) => {
+                    DerivedDeclarator::Array { size: size_expr, .. } => {
                         return_type = TypeSpecifier::Array(
                             Box::new(return_type),
                             size_expr.clone(),
@@ -452,7 +452,7 @@ impl Parser {
         }
         // Collect array dimensions
         let array_dims: Vec<_> = pderived.iter().filter_map(|d| {
-            if let DerivedDeclarator::Array(size) = d {
+            if let DerivedDeclarator::Array { size, .. } = d {
                 Some(size.clone())
             } else {
                 None

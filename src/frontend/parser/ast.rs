@@ -24,47 +24,94 @@ pub enum ExternalDecl {
 /// methods provide the same API as the old struct fields.
 ///
 /// Non-boolean attributes (`section`, `visibility`) remain as `Option<String>`.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct FunctionAttributes {
-    /// Packed boolean flags — see `FuncAttrFlag` constants.
-    flags: u16,
+    /// Packed boolean flags — see `func_attr_flag` constants.
+    /// Upgraded from u16 to u32 to accommodate additional attribute flags.
+    flags: u32,
     /// __attribute__((section("..."))) - place in specific ELF section
     pub section: Option<String>,
     /// __attribute__((visibility("hidden"|"default"|...)))
     pub visibility: Option<String>,
     /// __attribute__((symver("name@@VERSION"))) - symbol version alias
     pub symver: Option<String>,
+    /// `__attribute__((format(archetype, string_index, first_to_check)))` data.
+    /// Stores (archetype, string_index, first_to_check) for printf/scanf format checking.
+    /// E.g., `format(printf, 1, 2)` → `Some(("printf".into(), 1, 2))`.
+    pub format_attr: Option<(String, u32, u32)>,
+    /// `__attribute__((deprecated("message")))` optional deprecation message.
+    /// When `deprecated` is used without a message, only the DEPRECATED flag bit is set.
+    /// When a message is provided, this field holds it AND the flag bit is also set.
+    pub deprecated_msg: Option<String>,
+    /// `__attribute__((constructor(priority)))` — priority value (default 65535).
+    /// Only `Some` when an explicit priority was provided; absence means default priority.
+    pub constructor_priority: Option<u32>,
+    /// `__attribute__((destructor(priority)))` — priority value (default 65535).
+    /// Only `Some` when an explicit priority was provided; absence means default priority.
+    pub destructor_priority: Option<u32>,
+}
+
+impl Default for FunctionAttributes {
+    fn default() -> Self {
+        Self {
+            flags: 0,
+            section: None,
+            visibility: None,
+            symver: None,
+            format_attr: None,
+            deprecated_msg: None,
+            constructor_priority: None,
+            destructor_priority: None,
+        }
+    }
 }
 
 /// Bit masks for boolean flags in `FunctionAttributes::flags`.
 ///
 /// Each attribute occupies one bit, allowing cheap test/set/clear operations.
 /// New attributes can be added by defining the next power-of-two constant.
+/// Upgraded from u16 to u32 to accommodate additional C11/GCC attribute flags.
 pub mod func_attr_flag {
-    pub const STATIC: u16        = 1 << 0;
-    pub const INLINE: u16        = 1 << 1;
+    pub const STATIC: u32        = 1 << 0;
+    pub const INLINE: u32        = 1 << 1;
     /// `extern` storage class on the function definition.
-    pub const EXTERN: u16        = 1 << 2;
+    pub const EXTERN: u32        = 1 << 2;
     /// `__attribute__((gnu_inline))` — forces GNU89 inline semantics.
-    pub const GNU_INLINE: u16    = 1 << 3;
+    pub const GNU_INLINE: u32    = 1 << 3;
     /// `__attribute__((always_inline))` — must always be inlined.
-    pub const ALWAYS_INLINE: u16 = 1 << 4;
+    pub const ALWAYS_INLINE: u32 = 1 << 4;
     /// `__attribute__((noinline))` — must never be inlined.
-    pub const NOINLINE: u16      = 1 << 5;
+    pub const NOINLINE: u32      = 1 << 5;
     /// `__attribute__((constructor))` — run before main.
-    pub const CONSTRUCTOR: u16   = 1 << 6;
+    pub const CONSTRUCTOR: u32   = 1 << 6;
     /// `__attribute__((destructor))` — run after main.
-    pub const DESTRUCTOR: u16    = 1 << 7;
+    pub const DESTRUCTOR: u32    = 1 << 7;
     /// `__attribute__((weak))` — emit as a weak symbol.
-    pub const WEAK: u16          = 1 << 8;
+    pub const WEAK: u32          = 1 << 8;
     /// `__attribute__((used))` — prevent dead code elimination.
-    pub const USED: u16          = 1 << 9;
+    pub const USED: u32          = 1 << 9;
     /// `__attribute__((fastcall))` — i386 fastcall convention (first 2 int args in ecx/edx).
-    pub const FASTCALL: u16      = 1 << 10;
+    pub const FASTCALL: u32      = 1 << 10;
     /// `__attribute__((naked))` — emit no prologue/epilogue; function body is pure asm.
-    pub const NAKED: u16         = 1 << 11;
+    pub const NAKED: u32         = 1 << 11;
     /// `__attribute__((noreturn))` or `_Noreturn` — function never returns.
-    pub const NORETURN: u16      = 1 << 12;
+    pub const NORETURN: u32      = 1 << 12;
+    /// `__attribute__((warn_unused_result))` — warn if caller ignores return value.
+    pub const WARN_UNUSED_RESULT: u32 = 1 << 13;
+    /// `__attribute__((malloc))` — function returns a pointer that doesn't alias any other.
+    pub const MALLOC: u32        = 1 << 14;
+    /// `__attribute__((pure))` — function has no side effects besides return value.
+    pub const PURE: u32          = 1 << 15;
+    /// `__attribute__((const))` — like pure but also doesn't read global memory.
+    /// Named CONST_ATTR to avoid confusion with the `const` type qualifier.
+    pub const CONST_ATTR: u32    = 1 << 16;
+    /// `__attribute__((cold))` — function is rarely called; hint for branch prediction.
+    pub const COLD: u32          = 1 << 17;
+    /// `__attribute__((hot))` — function is frequently called; hint for optimization.
+    pub const HOT: u32           = 1 << 18;
+    /// `__attribute__((deprecated))` or `__attribute__((deprecated("msg")))` — mark as deprecated.
+    /// When a message is present, it is stored in `FunctionAttributes::deprecated_msg`.
+    pub const DEPRECATED: u32    = 1 << 19;
 }
 
 impl FunctionAttributes {
@@ -88,6 +135,17 @@ impl FunctionAttributes {
     #[inline] pub fn is_fastcall(&self) -> bool       { self.flags & func_attr_flag::FASTCALL != 0 }
     #[inline] pub fn is_naked(&self) -> bool          { self.flags & func_attr_flag::NAKED != 0 }
     #[inline] pub fn is_noreturn(&self) -> bool       { self.flags & func_attr_flag::NORETURN != 0 }
+    #[inline] pub fn is_warn_unused_result(&self) -> bool { self.flags & func_attr_flag::WARN_UNUSED_RESULT != 0 }
+    #[inline] pub fn is_malloc(&self) -> bool         { self.flags & func_attr_flag::MALLOC != 0 }
+    #[inline] pub fn is_pure(&self) -> bool           { self.flags & func_attr_flag::PURE != 0 }
+    #[inline] pub fn is_const_attr(&self) -> bool     { self.flags & func_attr_flag::CONST_ATTR != 0 }
+    #[inline] pub fn is_cold(&self) -> bool           { self.flags & func_attr_flag::COLD != 0 }
+    #[inline] pub fn is_hot(&self) -> bool            { self.flags & func_attr_flag::HOT != 0 }
+    /// Returns true if the function is marked `__attribute__((deprecated))`,
+    /// either with or without a message string.
+    #[inline] pub fn is_deprecated(&self) -> bool {
+        self.deprecated_msg.is_some() || (self.flags & func_attr_flag::DEPRECATED != 0)
+    }
 
     // --- flag setters ---
 
@@ -104,9 +162,16 @@ impl FunctionAttributes {
     #[inline] pub fn set_fastcall(&mut self, v: bool)      { self.set_flag(func_attr_flag::FASTCALL, v) }
     #[inline] pub fn set_naked(&mut self, v: bool)        { self.set_flag(func_attr_flag::NAKED, v) }
     #[inline] pub fn set_noreturn(&mut self, v: bool)     { self.set_flag(func_attr_flag::NORETURN, v) }
+    #[inline] pub fn set_warn_unused_result(&mut self, v: bool) { self.set_flag(func_attr_flag::WARN_UNUSED_RESULT, v) }
+    #[inline] pub fn set_malloc(&mut self, v: bool)       { self.set_flag(func_attr_flag::MALLOC, v) }
+    #[inline] pub fn set_pure(&mut self, v: bool)         { self.set_flag(func_attr_flag::PURE, v) }
+    #[inline] pub fn set_const_attr(&mut self, v: bool)   { self.set_flag(func_attr_flag::CONST_ATTR, v) }
+    #[inline] pub fn set_cold(&mut self, v: bool)         { self.set_flag(func_attr_flag::COLD, v) }
+    #[inline] pub fn set_hot(&mut self, v: bool)          { self.set_flag(func_attr_flag::HOT, v) }
+    #[inline] pub fn set_deprecated(&mut self, v: bool)   { self.set_flag(func_attr_flag::DEPRECATED, v) }
 
     #[inline]
-    fn set_flag(&mut self, mask: u16, v: bool) {
+    fn set_flag(&mut self, mask: u32, v: bool) {
         if v { self.flags |= mask; } else { self.flags &= !mask; }
     }
 }
@@ -127,8 +192,19 @@ impl std::fmt::Debug for FunctionAttributes {
             .field("is_fastcall", &self.is_fastcall())
             .field("is_naked", &self.is_naked())
             .field("is_noreturn", &self.is_noreturn())
+            .field("is_warn_unused_result", &self.is_warn_unused_result())
+            .field("is_malloc", &self.is_malloc())
+            .field("is_pure", &self.is_pure())
+            .field("is_const_attr", &self.is_const_attr())
+            .field("is_cold", &self.is_cold())
+            .field("is_hot", &self.is_hot())
+            .field("is_deprecated", &self.is_deprecated())
             .field("section", &self.section)
             .field("visibility", &self.visibility)
+            .field("format_attr", &self.format_attr)
+            .field("deprecated_msg", &self.deprecated_msg)
+            .field("constructor_priority", &self.constructor_priority)
+            .field("destructor_priority", &self.destructor_priority)
             .finish()
     }
 }
@@ -363,6 +439,9 @@ pub struct DeclAttributes {
     pub cleanup_fn: Option<String>,
     /// __attribute__((symver("name@@VERSION"))) - symbol version alias
     pub symver: Option<String>,
+    /// `__attribute__((deprecated("message")))` optional deprecation message.
+    /// When `deprecated` is used without a message, only the DEPRECATED flag bit is set.
+    pub deprecated_msg: Option<String>,
 }
 
 /// Bit masks for boolean flags in `DeclAttributes::flags`.
@@ -383,6 +462,10 @@ pub mod decl_attr_flag {
     pub const FASTCALL: u16    = 1 << 6;
     /// `__attribute__((naked))` — emit no prologue/epilogue.
     pub const NAKED: u16       = 1 << 7;
+    /// `__attribute__((deprecated))` or `__attribute__((deprecated("msg")))`.
+    /// Applies to variables and types (functions use `func_attr_flag::DEPRECATED`).
+    /// When a message is present, it is stored in `DeclAttributes::deprecated_msg`.
+    pub const DEPRECATED: u16  = 1 << 8;
 }
 
 impl DeclAttributes {
@@ -396,6 +479,11 @@ impl DeclAttributes {
     #[inline] pub fn is_used(&self) -> bool        { self.flags & decl_attr_flag::USED != 0 }
     #[inline] pub fn is_fastcall(&self) -> bool    { self.flags & decl_attr_flag::FASTCALL != 0 }
     #[inline] pub fn is_naked(&self) -> bool       { self.flags & decl_attr_flag::NAKED != 0 }
+    /// Returns true if the declarator is marked `__attribute__((deprecated))`,
+    /// either with or without a message string.
+    #[inline] pub fn is_deprecated(&self) -> bool {
+        self.deprecated_msg.is_some() || (self.flags & decl_attr_flag::DEPRECATED != 0)
+    }
 
     // --- flag setters ---
 
@@ -407,6 +495,7 @@ impl DeclAttributes {
     #[inline] pub fn set_used(&mut self, v: bool)        { self.set_flag(decl_attr_flag::USED, v) }
     #[inline] pub fn set_fastcall(&mut self, v: bool)    { self.set_flag(decl_attr_flag::FASTCALL, v) }
     #[inline] pub fn set_naked(&mut self, v: bool)       { self.set_flag(decl_attr_flag::NAKED, v) }
+    #[inline] pub fn set_deprecated(&mut self, v: bool)  { self.set_flag(decl_attr_flag::DEPRECATED, v) }
 
     #[inline]
     fn set_flag(&mut self, mask: u16, v: bool) {
@@ -423,11 +512,13 @@ impl std::fmt::Debug for DeclAttributes {
             .field("is_error_attr", &self.is_error_attr())
             .field("is_noreturn", &self.is_noreturn())
             .field("is_used", &self.is_used())
+            .field("is_deprecated", &self.is_deprecated())
             .field("alias_target", &self.alias_target)
             .field("visibility", &self.visibility)
             .field("section", &self.section)
             .field("asm_register", &self.asm_register)
             .field("cleanup_fn", &self.cleanup_fn)
+            .field("deprecated_msg", &self.deprecated_msg)
             .finish()
     }
 }
@@ -447,7 +538,16 @@ pub struct InitDeclarator {
 #[derive(Debug, Clone)]
 pub enum DerivedDeclarator {
     Pointer,
-    Array(Option<Box<Expr>>),
+    /// Array declarator: `[expr]`, `[]`, or `[*]`.
+    /// - `size: Some(expr)` for `[expr]` (fixed or VLA with runtime expression)
+    /// - `size: None, is_vla_unspecified: false` for `[]` (incomplete array)
+    /// - `size: None, is_vla_unspecified: true` for `[*]` (VLA with unspecified size in function parameter)
+    Array {
+        size: Option<Box<Expr>>,
+        /// True when the `[*]` syntax was used in a function parameter declaration
+        /// to denote a VLA of unspecified size (C11 §6.7.6.2).
+        is_vla_unspecified: bool,
+    },
     Function(Vec<ParamDecl>, bool), // params, variadic
     /// Function pointer: (*name)(params) - distinguishes from pointer-to-return-type
     FunctionPointer(Vec<ParamDecl>, bool), // params, variadic
@@ -530,6 +630,11 @@ pub enum TypeSpecifier {
     /// Wraps the base element type and total vector size in bytes.
     /// E.g., `(__attribute__((vector_size(16))) float){...}` becomes Vector(Float, 16).
     Vector(Box<TypeSpecifier>, usize),
+    /// `_Atomic(type-name)` — C11 atomic type qualifier.
+    /// The inner `TypeSpecifier` is the base type that `_Atomic` qualifies.
+    /// E.g., `_Atomic(int)` → `Atomic(Box::new(Int))`.
+    /// Resolved by `type_builder.rs` into `CType::Atomic(Box<CType>)`.
+    Atomic(Box<TypeSpecifier>),
 }
 
 /// A field declaration in a struct/union.
@@ -564,6 +669,10 @@ pub struct CompoundStmt {
     /// When non-empty, label definitions and gotos within this block use
     /// scope-qualified names to avoid collisions (e.g., in statement expressions).
     pub local_labels: Vec<String>,
+    /// Set to true when this scope contains VLA declarations,
+    /// indicating that the stack pointer must be saved on scope entry
+    /// and restored on scope exit.
+    pub has_vla: bool,
 }
 
 /// Items within a block.
@@ -745,6 +854,12 @@ pub struct GenericAssociation {
 }
 
 /// Sizeof argument can be a type or expression.
+///
+/// Note: When `Type` contains a VLA type specifier (e.g., an array with a
+/// runtime-computed dimension), `sizeof` yields a runtime expression rather
+/// than a compile-time constant.  The lowering pass (`expr_sizeof.rs`) handles
+/// this case by checking whether the resolved `CType` is a VLA and, if so,
+/// generating runtime size computation instead of a constant fold.
 #[derive(Debug, Clone)]
 pub enum SizeofArg {
     Type(TypeSpecifier),

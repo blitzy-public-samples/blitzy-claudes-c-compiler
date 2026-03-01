@@ -1207,7 +1207,7 @@ fn ctype_from_type_spec_with_derived(
             DerivedDeclarator::Pointer => {
                 ty = CType::Pointer(Box::new(ty), AddressSpace::Default);
             }
-            DerivedDeclarator::Array(Some(size_expr)) => {
+            DerivedDeclarator::Array { size: Some(size_expr), .. } => {
                 let expr: &Expr = size_expr;
                 let size = match expr {
                     Expr::IntLiteral(n, _) | Expr::LongLiteral(n, _) | Expr::LongLongLiteral(n, _) => Some(*n as usize),
@@ -1216,7 +1216,7 @@ fn ctype_from_type_spec_with_derived(
                 };
                 ty = CType::Array(Box::new(ty), size);
             }
-            DerivedDeclarator::Array(None) => {
+            DerivedDeclarator::Array { size: None, .. } => {
                 ty = CType::Array(Box::new(ty), None);
             }
             DerivedDeclarator::Function(_, _) | DerivedDeclarator::FunctionPointer(_, _) => {

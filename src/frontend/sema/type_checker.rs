@@ -764,11 +764,11 @@ impl<'a> ExprTypeChecker<'a> {
                 DerivedDeclarator::Pointer => {
                     ctype = CType::Pointer(Box::new(ctype), AddressSpace::Default);
                 }
-                DerivedDeclarator::Array(Some(size_expr)) => {
+                DerivedDeclarator::Array { size: Some(size_expr), .. } => {
                     let size = self.eval_const_expr(size_expr).unwrap_or(0) as usize;
                     ctype = CType::Array(Box::new(ctype), Some(size));
                 }
-                DerivedDeclarator::Array(None) => {
+                DerivedDeclarator::Array { size: None, .. } => {
                     ctype = CType::Array(Box::new(ctype), None);
                 }
                 _ => {} // Function/FunctionPointer not expected in struct fields
@@ -881,11 +881,11 @@ impl<'a> ExprTypeChecker<'a> {
                             DerivedDeclarator::Pointer => {
                                 ctype = CType::Pointer(Box::new(ctype), AddressSpace::Default);
                             }
-                            DerivedDeclarator::Array(Some(size_expr)) => {
+                            DerivedDeclarator::Array { size: Some(size_expr), .. } => {
                                 let size = self.eval_const_expr(size_expr).unwrap_or(0) as usize;
                                 ctype = CType::Array(Box::new(ctype), Some(size));
                             }
-                            DerivedDeclarator::Array(None) => {
+                            DerivedDeclarator::Array { size: None, .. } => {
                                 ctype = CType::Array(Box::new(ctype), None);
                             }
                             _ => {} // Function/FunctionPointer not expected here

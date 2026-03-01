@@ -66,7 +66,7 @@ impl Lowerer {
     pub(super) fn compute_pointee_type(&self, type_spec: &TypeSpecifier, derived: &[DerivedDeclarator]) -> Option<IrType> {
         // Count pointer and array levels
         let ptr_count = derived.iter().filter(|d| matches!(d, DerivedDeclarator::Pointer)).count();
-        let has_array = derived.iter().any(|d| matches!(d, DerivedDeclarator::Array(_)));
+        let has_array = derived.iter().any(|d| matches!(d, DerivedDeclarator::Array { .. }));
 
         if ptr_count > 1 {
             // Multi-level pointer (e.g., int **pp) - pointee is a pointer

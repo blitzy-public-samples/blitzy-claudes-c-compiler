@@ -287,6 +287,8 @@ impl Lowerer {
             TypeSpecifier::AutoType => if is_32bit { IrType::I32 } else { IrType::I64 },
             // Vector type: return the element IR type (used for per-element operations)
             TypeSpecifier::Vector(inner, _) => self.type_spec_to_ir(inner),
+            // C11 _Atomic(T): atomic types have the same IR type as the inner type.
+            TypeSpecifier::Atomic(inner) => self.type_spec_to_ir(inner),
         }
     }
 
@@ -564,7 +566,7 @@ impl Lowerer {
     /// Returns None for unsized dimensions (e.g., `int arr[]`).
     fn collect_derived_array_dims(&self, derived: &[DerivedDeclarator]) -> Vec<Option<usize>> {
         derived.iter().filter_map(|d| {
-            if let DerivedDeclarator::Array(size_expr) = d {
+            if let DerivedDeclarator::Array { size: size_expr, .. } = d {
                 Some(size_expr.as_ref().and_then(|e| self.expr_as_array_size(e).map(|n| n as usize)))
             } else {
                 None
@@ -669,7 +671,7 @@ impl Lowerer {
             || matches!(ts, TypeSpecifier::Pointer(_, _))
             || matches!(effective_ctype, CType::Pointer(_, _));
 
-        let has_array = derived.iter().any(|d| matches!(d, DerivedDeclarator::Array(_)))
+        let has_array = derived.iter().any(|d| matches!(d, DerivedDeclarator::Array { .. }))
             || matches!(effective_ctype, CType::Array(_, _));
 
         // Handle pointer and array combinations
@@ -714,7 +716,7 @@ impl Lowerer {
             let pointer_from_type_spec = ptr_pos.is_none() && (matches!(ts, TypeSpecifier::Pointer(_, _)) || matches!(effective_ctype, CType::Pointer(_, _)));
 
             // Check if the outermost (last) derived element is an Array
-            let last_is_array = matches!(derived.last(), Some(DerivedDeclarator::Array(_)));
+            let last_is_array = matches!(derived.last(), Some(DerivedDeclarator::Array { .. }));
 
             if has_func_ptr || pointer_from_type_spec || last_is_array {
                 // Array of pointers (or array of pointers-to-arrays, etc.)
@@ -730,7 +732,7 @@ impl Lowerer {
                 let array_dims: Vec<Option<usize>> = if let Some(lpp) = last_ptr_pos {
                     // First try: collect Array dims after the last pointer
                     let after_dims: Vec<Option<usize>> = derived[lpp + 1..].iter().filter_map(|d| {
-                        if let DerivedDeclarator::Array(size_expr) = d {
+                        if let DerivedDeclarator::Array { size: size_expr, .. } = d {
                             Some(size_expr.as_ref().and_then(|e| self.expr_as_array_size(e).map(|n| n as usize)))
                         } else {
                             None
@@ -742,7 +744,7 @@ impl Lowerer {
                         // For function pointer arrays, array dims come BEFORE the
                         // Pointer+FunctionPointer group (e.g., [Array(3), Pointer, FuncPtr])
                         derived[..lpp].iter().filter_map(|d| {
-                            if let DerivedDeclarator::Array(size_expr) = d {
+                            if let DerivedDeclarator::Array { size: size_expr, .. } = d {
                                 Some(size_expr.as_ref().and_then(|e| self.expr_as_array_size(e).map(|n| n as usize)))
                             } else {
                                 None
@@ -792,7 +794,7 @@ impl Lowerer {
             let rest = &derived[..derived.len() - trailing_ptr_count];
             let array_dims: Vec<usize> = rest.iter()
                 .filter_map(|d| {
-                    if let DerivedDeclarator::Array(size_expr) = d {
+                    if let DerivedDeclarator::Array { size: size_expr, .. } = d {
                         Some(size_expr.as_ref()
                             .and_then(|e| self.expr_as_array_size(e).map(|n| n as usize))
                             .unwrap_or(1))
@@ -827,7 +829,7 @@ impl Lowerer {
         // If the resolved type itself is an Array (e.g., va_list = Array(Char, 24),
         // or typedef'd multi-dimensional arrays like typedef int arr_t[2][3])
         // and there are no derived array declarators, handle it as an array type.
-        let derived_has_array = derived.iter().any(|d| matches!(d, DerivedDeclarator::Array(_)));
+        let derived_has_array = derived.iter().any(|d| matches!(d, DerivedDeclarator::Array { .. }));
         if !derived_has_array && !has_pointer {
             // Check both TypeSpecifier::Array and CType::Array (for typedef'd arrays)
             // Use effective_ctype (qualifier-unwrapped) so _Atomic(Array(...)) is detected

@@ -345,7 +345,7 @@ impl Lowerer {
                 // syntax marker (1) plus any return-type pointer indirections.
                 // If there are return-type pointers, the return type is a pointer.
                 let ptr_count_before = declarator.derived[..i].iter()
-                    .filter(|d| matches!(d, DerivedDeclarator::Pointer | DerivedDeclarator::Array(_)))
+                    .filter(|d| matches!(d, DerivedDeclarator::Pointer | DerivedDeclarator::Array { .. }))
                     .count();
                 // Subtract 1 for the syntax marker pointer
                 let return_type_ptrs = ptr_count_before.saturating_sub(1);
@@ -506,7 +506,7 @@ impl Lowerer {
         for (i, d) in declarator.derived.iter().enumerate() {
             if let DerivedDeclarator::FunctionPointer(params, _) = d {
                 let ptr_count_before = declarator.derived[..i].iter()
-                    .filter(|d| matches!(d, DerivedDeclarator::Pointer | DerivedDeclarator::Array(_)))
+                    .filter(|d| matches!(d, DerivedDeclarator::Pointer | DerivedDeclarator::Array { .. }))
                     .count();
                 let return_type_ptrs = ptr_count_before.saturating_sub(1);
                 let ret_ty = if return_type_ptrs > 0 {
@@ -1144,7 +1144,7 @@ impl Lowerer {
     ) -> Option<Value> {
         // Collect array dimensions from derived declarators
         let array_dims: Vec<&Option<Box<Expr>>> = derived.iter().filter_map(|d| {
-            if let DerivedDeclarator::Array(size) = d {
+            if let DerivedDeclarator::Array { size, .. } = d {
                 Some(size)
             } else {
                 None
@@ -1238,7 +1238,7 @@ impl Lowerer {
     ) -> Vec<Option<Value>> {
         // Collect array dimensions from derived declarators
         let array_dims: Vec<&Option<Box<Expr>>> = derived.iter().filter_map(|d| {
-            if let DerivedDeclarator::Array(size) = d {
+            if let DerivedDeclarator::Array { size, .. } = d {
                 Some(size)
             } else {
                 None
@@ -1353,8 +1353,8 @@ impl Lowerer {
         let has_pointer = derived.iter().any(|d| matches!(d, DerivedDeclarator::Pointer));
         let has_func_ptr = derived.iter().any(|d| matches!(d,
             DerivedDeclarator::FunctionPointer(_, _) | DerivedDeclarator::Function(_, _)));
-        let has_array = derived.iter().any(|d| matches!(d, DerivedDeclarator::Array(_)));
-        let last_is_array = matches!(derived.last(), Some(DerivedDeclarator::Array(_)));
+        let has_array = derived.iter().any(|d| matches!(d, DerivedDeclarator::Array { .. }));
+        let last_is_array = matches!(derived.last(), Some(DerivedDeclarator::Array { .. }));
 
         if has_array && (has_pointer || has_func_ptr) && last_is_array {
             // Array of pointers (e.g., int *ap[n], void (*fns[n])(int))

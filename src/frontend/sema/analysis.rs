@@ -507,7 +507,7 @@ impl SemanticAnalyzer {
             // Analyze array size expressions in derived declarators
             // (catches undeclared identifiers in e.g. `int arr[UNDECLARED];`)
             for derived in &init_decl.derived {
-                if let DerivedDeclarator::Array(Some(size_expr)) = derived {
+                if let DerivedDeclarator::Array { size: Some(size_expr), .. } = derived {
                     self.analyze_expr(size_expr);
                 }
             }

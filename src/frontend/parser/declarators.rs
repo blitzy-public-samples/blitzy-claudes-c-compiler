@@ -100,7 +100,7 @@ impl Parser {
                         Some(Box::new(self.parse_expr()))
                     };
                     self.expect_closing(&TokenKind::RBracket, open_bracket);
-                    outer_suffixes.push(DerivedDeclarator::Array(size));
+                    outer_suffixes.push(DerivedDeclarator::Array { size, is_vla_unspecified: false });
                 }
                 TokenKind::LParen => {
                     let (params, variadic) = self.parse_param_list();
@@ -175,7 +175,7 @@ impl Parser {
 
         // Check for function pointer: inner has Pointer(s), outer starts with Function
         let inner_only_ptr_and_array = inner_derived.iter().all(|d|
-            matches!(d, DerivedDeclarator::Pointer | DerivedDeclarator::Array(_)));
+            matches!(d, DerivedDeclarator::Pointer | DerivedDeclarator::Array { .. }));
         let inner_has_pointer = inner_derived.iter().any(|d| matches!(d, DerivedDeclarator::Pointer));
         let outer_starts_with_function = matches!(outer_suffixes.first(), Some(DerivedDeclarator::Function(_, _)));
 
@@ -224,7 +224,7 @@ impl Parser {
 
             // Emit inner arrays (for array of function pointers, e.g., `int (*fps[10])(int)`)
             for d in &inner_derived {
-                if matches!(d, DerivedDeclarator::Array(_)) {
+                if matches!(d, DerivedDeclarator::Array { .. }) {
                     result.push(d.clone());
                 }
             }
@@ -246,7 +246,7 @@ impl Parser {
         // For `int (*ptrs[2])[4]`: inner=[Pointer, Array(2)], outer=[Array(4)]
         //   Split inner at pointer: pre_ptr=[], post_ptr=[Array(2)]
         //   Result: [] ++ [Array(4)] ++ [Pointer] ++ [Array(2)] = [Array(4), Pointer, Array(2)]
-        let outer_only_arrays = outer_suffixes.iter().all(|d| matches!(d, DerivedDeclarator::Array(_)));
+        let outer_only_arrays = outer_suffixes.iter().all(|d| matches!(d, DerivedDeclarator::Array { .. }));
         if inner_only_ptr_and_array && inner_has_pointer && outer_only_arrays {
             // Split inner_derived at the last Pointer:
             // - pre_ptr_arrays: arrays before the last pointer (part of pointee type)
@@ -256,7 +256,7 @@ impl Parser {
             let mut result = outer_pointers;
             // 1. Arrays from inner that come before the pointer (pointee array dimensions)
             for d in &inner_derived[..last_ptr_idx] {
-                if matches!(d, DerivedDeclarator::Array(_)) {
+                if matches!(d, DerivedDeclarator::Array { .. }) {
                     result.push(d.clone());
                 }
             }

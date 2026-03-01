@@ -411,7 +411,7 @@ impl Lowerer {
         //   2. Typedef'd pointer with array dimensions.
         let is_array_of_pointers = is_array && {
             let ptr_pos = derived.iter().position(|d| matches!(d, DerivedDeclarator::Pointer));
-            let last_arr_pos = derived.iter().rposition(|d| matches!(d, DerivedDeclarator::Array(_)));
+            let last_arr_pos = derived.iter().rposition(|d| matches!(d, DerivedDeclarator::Array { .. }));
             let has_derived_ptr_before_last_arr = matches!((ptr_pos, last_arr_pos), (Some(pp), Some(ap)) if pp < ap);
             let typedef_ptr_array = ptr_pos.is_none() && last_arr_pos.is_some() &&
                 self.is_type_pointer(type_spec);
@@ -529,7 +529,7 @@ impl Lowerer {
         init: &Option<Initializer>,
     ) {
         let is_unsized = da.is_array && (
-            derived.iter().any(|d| matches!(d, DerivedDeclarator::Array(None)))
+            derived.iter().any(|d| matches!(d, DerivedDeclarator::Array { size: None, .. }))
             || matches!(self.type_spec_to_ctype(type_spec), CType::Array(_, None))
         );
         if !is_unsized {

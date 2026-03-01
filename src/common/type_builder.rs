@@ -135,15 +135,13 @@ pub trait TypeConvertContext {
             }
 
             // === C11 _Atomic(type-name) specifier ===
-            // When the parser adds TypeSpecifier::Atomic(Box<TypeSpecifier>) to ast.rs,
-            // uncomment the following match arm to resolve _Atomic(T) to CType::Atomic(T).
-            // The _Atomic qualifier form (without parens) is handled by the parser producing
-            // a TypeSpecifier::Atomic wrapping the base type, so both forms converge here.
-            //
-            // TypeSpecifier::Atomic(inner) => {
-            //     let inner_type = self.resolve_type_spec_to_ctype(inner);
-            //     inner_type.with_atomic()
-            // }
+            // Resolve _Atomic(T) to CType::Atomic(T). The _Atomic qualifier form
+            // (without parens) is handled by the parser producing a
+            // TypeSpecifier::Atomic wrapping the base type, so both forms converge here.
+            TypeSpecifier::Atomic(inner) => {
+                let inner_type = self.resolve_type_spec_to_ctype(inner);
+                inner_type.with_atomic()
+            }
         }
     }
 }
@@ -295,7 +293,7 @@ pub fn build_full_ctype_with_base(
                     result = func_type;
                     i += 1;
                 }
-                DerivedDeclarator::Array(size_expr) => {
+                DerivedDeclarator::Array { size: size_expr, .. } => {
                     // Array declarators after the function pointer core are outer
                     // wrappers (e.g., array-of-function-pointers when inner_derived
                     // had [Pointer, Array(N)] which the parser emits as
@@ -315,7 +313,7 @@ pub fn build_full_ctype_with_base(
         // Pointer declarators in the prefix were already folded into the return type.
         let prefix = &derived[..fp_start];
         for d in prefix.iter().rev() {
-            if let DerivedDeclarator::Array(size_expr) = d {
+            if let DerivedDeclarator::Array { size: size_expr, .. } = d {
                 let size = size_expr
                     .as_ref()
                     .and_then(|e| ctx.eval_const_expr_as_usize(e));
@@ -334,17 +332,17 @@ pub fn build_full_ctype_with_base(
                     result = CType::Pointer(Box::new(result), AddressSpace::Default);
                     i += 1;
                 }
-                DerivedDeclarator::Array(_) => {
+                DerivedDeclarator::Array { .. } => {
                     // Collect consecutive array dimensions
                     let start = i;
                     while i < derived.len()
-                        && matches!(&derived[i], DerivedDeclarator::Array(_))
+                        && matches!(&derived[i], DerivedDeclarator::Array { .. })
                     {
                         i += 1;
                     }
                     // Apply in reverse: innermost (rightmost) dimension wraps first
                     for j in (start..i).rev() {
-                        if let DerivedDeclarator::Array(size_expr) = &derived[j] {
+                        if let DerivedDeclarator::Array { size: size_expr, .. } = &derived[j] {
                             let size = size_expr
                                 .as_ref()
                                 .and_then(|e| ctx.eval_const_expr_as_usize(e));
