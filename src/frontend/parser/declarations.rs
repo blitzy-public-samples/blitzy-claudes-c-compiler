@@ -34,6 +34,7 @@ struct DeclContext {
 }
 
 impl Parser {
+    // grammar: external-declaration
     pub(super) fn parse_external_decl(&mut self) -> Option<ExternalDecl> {
         // Reset all declaration-level flags before parsing the next declaration.
         self.attrs = ParsedDeclAttrs::default();
@@ -143,8 +144,38 @@ impl Parser {
         // Merge alignment from _Alignas (type specifier), declarator attrs, and post-declarator attrs.
         // Per C11, alignment can only increase (6.7.5), so take the maximum.
         let mut merged_alignment = self.attrs.parsed_alignas.take();
+        let has_c11_alignas = self.attrs.has_c11_alignas();
+        self.attrs.set_c11_alignas(false);
         let alignas_type = self.attrs.parsed_alignas_type.take();
         let alignment_sizeof_type = self.attrs.parsed_alignment_sizeof_type.take();
+        // Validate _Alignas constraints before merging with __attribute__((aligned(N))).
+        // __attribute__((aligned(N))) has different rules (allows any positive value),
+        // so only _Alignas values are checked here (guarded by has_c11_alignas flag).
+        if has_c11_alignas {
+            if let Some(alignas_val) = merged_alignment {
+                // C11 §6.7.5: _Alignas(N) requires N to be a power of 2.
+                if alignas_val > 0 && (alignas_val & (alignas_val - 1)) != 0 {
+                    self.emit_error("requested alignment is not a power of 2", start);
+                }
+                // C11 §6.7.5: _Alignas cannot reduce alignment below the natural
+                // alignment of the declared type.
+                let tag_aligns = if self.struct_tag_alignments.is_empty() {
+                    None
+                } else {
+                    Some(&self.struct_tag_alignments)
+                };
+                let natural = Self::alignof_type_spec(&type_spec, tag_aligns);
+                if alignas_val > 0 && alignas_val < natural {
+                    self.diagnostics.warning(
+                        format!(
+                            "requested alignment is less than minimum alignment of {} for type",
+                            natural
+                        ),
+                        start,
+                    );
+                }
+            }
+        }
         for a in [decl_aligned, post_aligned].iter().copied().flatten() {
             merged_alignment = Some(merged_alignment.map_or(a, |prev| prev.max(a)));
         }
@@ -210,6 +241,7 @@ impl Parser {
         }
     }
 
+    // grammar: function-definition
     /// Parse the rest of a function definition after the declarator.
     fn parse_function_def(
         &mut self,
@@ -347,6 +379,7 @@ impl Parser {
         return_type
     }
 
+    // grammar: declaration-list (K&R parameters)
     /// Parse K&R-style parameter declarations.
     /// In K&R style, the parameter list is just names, and type declarations follow.
     fn parse_kr_params(&mut self, mut kr_params: Vec<ParamDecl>) -> Vec<ParamDecl> {
@@ -474,6 +507,7 @@ impl Parser {
         (full_type, None)
     }
 
+    // grammar: declaration
     /// Parse the rest of a declaration (not a function definition).
     fn parse_declaration_rest(
         &mut self,
@@ -644,6 +678,7 @@ impl Parser {
         Some(ExternalDecl::Declaration(d))
     }
 
+    // grammar: declaration (block-scope)
     pub(super) fn parse_local_declaration(&mut self) -> Option<Declaration> {
         let start = self.peek_span();
         // Selective reset: only storage-class/qualifier flags need clearing here.
@@ -769,8 +804,36 @@ impl Parser {
 
         self.expect_after(&TokenKind::Semicolon, "after declaration");
         // Merge alignment from _Alignas (captured in parsed_alignas during type specifier parsing)
-        // with alignment from __attribute__((aligned(N))) on declarators
+        // with alignment from __attribute__((aligned(N))) on declarators.
+        // Validate _Alignas constraints before merging: __attribute__((aligned(N)))
+        // has different rules, so only _Alignas values are checked (guarded by
+        // has_c11_alignas flag).
+        let has_c11_alignas = self.attrs.has_c11_alignas();
+        self.attrs.set_c11_alignas(false);
         if let Some(a) = self.attrs.parsed_alignas.take() {
+            if has_c11_alignas {
+                // C11 §6.7.5: _Alignas(N) requires N to be a power of 2.
+                if a > 0 && (a & (a - 1)) != 0 {
+                    self.emit_error("requested alignment is not a power of 2", start);
+                }
+                // C11 §6.7.5: _Alignas cannot reduce alignment below the natural
+                // alignment of the declared type.
+                let tag_aligns = if self.struct_tag_alignments.is_empty() {
+                    None
+                } else {
+                    Some(&self.struct_tag_alignments)
+                };
+                let natural = Self::alignof_type_spec(&type_spec, tag_aligns);
+                if a > 0 && a < natural {
+                    self.diagnostics.warning(
+                        format!(
+                            "requested alignment is less than minimum alignment of {} for type",
+                            natural
+                        ),
+                        start,
+                    );
+                }
+            }
             alignment = Some(alignment.map_or(a, |prev| prev.max(a)));
         }
         let alignas_type = self.attrs.parsed_alignas_type.take();
@@ -796,6 +859,7 @@ impl Parser {
         Some(d)
     }
 
+    // grammar: initializer
     /// Parse an initializer: either a braced initializer list or a single expression.
     pub(super) fn parse_initializer(&mut self) -> Initializer {
         if matches!(self.peek(), TokenKind::LBrace) {
@@ -1131,6 +1195,7 @@ impl Parser {
                 TokenKind::SegFs => { self.advance(); self.attrs.parsing_address_space = AddressSpace::SegFs; }
                 TokenKind::Alignas => {
                     self.advance();
+                    self.attrs.set_c11_alignas(true);
                     if let Some(align) = self.parse_alignas_argument() {
                         self.attrs.parsed_alignas = Some(self.attrs.parsed_alignas.map_or(align, |prev| prev.max(align)));
                     }
@@ -1206,6 +1271,7 @@ impl Parser {
         }
     }
 
+    // grammar: static_assert-declaration
     /// Parse and evaluate `_Static_assert(constant-expr, "message")` or
     /// the C23 single-argument form `_Static_assert(constant-expr)`.
     ///

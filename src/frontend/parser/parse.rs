@@ -95,6 +95,8 @@ pub(super) mod parsed_attr_flag {
     pub const FASTCALL: u32         = 1 << 17;
     /// `__attribute__((naked))` encountered — emit no prologue/epilogue.
     pub const NAKED: u32            = 1 << 18;
+    /// `_Alignas` keyword was used (not `__attribute__((aligned(N)))`).
+    pub const C11_ALIGNAS: u32       = 1 << 19;
 }
 
 /// Accumulated storage-class specifiers, type qualifiers, and GCC attributes
@@ -166,6 +168,7 @@ impl ParsedDeclAttrs {
     #[inline] pub fn parsing_transparent_union(&self) -> bool { self.flags & parsed_attr_flag::TRANSPARENT_UNION != 0 }
     #[inline] pub fn parsing_fastcall(&self) -> bool         { self.flags & parsed_attr_flag::FASTCALL != 0 }
     #[inline] pub fn parsing_naked(&self) -> bool            { self.flags & parsed_attr_flag::NAKED != 0 }
+    #[inline] pub fn has_c11_alignas(&self) -> bool          { self.flags & parsed_attr_flag::C11_ALIGNAS != 0 }
 
     // --- flag setters ---
 
@@ -188,6 +191,7 @@ impl ParsedDeclAttrs {
     #[inline] pub fn set_transparent_union(&mut self, v: bool) { self.set_flag(parsed_attr_flag::TRANSPARENT_UNION, v) }
     #[inline] pub fn set_fastcall(&mut self, v: bool)         { self.set_flag(parsed_attr_flag::FASTCALL, v) }
     #[inline] pub fn set_naked(&mut self, v: bool)           { self.set_flag(parsed_attr_flag::NAKED, v) }
+    #[inline] pub fn set_c11_alignas(&mut self, v: bool)     { self.set_flag(parsed_attr_flag::C11_ALIGNAS, v) }
 
     #[inline]
     fn set_flag(&mut self, mask: u32, v: bool) {

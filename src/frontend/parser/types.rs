@@ -186,6 +186,7 @@ impl Parser {
                 // Alignas
                 TokenKind::Alignas => {
                     self.advance();
+                    self.attrs.set_c11_alignas(true);
                     if let Some(align) = self.parse_alignas_argument() {
                         self.attrs.parsed_alignas = Some(self.attrs.parsed_alignas.map_or(align, |prev| prev.max(align)));
                     }
