@@ -15,6 +15,18 @@
 //!   intra-block greedy slot reuse. Each block has its own pool; pools from
 //!   different blocks overlap since only one block executes at a time.
 //!
+//! ## VLA (Variable-Length Array) Support
+//!
+//! Functions containing `DynAlloca` instructions use dynamic stack allocation
+//! where the frame size is not fully known at compile time. The stack layout
+//! module handles the static portion of the frame; the dynamic VLA region is
+//! allocated at runtime by adjusting SP. Key considerations:
+//!
+//! - DynAlloca and StackSave destination values get permanent slots (Tier 1/2)
+//!   to ensure they survive across VLA scope boundaries
+//! - Backends must use frame-pointer-relative addressing (SP is unstable)
+//! - The `has_vla` flag in `StackLayoutContext` coordinates with backends
+//!
 //! ## Submodules
 //!
 //! - `analysis`: value use-block maps, used-value collection, dead param detection
@@ -106,6 +118,16 @@ struct StackLayoutContext {
     /// as the first operand loaded into the accumulator. These values don't need
     /// stack slots — the accumulator register cache keeps them alive.
     immediately_consumed: FxHashSet<u32>,
+    /// Whether the function contains DynAlloca (VLA) instructions.
+    /// When true, the function uses dynamic stack allocation and backends
+    /// must use frame-pointer-relative addressing (SP changes at runtime).
+    /// DynAlloca and StackSave dest values are excluded from block-local
+    /// coalescing (Tier 3) to ensure they get reliable permanent slots.
+    has_vla: bool,
+    /// Value IDs of DynAlloca and StackSave instruction destinations.
+    /// These values are critical for VLA correctness and must not be
+    /// coalesced or shared with other values.
+    vla_critical_values: FxHashSet<u32>,
 }
 
 // ── Main stack space calculation ──────────────────────────────────────────
@@ -113,6 +135,12 @@ struct StackLayoutContext {
 /// Shared stack space calculation: iterates over all instructions, assigns stack
 /// slots for allocas and value results. Arch-specific offset direction is handled
 /// by the `assign_slot` closure.
+///
+/// For VLA-containing functions (those with DynAlloca instructions), the returned
+/// `total_space` represents only the statically-known portion of the frame. The
+/// dynamic VLA allocation happens at runtime via SP adjustment. Backends must use
+/// frame-pointer-relative addressing when `state.has_dyn_alloca` is true, since
+/// SP is no longer stable after DynAlloca execution.
 ///
 /// `initial_offset`: starting offset (e.g., 0 for x86, 16 for ARM/RISC-V to skip saved regs)
 /// `assign_slot`: maps (current_space, raw_alloca_size, alignment) -> (slot_offset, new_space)
@@ -239,7 +267,39 @@ fn build_layout_context(
     );
 
     // Immediately-consumed value analysis: identify values that can skip stack slots.
-    let immediately_consumed = copy_coalescing::compute_immediately_consumed(func, lhs_first_binop);
+    let mut immediately_consumed = copy_coalescing::compute_immediately_consumed(func, lhs_first_binop);
+
+    // VLA detection: scan for DynAlloca and StackSave instructions.
+    // DynAlloca dynamically adjusts SP for variable-length arrays.
+    // StackSave captures SP before VLA allocation for later restoration.
+    // Both produce values that must survive their scope and cannot be
+    // coalesced with block-local temporaries.
+    let mut has_vla = false;
+    let mut vla_critical_values: FxHashSet<u32> = FxHashSet::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            match inst {
+                Instruction::DynAlloca { dest, .. } => {
+                    has_vla = true;
+                    vla_critical_values.insert(dest.0);
+                }
+                Instruction::StackSave { dest } => {
+                    has_vla = true;
+                    vla_critical_values.insert(dest.0);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // VLA-critical values (DynAlloca, StackSave dests) must never be
+    // treated as immediately consumed — they are referenced across
+    // scopes for VLA deallocation and stack restoration.
+    if has_vla {
+        for &v in &vla_critical_values {
+            immediately_consumed.remove(&v);
+        }
+    }
 
     // Propagate copy-alias uses into use_blocks_map so that root values account
     // for their aliases' use sites when deciding block-local vs. multi-block.
@@ -309,5 +369,7 @@ fn build_layout_context(
         dead_param_allocas,
         coalescable_allocas,
         immediately_consumed,
+        has_vla,
+        vla_critical_values,
     }
 }
