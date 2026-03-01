@@ -1,8 +1,8 @@
-// Test: binary size comparison across optimization levels
+// Test: binary size comparison payload for optimization tiers -Os and -Oz
 //
 // This test provides a code payload with many small static functions
-// and constant-bound loops, designed to be sensitive to optimization
-// level differences in binary size:
+// and constant-bound loops, designed to produce measurable binary size
+// differences when compiled at different optimization levels:
 //
 //   -O3: All functions inlined + loop unrolled -> largest binary
 //   -O2: Most functions inlined, no loop unrolling -> medium-large
@@ -10,9 +10,18 @@
 //   -Oz: No inlining at all, no loop unrolling -> smallest binary
 //
 // The test computes a deterministic result (8952) that is identical
-// regardless of optimization level, verifying correctness. The binary
-// size comparison is validated by compiling at multiple levels and
-// checking: size(-Oz) < size(-Os) < size(-O3).
+// regardless of optimization level, verifying correctness at -Os
+// (specified in compile_flags).
+//
+// Binary size comparison across optimization levels:
+// The standard CCC test harness compiles each test directory once (using
+// compile_flags) and verifies stdout/exit code. Multi-compilation size
+// comparison (verifying size(-Oz) < size(-Os) < size(-O3)) is performed
+// externally by the Gate 2 validation infrastructure (V-200 through
+// V-207), which compiles this same payload at -O2, -O3, -Os, and -Oz
+// and checks the size ordering. This test serves as:
+//   1. Correctness verification at -Os (via compile_flags)
+//   2. The shared payload for external binary size comparison
 
 int printf(const char *fmt, ...);
 

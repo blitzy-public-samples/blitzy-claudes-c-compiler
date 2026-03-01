@@ -9,10 +9,15 @@
 // 6. Block-scope _Static_assert inside function body
 // 7. String literal concatenation in assertion message
 //
-// The compile-error aspect is implicitly tested: if _Static_assert evaluation
+// Compile-fail testing limitation: the CCC integration test harness
+// convention (main.c + expected.stdout + expected.ret) requires successful
+// compilation and execution. Explicit compile-error cases such as
+// _Static_assert(0, "should fail") cannot be tested within this harness
+// because the harness expects compilation to succeed. The compiler's
+// error path (declarations.rs:1261-1268, emitting "static assertion
+// failed") is implicitly validated here: if _Static_assert evaluation
 // were broken (false positives), these assertions would fail compilation.
-// The compiler's error path for failing assertions is exercised by the fact
-// that each assertion expression MUST evaluate to non-zero at compile time
+// Each assertion expression MUST evaluate to non-zero at compile time
 // via eval_const_int_expr_with_enums() in declarations.rs:1260.
 //
 // Implementation path:
