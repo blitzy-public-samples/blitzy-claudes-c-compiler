@@ -14,6 +14,8 @@ use crate::common::fx_hash::FxHashMap;
 use crate::frontend::parser::ast::{
     BlockItem,
     CompoundStmt,
+    Declaration,
+    DerivedDeclarator,
     Expr,
     ForInit,
     FunctionDef,
@@ -85,6 +87,20 @@ impl Lowerer {
         // E.g., `void foo(int a, int b[a++])` - the `a++` must be evaluated
         // so that `a` is incremented before the function body runs.
         self.evaluate_vla_param_side_effects(func);
+
+        // Step 4.5: Pre-scan function body for VLA declarations.
+        // If found, emit an initial StackSave to capture the pre-VLA stack pointer
+        // at function entry. This is used for function-level cleanup: StackRestore
+        // in finalize_function ensures VLA stack memory is properly reclaimed on
+        // implicit return paths, including those reachable via longjmp or other
+        // non-local exits. Setting has_vla early also prevents emit_vla_alloca
+        // (in stmt.rs) from emitting a duplicate StackSave later.
+        if Self::function_body_contains_vla(&func.body) {
+            let saved_sp = self.fresh_value();
+            self.emit(Instruction::StackSave { dest: saved_sp });
+            self.func_mut().has_vla = true;
+            self.func_mut().vla_stack_save = Some(saved_sp);
+        }
 
         // Step 5: K&R float promotion
         self.handle_kr_float_promotion(func);
@@ -476,12 +492,45 @@ impl Lowerer {
     }
 
     /// Finalize a function: add implicit return, build IrFunction, push to module.
+    ///
+    /// For `_Noreturn` functions, the implicit terminator is `Unreachable` instead
+    /// of `Return`, since these functions should never return to their caller.
+    /// For functions containing VLA declarations, a `StackRestore` is emitted before
+    /// the implicit return to reclaim dynamically allocated VLA stack memory.
     fn finalize_function(&mut self, func: &FunctionDef, return_type: IrType, params: Vec<IrParam>, uses_sret: bool) {
-        if !self.func_mut().instrs.is_empty() || self.func_mut().blocks.is_empty()
-           || !matches!(self.func_mut().blocks.last().map(|b| &b.terminator), Some(Terminator::Return(_)))
-        {
-            let ret_op = if return_type == IrType::Void { None } else { Some(Operand::Const(IrConst::I32(0))) };
-            self.terminate(Terminator::Return(ret_op));
+        // Check if this function is declared _Noreturn (via attribute or _Noreturn keyword).
+        let is_noreturn = func.attrs.is_noreturn()
+            || self.noreturn_functions.contains(&func.name);
+
+        // Determine if the current block needs an implicit terminator:
+        // - There are uncommitted instructions that need a terminator, OR
+        // - No blocks have been emitted yet (empty function body)
+        let needs_implicit_term = !self.func_mut().instrs.is_empty()
+            || self.func_mut().blocks.is_empty();
+
+        // For non-_Noreturn functions, also check if the last block doesn't end
+        // with a Return (e.g., the body ended with a branch/switch/loop and
+        // control flow falls through without an explicit return).
+        let needs_return_fixup = !needs_implicit_term
+            && !is_noreturn
+            && !matches!(self.func_mut().blocks.last().map(|b| &b.terminator), Some(Terminator::Return(_)));
+
+        if needs_implicit_term || needs_return_fixup {
+            if is_noreturn {
+                // _Noreturn functions: terminate with Unreachable instead of implicit
+                // return. No VLA StackRestore needed since this path is unreachable.
+                self.terminate(Terminator::Unreachable);
+            } else {
+                // Emit VLA stack restore before the implicit return to reclaim
+                // dynamically allocated VLA stack memory. This ensures cleanup
+                // even if the function exits without explicit scope cleanup
+                // (e.g., through longjmp or falling off the end of the function).
+                if let Some(saved_sp) = self.func().vla_stack_save {
+                    self.emit(Instruction::StackRestore { ptr: saved_sp });
+                }
+                let ret_op = if return_type == IrType::Void { None } else { Some(Operand::Const(IrConst::I32(0))) };
+                self.terminate(Terminator::Return(ret_op));
+            }
         }
 
         // Merge deferred entry-block allocas into blocks[0], right after
@@ -723,6 +772,143 @@ impl Lowerer {
         match expr {
             Expr::Identifier(name, _) => name.clone(),
             _ => String::new(),
+        }
+    }
+
+    // =========================================================================
+    // VLA (Variable-Length Array) body pre-scan
+    // =========================================================================
+
+    /// Pre-scan a function body for VLA (Variable-Length Array) declarations.
+    ///
+    /// This is a lightweight AST walk (no IR emission) that checks whether any
+    /// local variable declaration in the function body has a runtime-sized array
+    /// dimension.  When true, `lower_function` emits an early `StackSave` at
+    /// function entry so that `finalize_function` can emit a matching
+    /// `StackRestore` before the implicit return terminator, ensuring VLA stack
+    /// memory is properly reclaimed on all exit paths.
+    ///
+    /// The check is intentionally conservative: any array dimension that is not a
+    /// simple integer literal, character literal, sizeof, or alignof expression is
+    /// considered potentially runtime-sized.  This over-approximation is safe
+    /// because emitting a redundant `StackSave`/`StackRestore` pair around a
+    /// function with only constant-sized arrays has no correctness impact.
+    fn function_body_contains_vla(body: &CompoundStmt) -> bool {
+        Self::compound_stmt_contains_vla(body)
+    }
+
+    /// Recursively scan a compound statement for VLA declarations.
+    fn compound_stmt_contains_vla(compound: &CompoundStmt) -> bool {
+        for item in &compound.items {
+            match item {
+                BlockItem::Declaration(decl) => {
+                    if Self::declaration_has_vla(decl) {
+                        return true;
+                    }
+                }
+                BlockItem::Statement(stmt) => {
+                    if Self::stmt_contains_vla(stmt) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Recursively scan a statement for VLA declarations.
+    fn stmt_contains_vla(stmt: &Stmt) -> bool {
+        match stmt {
+            Stmt::Compound(compound) => Self::compound_stmt_contains_vla(compound),
+            Stmt::Declaration(decl) => Self::declaration_has_vla(decl),
+            Stmt::If(_, then_stmt, else_stmt, _) => {
+                Self::stmt_contains_vla(then_stmt)
+                    || else_stmt.as_ref().map_or(false, |s| Self::stmt_contains_vla(s))
+            }
+            Stmt::While(_, body, _) | Stmt::DoWhile(body, _, _) => {
+                Self::stmt_contains_vla(body)
+            }
+            Stmt::For(init, _, _, body, _) => {
+                let init_has_vla = init.as_ref().map_or(false, |i| {
+                    if let ForInit::Declaration(decl) = i.as_ref() {
+                        Self::declaration_has_vla(decl)
+                    } else {
+                        false
+                    }
+                });
+                init_has_vla || Self::stmt_contains_vla(body)
+            }
+            Stmt::Switch(_, body, _) => Self::stmt_contains_vla(body),
+            Stmt::Label(_, inner, _)
+            | Stmt::Case(_, inner, _)
+            | Stmt::CaseRange(_, _, inner, _)
+            | Stmt::Default(inner, _) => Self::stmt_contains_vla(inner),
+            // Leaf statements: no declarations inside
+            Stmt::Expr(_) | Stmt::Return(_, _) | Stmt::Break(_) | Stmt::Continue(_)
+            | Stmt::Goto(_, _) | Stmt::GotoIndirect(_, _) | Stmt::InlineAsm { .. } => false,
+        }
+    }
+
+    /// Check whether a declaration contains a VLA (runtime-sized array dimension).
+    ///
+    /// Inspects both derived declarator array dimensions (e.g., `int arr[n]` where
+    /// the `[n]` is a `DerivedDeclarator::Array`) and the base type specifier
+    /// (e.g., a typedef that resolves to an array type).
+    fn declaration_has_vla(decl: &Declaration) -> bool {
+        for init_decl in &decl.declarators {
+            for derived in &init_decl.derived {
+                if let DerivedDeclarator::Array(Some(expr)) = derived {
+                    if !Self::expr_is_definitely_const(expr) {
+                        return true;
+                    }
+                }
+            }
+        }
+        // Also check the type specifier itself for nested array types
+        Self::type_spec_has_vla(&decl.type_spec)
+    }
+
+    /// Recursively check whether a type specifier contains a VLA dimension.
+    fn type_spec_has_vla(ts: &TypeSpecifier) -> bool {
+        match ts {
+            TypeSpecifier::Array(inner, Some(expr)) => {
+                if !Self::expr_is_definitely_const(expr) {
+                    return true;
+                }
+                Self::type_spec_has_vla(inner)
+            }
+            TypeSpecifier::Array(inner, None) => Self::type_spec_has_vla(inner),
+            TypeSpecifier::Pointer(inner, _) => Self::type_spec_has_vla(inner),
+            _ => false,
+        }
+    }
+
+    /// Conservative check: is this expression definitely a compile-time constant?
+    ///
+    /// Returns `true` for integer/character literals, sizeof, and alignof —
+    /// expressions that are always compile-time evaluable.  Returns `false` for
+    /// identifiers, function calls, binary ops, etc., which *might* be constant
+    /// (e.g., enum constants, `sizeof(struct S) + 1`) but cannot be proven so
+    /// without full constant evaluation.  The over-approximation is safe: a false
+    /// negative merely triggers a redundant `StackSave`/`StackRestore` pair.
+    fn expr_is_definitely_const(expr: &Expr) -> bool {
+        match expr {
+            // Integer and character literals are always constant
+            Expr::IntLiteral(_, _)
+            | Expr::UIntLiteral(_, _)
+            | Expr::LongLiteral(_, _)
+            | Expr::ULongLiteral(_, _)
+            | Expr::LongLongLiteral(_, _)
+            | Expr::ULongLongLiteral(_, _)
+            | Expr::CharLiteral(_, _) => true,
+            // sizeof and alignof are always compile-time constants
+            Expr::Sizeof(_, _)
+            | Expr::Alignof(_, _)
+            | Expr::AlignofExpr(_, _)
+            | Expr::GnuAlignof(_, _) => true,
+            // Casts of constant expressions are constant
+            Expr::Cast(_, inner, _) => Self::expr_is_definitely_const(inner),
+            _ => false,
         }
     }
 
