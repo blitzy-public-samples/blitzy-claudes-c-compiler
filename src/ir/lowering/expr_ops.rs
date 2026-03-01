@@ -110,6 +110,89 @@ impl Lowerer {
     fn lower_complex_binary_op(&mut self, op: &BinOp, lhs: &Expr, rhs: &Expr, lhs_ct: &CType, rhs_ct: &CType) -> Operand {
         let result_ct = self.common_complex_type(lhs_ct, rhs_ct);
 
+        // Annex G optimized paths for mixed real/complex arithmetic (C11 Annex G).
+        //
+        // When one operand is real and the other complex, certain operations can
+        // be lowered more efficiently than the general complex-complex formulas:
+        //
+        //   - real * complex / complex * real: componentwise (scalar*re, scalar*im)
+        //     Avoids the full (ac-bd, ad+bc) formula whose NaN recovery overhead
+        //     is unnecessary when the imaginary part of one operand is exactly zero.
+        //
+        //   - complex / real: componentwise (re/scalar, im/scalar)
+        //     Avoids the full division formula with its denominator scaling overhead
+        //     since there is no imaginary denominator component.
+        //
+        //   - real / complex: requires the conjugate method (real * conj(z) / |z|²),
+        //     falls through to the existing full complex division path which is correct.
+        //
+        // Note: _Atomic qualified operands are transparently handled here because
+        // is_complex() unwraps CType::Atomic(inner) to check the inner type, and
+        // the atomic load has already occurred before reaching this function.
+        let lhs_is_complex = lhs_ct.is_complex();
+        let rhs_is_complex = rhs_ct.is_complex();
+
+        if lhs_is_complex != rhs_is_complex {
+            match op {
+                BinOp::Mul => {
+                    // Mixed real * complex or complex * real:
+                    //   result = (scalar * re, scalar * im)
+                    // Normalize so the real operand is always the "scalar" side.
+                    let (real_expr, real_ct, complex_expr, complex_ct) = if lhs_is_complex {
+                        (rhs, rhs_ct, lhs, lhs_ct)
+                    } else {
+                        (lhs, lhs_ct, rhs, rhs_ct)
+                    };
+                    let scalar_val = self.lower_expr(real_expr);
+                    let complex_val = self.lower_expr(complex_expr);
+                    let complex_converted = self.convert_to_complex(complex_val, complex_ct, &result_ct);
+                    let complex_ptr = self.operand_to_value(complex_converted);
+                    let comp_ty = Self::complex_component_ir_type(&result_ct);
+                    // Cast the real scalar to the complex component float type
+                    let real_ir = IrType::from_ctype(real_ct);
+                    let converted_scalar = if real_ir != comp_ty {
+                        Operand::Value(self.emit_cast_val(scalar_val, real_ir, comp_ty))
+                    } else {
+                        scalar_val
+                    };
+                    let re = self.load_complex_real(complex_ptr, &result_ct);
+                    let im = self.load_complex_imag(complex_ptr, &result_ct);
+                    let new_re = self.emit_binop_val(IrBinOp::Mul, converted_scalar, re, comp_ty);
+                    let new_im = self.emit_binop_val(IrBinOp::Mul, converted_scalar, im, comp_ty);
+                    let result = self.alloca_complex(&result_ct);
+                    self.store_complex_parts(result, Operand::Value(new_re), Operand::Value(new_im), &result_ct);
+                    return Operand::Value(result);
+                }
+                BinOp::Div if lhs_is_complex && !rhs_is_complex => {
+                    // complex / real: (re / scalar, im / scalar)
+                    let lhs_val = self.lower_expr(lhs);
+                    let rhs_val = self.lower_expr(rhs);
+                    let lhs_converted = self.convert_to_complex(lhs_val, lhs_ct, &result_ct);
+                    let lhs_ptr = self.operand_to_value(lhs_converted);
+                    let comp_ty = Self::complex_component_ir_type(&result_ct);
+                    // Cast the real divisor to the complex component float type
+                    let rhs_ir = IrType::from_ctype(rhs_ct);
+                    let converted_scalar = if rhs_ir != comp_ty {
+                        Operand::Value(self.emit_cast_val(rhs_val, rhs_ir, comp_ty))
+                    } else {
+                        rhs_val
+                    };
+                    let re = self.load_complex_real(lhs_ptr, &result_ct);
+                    let im = self.load_complex_imag(lhs_ptr, &result_ct);
+                    let new_re = self.emit_binop_val(IrBinOp::SDiv, re, converted_scalar, comp_ty);
+                    let new_im = self.emit_binop_val(IrBinOp::SDiv, im, converted_scalar, comp_ty);
+                    let result = self.alloca_complex(&result_ct);
+                    self.store_complex_parts(result, Operand::Value(new_re), Operand::Value(new_im), &result_ct);
+                    return Operand::Value(result);
+                }
+                // real / complex: falls through to existing full complex division path
+                // which is correct per Annex G (conjugate-based optimization deferred).
+                // Add/Sub: falls through — Sub has special -0.0 handling below,
+                // Add is already componentwise and handles mixed operands correctly.
+                _ => {}
+            }
+        }
+
         // Special case: real - complex uses negation for imag part to preserve -0.0
         if *op == BinOp::Sub && !lhs_ct.is_complex() && rhs_ct.is_complex() {
             let lhs_val = self.lower_expr(lhs);
