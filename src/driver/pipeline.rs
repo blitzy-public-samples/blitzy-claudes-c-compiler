@@ -234,6 +234,21 @@ pub struct Driver {
     /// _REENTRANT=1 (matching GCC/Clang behavior). Build systems that detect
     /// pthread support via configure (ax_pthread.m4) add -lpthread themselves.
     pub(super) pthread: bool,
+    /// Whether trigraph processing is enabled (-trigraphs flag).
+    /// When true, the preprocessor performs Phase 1 trigraph replacement
+    /// before other preprocessing. Off by default (matching modern GCC).
+    pub(super) trigraphs_enabled: bool,
+    /// Whether -pedantic mode is enabled.
+    /// When true, warnings are emitted for GNU extensions and non-standard C.
+    pub(super) pedantic: bool,
+    /// Path to linker script file (-T flag).
+    /// When Some, the linker script is parsed for SECTIONS, MEMORY, ENTRY,
+    /// PROVIDE, and KEEP directives.
+    pub(super) linker_script_path: Option<std::path::PathBuf>,
+    /// Whether -Oz (aggressive size optimization) is requested.
+    /// Distinguished from -Os: both set optimize_size=true, but -Oz
+    /// additionally disables inlining entirely, whereas -Os reduces it to 50%.
+    pub(super) size_opt_aggressive: bool,
 }
 
 impl Driver {
@@ -302,6 +317,10 @@ impl Driver {
             no_unwind_tables: false,
             raw_args: Vec::new(),
             pthread: false,
+            trigraphs_enabled: false,
+            pedantic: false,
+            linker_script_path: None,
+            size_opt_aggressive: false,
         }
     }
 
@@ -799,6 +818,12 @@ impl Driver {
         if !self.gnu_extensions {
             preprocessor.set_strict_ansi(true);
         }
+        // Enable trigraph preprocessing when -trigraphs flag is active.
+        // Trigraphs (??=, ??/, etc.) are replaced in preprocessing Phase 1,
+        // before any other preprocessing. Off by default per modern GCC.
+        if self.trigraphs_enabled {
+            preprocessor.set_trigraphs(true);
+        }
         // Set inline semantics mode: -fgnu89-inline or -std=gnu89 uses GNU89
         // inline semantics (__GNUC_GNU_INLINE__), while the default C99+ mode
         // uses __GNUC_STDC_INLINE__. Projects like mpack use these macros to
@@ -918,6 +943,11 @@ impl Driver {
         let mut diagnostics = DiagnosticEngine::new();
         diagnostics.set_warning_config(self.warning_config.clone());
         diagnostics.set_color_mode(self.color_mode);
+        // Enable -pedantic mode in the diagnostic engine.
+        // When active, the diagnostic engine emits warnings for GNU extensions.
+        if self.pedantic {
+            diagnostics.set_pedantic(true);
+        }
 
         // Emit preprocessor warnings through diagnostic engine with Cpp kind
         // so they can be controlled via -Wcpp / -Wno-cpp / -Werror=cpp.
@@ -1078,11 +1108,22 @@ impl Driver {
 
         // Run optimization passes
         let t5 = std::time::Instant::now();
-        promote_allocas(&mut module);
+        // Compute effective optimization tier for pass dispatch:
+        // -O0 → 0, -O1 → 1, -O2 → 2, -O3 → 3, -Os → 4, -Oz → 5
+        let effective_opt_tier = if self.optimize_size {
+            if self.size_opt_aggressive { 5u32 } else { 4u32 }
+        } else {
+            self.opt_level
+        };
+        // Run mem2reg to promote stack allocas to SSA registers.
+        // Skip at -O0 for fastest compile (no optimization passes at all).
+        if effective_opt_tier > 0 {
+            promote_allocas(&mut module);
+        }
         if time_phases { eprintln!("[TIME] mem2reg: {:.3}s", t5.elapsed().as_secs_f64()); }
 
         let t6 = std::time::Instant::now();
-        run_passes(&mut module, self.opt_level, self.target);
+        run_passes(&mut module, effective_opt_tier, self.target);
         if time_phases { eprintln!("[TIME] opt passes: {:.3}s", t6.elapsed().as_secs_f64()); }
 
         // Lower SSA phi nodes to copies before codegen
