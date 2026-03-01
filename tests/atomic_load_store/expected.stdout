@@ -1,0 +1,9 @@
+load initial: v=42
+store_load: v=99
+overwrite: v=200
+relaxed: v=77
+release_acquire: v=55
+long initial: lv=100000
+long store_load: lv=500000
+multi: a=10 b=20 c=30
+sequential sum: sum=150
