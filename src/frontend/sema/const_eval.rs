@@ -514,6 +514,9 @@ impl<'a> SemaConstEval<'a> {
             IrConst::F32(_) => Some(CType::Float),
             IrConst::F64(_) => Some(CType::Double),
             IrConst::LongDouble(..) => Some(CType::LongDouble),
+            // Complex constants map to their corresponding complex CType.
+            IrConst::ComplexF32(_, _) => Some(CType::ComplexFloat),
+            IrConst::ComplexF64(_, _) => Some(CType::ComplexDouble),
             IrConst::Zero => Some(CType::Int),
         }
     }

@@ -24,6 +24,15 @@ pub enum IrConst {
     ///   For ARM64/RISC-V, these bytes are used directly for data emission.
     ///   For x86, they are converted to x87 80-bit format at emission time.
     LongDouble(f64, [u8; 16]),
+    /// _Complex float constant: (real_part, imaginary_part).
+    /// Used for compile-time constant folding of _Complex float expressions.
+    /// Both components stored as f32 for precision preservation.
+    ComplexF32(f32, f32),
+    /// _Complex double constant: (real_part, imaginary_part).
+    /// Used for compile-time constant folding of _Complex double expressions.
+    /// Annex G edge cases (infinity/NaN recovery) are handled during constant arithmetic
+    /// in src/common/const_arith.rs.
+    ComplexF64(f64, f64),
     Zero,
 }
 
@@ -39,6 +48,10 @@ pub enum ConstHashKey {
     F32(u32),
     F64(u64),
     LongDouble([u8; 16]),
+    /// Complex float: uses bit patterns for both components.
+    ComplexF32(u32, u32),
+    /// Complex double: uses bit patterns for both components.
+    ComplexF64(u64, u64),
     Zero,
 }
 
@@ -158,6 +171,8 @@ impl IrConst {
             IrConst::F32(v) => *v == 0.0,
             IrConst::F64(v) => *v == 0.0,
             IrConst::LongDouble(v, _) => *v == 0.0,
+            IrConst::ComplexF32(re, im) => *re == 0.0 && *im == 0.0,
+            IrConst::ComplexF64(re, im) => *re == 0.0 && *im == 0.0,
             IrConst::Zero => true,
             _ => false,
         }
@@ -204,6 +219,39 @@ impl IrConst {
         IrConst::LongDouble(val as f64, bytes)
     }
 
+    /// Create a complex float constant from real and imaginary parts.
+    pub fn complex_f32(re: f32, im: f32) -> IrConst {
+        IrConst::ComplexF32(re, im)
+    }
+
+    /// Create a complex double constant from real and imaginary parts.
+    pub fn complex_f64(re: f64, im: f64) -> IrConst {
+        IrConst::ComplexF64(re, im)
+    }
+
+    /// Extract the real and imaginary parts of a complex float constant.
+    /// Returns None if this is not a ComplexF32.
+    pub fn complex_f32_parts(&self) -> Option<(f32, f32)> {
+        match self {
+            IrConst::ComplexF32(re, im) => Some((*re, *im)),
+            _ => None,
+        }
+    }
+
+    /// Extract the real and imaginary parts of a complex double constant.
+    /// Returns None if this is not a ComplexF64.
+    pub fn complex_f64_parts(&self) -> Option<(f64, f64)> {
+        match self {
+            IrConst::ComplexF64(re, im) => Some((*re, *im)),
+            _ => None,
+        }
+    }
+
+    /// Whether this constant is a complex type (ComplexF32 or ComplexF64).
+    pub fn is_complex(&self) -> bool {
+        matches!(self, IrConst::ComplexF32(_, _) | IrConst::ComplexF64(_, _))
+    }
+
     /// Get the raw f128 bytes from a LongDouble constant.
     pub fn long_double_bytes(&self) -> Option<&[u8; 16]> {
         match self {
@@ -231,9 +279,14 @@ impl IrConst {
         }
     }
 
-    /// Returns true if this constant is one (integer only).
+    /// Returns true if this constant is one (integer or complex multiplicative identity 1+0i).
     pub fn is_one(&self) -> bool {
-        matches!(self, IrConst::I8(1) | IrConst::I16(1) | IrConst::I32(1) | IrConst::I64(1) | IrConst::I128(1))
+        match self {
+            IrConst::I8(1) | IrConst::I16(1) | IrConst::I32(1) | IrConst::I64(1) | IrConst::I128(1) => true,
+            IrConst::ComplexF32(re, im) => *re == 1.0 && *im == 0.0,
+            IrConst::ComplexF64(re, im) => *re == 1.0 && *im == 0.0,
+            _ => false,
+        }
     }
 
     /// Returns true if this constant is nonzero (for truthiness checks in const eval).
@@ -252,6 +305,8 @@ impl IrConst {
             IrConst::F32(v) => ConstHashKey::F32(v.to_bits()),
             IrConst::F64(v) => ConstHashKey::F64(v.to_bits()),
             IrConst::LongDouble(_, bytes) => ConstHashKey::LongDouble(bytes),
+            IrConst::ComplexF32(re, im) => ConstHashKey::ComplexF32(re.to_bits(), im.to_bits()),
+            IrConst::ComplexF64(re, im) => ConstHashKey::ComplexF64(re.to_bits(), im.to_bits()),
             IrConst::Zero => ConstHashKey::Zero,
         }
     }
@@ -267,6 +322,9 @@ impl IrConst {
             IrConst::F32(v) => Some(v as f64),
             IrConst::F64(v) => Some(v),
             IrConst::LongDouble(v, _) => Some(v),
+            // Complex constants don't have a single f64 representation.
+            // Callers that need complex components should use complex_f32_parts/complex_f64_parts.
+            IrConst::ComplexF32(_, _) | IrConst::ComplexF64(_, _) => None,
             IrConst::Zero => Some(0.0),
         }
     }
@@ -327,7 +385,8 @@ impl IrConst {
             IrConst::I64(v) => Some(v),
             IrConst::I128(v) => Some(v as i64),
             IrConst::Zero => Some(0),
-            IrConst::F32(_) | IrConst::F64(_) | IrConst::LongDouble(..) => None,
+            IrConst::F32(_) | IrConst::F64(_) | IrConst::LongDouble(..)
+            | IrConst::ComplexF32(_, _) | IrConst::ComplexF64(_, _) => None,
         }
     }
 
@@ -341,7 +400,8 @@ impl IrConst {
             IrConst::I64(v) => Some(v as i128),
             IrConst::I128(v) => Some(v),
             IrConst::Zero => Some(0),
-            IrConst::F32(_) | IrConst::F64(_) | IrConst::LongDouble(..) => None,
+            IrConst::F32(_) | IrConst::F64(_) | IrConst::LongDouble(..)
+            | IrConst::ComplexF32(_, _) | IrConst::ComplexF64(_, _) => None,
         }
     }
 
@@ -354,7 +414,8 @@ impl IrConst {
             IrConst::I64(v) => Some(v as u64),
             IrConst::I128(v) => Some(v as u64),
             IrConst::Zero => Some(0),
-            IrConst::F32(_) | IrConst::F64(_) | IrConst::LongDouble(..) => None,
+            IrConst::F32(_) | IrConst::F64(_) | IrConst::LongDouble(..)
+            | IrConst::ComplexF32(_, _) | IrConst::ComplexF64(_, _) => None,
         }
     }
 
@@ -386,6 +447,14 @@ impl IrConst {
                 // Default: emit full f128 bytes. For architecture-specific emission,
                 // use push_le_bytes_x86 (x87 format) or push_le_bytes_riscv (f128 format).
                 out.extend_from_slice(f128_bytes);
+            }
+            IrConst::ComplexF32(re, im) => {
+                out.extend_from_slice(&re.to_bits().to_le_bytes());
+                out.extend_from_slice(&im.to_bits().to_le_bytes());
+            }
+            IrConst::ComplexF64(re, im) => {
+                out.extend_from_slice(&re.to_bits().to_le_bytes());
+                out.extend_from_slice(&im.to_bits().to_le_bytes());
             }
             IrConst::I128(v) => {
                 let le_bytes = v.to_le_bytes();
@@ -507,6 +576,11 @@ impl IrConst {
             (IrConst::F32(_), IrType::F32) => return *self,
             (IrConst::F64(_), IrType::F64) => return *self,
             (IrConst::LongDouble(..), IrType::F64 | IrType::F128) => return *self,
+            // Complex -> float coercions: extract real part per C11 §6.3.1.7
+            (IrConst::ComplexF32(re, _), IrType::F32) => return IrConst::F32(*re),
+            (IrConst::ComplexF64(re, _), IrType::F64) => return IrConst::F64(*re),
+            (IrConst::ComplexF32(re, _), IrType::F64) => return IrConst::F64(*re as f64),
+            (IrConst::ComplexF64(re, _), IrType::F32) => return IrConst::F32(*re as f32),
             _ => {}
         }
         // Convert integer types via from_i64, with unsigned-aware paths
@@ -624,6 +698,16 @@ impl IrConst {
             IrConst::F32(v) => v.to_bits().to_le_bytes().to_vec(),
             IrConst::F64(v) => v.to_bits().to_le_bytes().to_vec(),
             IrConst::LongDouble(_, bytes) => bytes.to_vec(),
+            IrConst::ComplexF32(re, im) => {
+                let mut bytes = re.to_bits().to_le_bytes().to_vec();
+                bytes.extend_from_slice(&im.to_bits().to_le_bytes());
+                bytes
+            }
+            IrConst::ComplexF64(re, im) => {
+                let mut bytes = re.to_bits().to_le_bytes().to_vec();
+                bytes.extend_from_slice(&im.to_bits().to_le_bytes());
+                bytes
+            }
             IrConst::Zero => vec![0],
         }
     }

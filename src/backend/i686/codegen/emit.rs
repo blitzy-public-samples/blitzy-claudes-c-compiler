@@ -270,6 +270,12 @@ impl I686Codegen {
                         let low = i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
                         emit!(self.state, "    movl ${}, %eax", low);
                     }
+                    // Complex constants: load the real part (low 32 bits) into eax.
+                    IrConst::ComplexF32(re, _) => emit!(self.state, "    movl ${}, %eax", re.to_bits() as i32),
+                    IrConst::ComplexF64(re, _) => {
+                        let low = re.to_bits() as i32;
+                        emit!(self.state, "    movl ${}, %eax", low);
+                    }
                     IrConst::Zero => {
                         self.state.emit("    xorl %eax, %eax");
                     }
@@ -355,6 +361,12 @@ impl I686Codegen {
                     }
                     IrConst::LongDouble(_, bytes) => {
                         let low = i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                        emit!(self.state, "    movl ${}, %ecx", low);
+                    }
+                    // Complex constants: load the real part (low 32 bits) into ecx.
+                    IrConst::ComplexF32(re, _) => emit!(self.state, "    movl ${}, %ecx", re.to_bits() as i32),
+                    IrConst::ComplexF64(re, _) => {
+                        let low = re.to_bits() as i32;
                         emit!(self.state, "    movl ${}, %ecx", low);
                     }
                     IrConst::Zero => {

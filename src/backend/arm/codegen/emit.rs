@@ -1020,6 +1020,9 @@ impl ArmCodegen {
                     IrConst::F64(v) => self.emit_load_imm64("x0", v.to_bits() as i64),
                     IrConst::LongDouble(v, _) => self.emit_load_imm64("x0", v.to_bits() as i64),
                     IrConst::I128(v) => self.emit_load_imm64("x0", *v as i64), // truncate to 64-bit
+                    // Complex constants: load the real part into x0.
+                    IrConst::ComplexF32(re, _) => self.emit_load_imm64("x0", re.to_bits() as i64),
+                    IrConst::ComplexF64(re, _) => self.emit_load_imm64("x0", re.to_bits() as i64),
                     IrConst::Zero => self.state.emit("    mov x0, #0"),
                 }
             }

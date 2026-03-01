@@ -454,6 +454,24 @@ impl X86Codegen {
                             self.state.out.emit_instr_imm_reg("    movabsq", low, "rax");
                         }
                     }
+                    // Complex constants: load the real part into rax (low 64 bits of the pair).
+                    // Full complex handling is done at the lowering level with separate components.
+                    IrConst::ComplexF32(re, _) => {
+                        let bits = re.to_bits() as u64;
+                        if bits == 0 {
+                            self.state.emit("    xorl %eax, %eax");
+                        } else {
+                            self.state.out.emit_instr_imm_reg("    movq", bits as i64, "rax");
+                        }
+                    }
+                    IrConst::ComplexF64(re, _) => {
+                        let bits = re.to_bits();
+                        if bits == 0 {
+                            self.state.emit("    xorl %eax, %eax");
+                        } else {
+                            self.state.out.emit_instr_imm_reg("    movabsq", bits as i64, "rax");
+                        }
+                    }
                     IrConst::Zero => self.state.emit("    xorl %eax, %eax"),
                 }
             }
@@ -551,6 +569,23 @@ impl X86Codegen {
                             self.state.out.emit_instr_imm_reg("    movq", low, "rcx");
                         } else {
                             self.state.out.emit_instr_imm_reg("    movabsq", low, "rcx");
+                        }
+                    }
+                    // Complex constants: load the real part into rcx.
+                    IrConst::ComplexF32(re, _) => {
+                        let bits = re.to_bits() as u64;
+                        if bits == 0 {
+                            self.state.emit("    xorl %ecx, %ecx");
+                        } else {
+                            self.state.out.emit_instr_imm_reg("    movq", bits as i64, "rcx");
+                        }
+                    }
+                    IrConst::ComplexF64(re, _) => {
+                        let bits = re.to_bits();
+                        if bits == 0 {
+                            self.state.emit("    xorl %ecx, %ecx");
+                        } else {
+                            self.state.out.emit_instr_imm_reg("    movabsq", bits as i64, "rcx");
                         }
                     }
                     IrConst::Zero => self.state.emit("    xorl %ecx, %ecx"),

@@ -330,6 +330,13 @@ impl RiscvCodegen {
                         self.state.emit_fmt(format_args!("    li t0, {}", bits as i64));
                     }
                     IrConst::I128(v) => self.state.emit_fmt(format_args!("    li t0, {}", *v as i64)),
+                    // Complex constants: load the real part into t0.
+                    IrConst::ComplexF32(re, _) => {
+                        self.state.emit_fmt(format_args!("    li t0, {}", re.to_bits() as i64));
+                    }
+                    IrConst::ComplexF64(re, _) => {
+                        self.state.emit_fmt(format_args!("    li t0, {}", re.to_bits() as i64));
+                    }
                     IrConst::Zero => self.state.emit("    li t0, 0"),
                 }
             }

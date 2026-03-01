@@ -1638,6 +1638,23 @@ pub fn emit_const_data(out: &mut AsmOutput, c: &IrConst, ty: IrType, ptr_dir: Pt
                 out.emit_fmt(format_args!("    {} {}", ptr_dir.as_str(), hi as i64));
             }
         }
+        IrConst::ComplexF32(re, im) => {
+            // Complex float: emit real part then imaginary part as two .long directives.
+            out.emit_fmt(format_args!("    .long {}", re.to_bits()));
+            out.emit_fmt(format_args!("    .long {}", im.to_bits()));
+        }
+        IrConst::ComplexF64(re, im) => {
+            // Complex double: emit real part then imaginary part.
+            let re_bits = re.to_bits();
+            let im_bits = im.to_bits();
+            if ptr_dir.is_32bit() {
+                emit_u64_as_long_pair(out, re_bits);
+                emit_u64_as_long_pair(out, im_bits);
+            } else {
+                out.emit_fmt(format_args!("    {} {}", ptr_dir.as_str(), re_bits as i64));
+                out.emit_fmt(format_args!("    {} {}", ptr_dir.as_str(), im_bits as i64));
+            }
+        }
         IrConst::Zero => {
             let size = ty.size();
             out.emit_fmt(format_args!("    .zero {}", if size == 0 { 4 } else { size }));
