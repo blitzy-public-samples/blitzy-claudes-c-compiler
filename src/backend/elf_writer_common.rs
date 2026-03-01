@@ -56,7 +56,7 @@ use crate::backend::elf::{self as elf_mod,
     SHT_PROGBITS,
     SHF_ALLOC, SHF_EXECINSTR, SHF_GROUP,
     STB_LOCAL, STB_GLOBAL, STB_WEAK,
-    STT_NOTYPE, STT_OBJECT, STT_FUNC, STT_TLS,
+    STT_NOTYPE, STT_OBJECT, STT_FUNC, STT_TLS, STT_GNU_IFUNC,
     STV_DEFAULT, STV_INTERNAL, STV_HIDDEN, STV_PROTECTED,
     resolve_numeric_labels, parse_section_flags,
     ElfConfig, ObjSection, ObjSymbol, ObjReloc, SymbolTableInput,
@@ -756,6 +756,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 Some(SymbolKind::Function) => STT_FUNC,
                 Some(SymbolKind::Object) => STT_OBJECT,
                 Some(SymbolKind::TlsObject) => STT_TLS,
+                Some(SymbolKind::GnuIndirectFunction) => STT_GNU_IFUNC,
                 Some(SymbolKind::NoType) | None => STT_NOTYPE,
             };
 
@@ -1357,6 +1358,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
                     SymbolKind::Function => STT_FUNC,
                     SymbolKind::Object => STT_OBJECT,
                     SymbolKind::TlsObject => STT_TLS,
+                    SymbolKind::GnuIndirectFunction => STT_GNU_IFUNC,
                     SymbolKind::NoType => STT_NOTYPE,
                 };
                 (name.clone(), stt)

@@ -823,6 +823,7 @@ mod tests {
             symbol_attrs: vec![],
             char16_string_literals: vec![],
             symver_directives: vec![],
+            ifunc_aliases: vec![],
         };
 
         let eliminated = module.for_each_function(run_gvn_function);
@@ -899,6 +900,7 @@ mod tests {
             symbol_attrs: vec![],
             char16_string_literals: vec![],
             symver_directives: vec![],
+            ifunc_aliases: vec![],
         };
 
         let eliminated = module.for_each_function(run_gvn_function);
@@ -966,6 +968,7 @@ mod tests {
             symbol_attrs: vec![],
             char16_string_literals: vec![],
             symver_directives: vec![],
+            ifunc_aliases: vec![],
         };
 
         let eliminated = module.for_each_function(run_gvn_function);
@@ -1039,6 +1042,7 @@ mod tests {
             symbol_attrs: vec![],
             char16_string_literals: vec![],
             symver_directives: vec![],
+            ifunc_aliases: vec![],
         };
 
         let eliminated = module.for_each_function(run_gvn_function);
@@ -1112,6 +1116,7 @@ mod tests {
             symbol_attrs: vec![],
             char16_string_literals: vec![],
             symver_directives: vec![],
+            ifunc_aliases: vec![],
         };
 
         let eliminated = module.for_each_function(run_gvn_function);
@@ -1190,6 +1195,7 @@ mod tests {
             symbol_attrs: vec![],
             char16_string_literals: vec![],
             symver_directives: vec![],
+            ifunc_aliases: vec![],
         };
 
         let eliminated = module.for_each_function(run_gvn_function);
@@ -1297,6 +1303,7 @@ mod tests {
             symbol_attrs: vec![],
             char16_string_literals: vec![],
             symver_directives: vec![],
+            ifunc_aliases: vec![],
         };
 
         let eliminated = module.for_each_function(run_gvn_function);
@@ -1356,6 +1363,7 @@ mod tests {
             symbol_attrs: vec![],
             char16_string_literals: vec![],
             symver_directives: vec![],
+            ifunc_aliases: vec![],
         }
     }
 

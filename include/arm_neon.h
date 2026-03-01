@@ -884,6 +884,16 @@ vaddq_u8(uint8x16_t __a, uint8x16_t __b)
     return __ret;
 }
 
+/* vaddq_s8: add int8x16_t element-wise */
+static __inline__ int8x16_t __attribute__((__always_inline__))
+vaddq_s8(int8x16_t __a, int8x16_t __b)
+{
+    int8x16_t __ret;
+    for (int __i = 0; __i < 16; __i++)
+        __ret.__val[__i] = __a.__val[__i] + __b.__val[__i];
+    return __ret;
+}
+
 static __inline__ uint8x8_t __attribute__((__always_inline__))
 vadd_u8(uint8x8_t __a, uint8x8_t __b)
 {
@@ -1525,6 +1535,30 @@ vmulq_u32(uint32x4_t __a, uint32x4_t __b)
     return __ret;
 }
 
+/* vaddq_s32: add int32x4_t element-wise */
+static __inline__ int32x4_t __attribute__((__always_inline__))
+vaddq_s32(int32x4_t __a, int32x4_t __b)
+{
+    int32x4_t __ret;
+    __ret.__val[0] = __a.__val[0] + __b.__val[0];
+    __ret.__val[1] = __a.__val[1] + __b.__val[1];
+    __ret.__val[2] = __a.__val[2] + __b.__val[2];
+    __ret.__val[3] = __a.__val[3] + __b.__val[3];
+    return __ret;
+}
+
+/* vmulq_s32: multiply int32x4_t element-wise */
+static __inline__ int32x4_t __attribute__((__always_inline__))
+vmulq_s32(int32x4_t __a, int32x4_t __b)
+{
+    int32x4_t __ret;
+    __ret.__val[0] = __a.__val[0] * __b.__val[0];
+    __ret.__val[1] = __a.__val[1] * __b.__val[1];
+    __ret.__val[2] = __a.__val[2] * __b.__val[2];
+    __ret.__val[3] = __a.__val[3] * __b.__val[3];
+    return __ret;
+}
+
 /* === Arithmetic: u64 === */
 
 /* vaddq_u64: add uint64x2_t element-wise */
@@ -1532,6 +1566,16 @@ static __inline__ uint64x2_t __attribute__((__always_inline__))
 vaddq_u64(uint64x2_t __a, uint64x2_t __b)
 {
     uint64x2_t __ret;
+    __ret.__val[0] = __a.__val[0] + __b.__val[0];
+    __ret.__val[1] = __a.__val[1] + __b.__val[1];
+    return __ret;
+}
+
+/* vaddq_s64: add int64x2_t element-wise */
+static __inline__ int64x2_t __attribute__((__always_inline__))
+vaddq_s64(int64x2_t __a, int64x2_t __b)
+{
+    int64x2_t __ret;
     __ret.__val[0] = __a.__val[0] + __b.__val[0];
     __ret.__val[1] = __a.__val[1] + __b.__val[1];
     return __ret;
@@ -2529,6 +2573,26 @@ vsubq_u32(uint32x4_t __a, uint32x4_t __b)
     return __ret;
 }
 
+/* vsubq_s32: element-wise subtract int32x4_t */
+static __inline__ int32x4_t __attribute__((__always_inline__))
+vsubq_s32(int32x4_t __a, int32x4_t __b)
+{
+    int32x4_t __ret;
+    for (int __i = 0; __i < 4; __i++)
+        __ret.__val[__i] = __a.__val[__i] - __b.__val[__i];
+    return __ret;
+}
+
+/* vsubq_s64: element-wise subtract int64x2_t */
+static __inline__ int64x2_t __attribute__((__always_inline__))
+vsubq_s64(int64x2_t __a, int64x2_t __b)
+{
+    int64x2_t __ret;
+    __ret.__val[0] = __a.__val[0] - __b.__val[0];
+    __ret.__val[1] = __a.__val[1] - __b.__val[1];
+    return __ret;
+}
+
 /* vmaxq_u16: element-wise unsigned max uint16x8_t */
 static __inline__ uint16x8_t __attribute__((__always_inline__))
 vmaxq_u16(uint16x8_t __a, uint16x8_t __b)
@@ -2564,6 +2628,26 @@ static __inline__ uint16x8_t __attribute__((__always_inline__))
 vmulq_u16(uint16x8_t __a, uint16x8_t __b)
 {
     uint16x8_t __ret;
+    for (int __i = 0; __i < 8; __i++)
+        __ret.__val[__i] = __a.__val[__i] * __b.__val[__i];
+    return __ret;
+}
+
+/* vmulq_s8: element-wise multiply int8x16_t */
+static __inline__ int8x16_t __attribute__((__always_inline__))
+vmulq_s8(int8x16_t __a, int8x16_t __b)
+{
+    int8x16_t __ret;
+    for (int __i = 0; __i < 16; __i++)
+        __ret.__val[__i] = __a.__val[__i] * __b.__val[__i];
+    return __ret;
+}
+
+/* vmulq_s16: element-wise multiply int16x8_t */
+static __inline__ int16x8_t __attribute__((__always_inline__))
+vmulq_s16(int16x8_t __a, int16x8_t __b)
+{
+    int16x8_t __ret;
     for (int __i = 0; __i < 8; __i++)
         __ret.__val[__i] = __a.__val[__i] * __b.__val[__i];
     return __ret;

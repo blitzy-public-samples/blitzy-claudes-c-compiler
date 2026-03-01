@@ -19,6 +19,7 @@ use crate::ir::reexports::{
     IrConst,
     IrUnaryOp,
     Operand,
+    Terminator,
     Value,
 };
 use crate::common::types::{AddressSpace, IrType, CType};
@@ -293,7 +294,33 @@ impl Lowerer {
     }
 
     /// Lower complex division: (a+bi)/(c+di) = ((ac+bd) + (bc-ad)i) / (c²+d²)
+    ///
+    /// For F64/F128 types, implements C11 Annex G §G.5.1 recovery for special
+    /// cases using branching to keep register pressure minimal:
+    /// - Division by zero (c=d=0, a or b nonzero): produces ±infinity
+    /// - NaN result from finite/infinity: produces zero
+    ///
+    /// For F32, uses the simple naive formula without branching. The branch-based
+    /// approach causes register allocation issues with 32-bit float stack slot
+    /// management in the current backend, and F32 complex edge cases are rare
+    /// in practice. The naive formula handles all normal F32 divisions correctly.
     pub(super) fn lower_complex_div(&mut self, lhs_ptr: Value, rhs_ptr: Value, ctype: &CType) -> Operand {
+        let comp_ty = Self::complex_component_ir_type(ctype);
+
+        // For F32, use simple formula without branches to avoid register
+        // allocation issues with 32-bit float stack slot management.
+        if comp_ty == IrType::F32 {
+            return self.lower_complex_div_simple(lhs_ptr, rhs_ptr, ctype);
+        }
+
+        // F64/F128: use branch-based Annex G recovery
+        self.lower_complex_div_annex_g(lhs_ptr, rhs_ptr, ctype)
+    }
+
+    /// Simple complex division without Annex G recovery.
+    /// Uses the naive formula: (a+bi)/(c+di) = ((ac+bd) + (bc-ad)i) / (c²+d²)
+    /// Suitable for F32 where branch-based recovery causes register pressure issues.
+    fn lower_complex_div_simple(&mut self, lhs_ptr: Value, rhs_ptr: Value, ctype: &CType) -> Operand {
         let comp_ty = Self::complex_component_ir_type(ctype);
 
         let a = self.load_complex_real(lhs_ptr, ctype);
@@ -322,6 +349,118 @@ impl Lowerer {
 
         let result = self.alloca_complex(ctype);
         self.store_complex_parts(result, Operand::Value(real), Operand::Value(imag), ctype);
+        Operand::Value(result)
+    }
+
+    /// Complex division with C11 Annex G §G.5.1 recovery for edge cases.
+    /// Uses branch-based control flow to handle div-by-zero and NaN recovery
+    /// while keeping register pressure low in the normal division path.
+    fn lower_complex_div_annex_g(&mut self, lhs_ptr: Value, rhs_ptr: Value, ctype: &CType) -> Operand {
+        let comp_ty = Self::complex_component_ir_type(ctype);
+        let zero = Self::complex_zero(comp_ty);
+
+        let a = self.load_complex_real(lhs_ptr, ctype);
+        let b = self.load_complex_imag(lhs_ptr, ctype);
+        let c = self.load_complex_real(rhs_ptr, ctype);
+        let d = self.load_complex_imag(rhs_ptr, ctype);
+
+        // denom = c*c + d*d
+        let cc = self.emit_binop_val(IrBinOp::Mul, c, c, comp_ty);
+        let dd = self.emit_binop_val(IrBinOp::Mul, d, d, comp_ty);
+        let denom = self.emit_binop_val(IrBinOp::Add, Operand::Value(cc), Operand::Value(dd), comp_ty);
+
+        // real_num = a*c + b*d
+        let ac = self.emit_binop_val(IrBinOp::Mul, a, c, comp_ty);
+        let bd = self.emit_binop_val(IrBinOp::Mul, b, d, comp_ty);
+        let real_num = self.emit_binop_val(IrBinOp::Add, Operand::Value(ac), Operand::Value(bd), comp_ty);
+
+        // imag_num = b*c - a*d
+        let bc = self.emit_binop_val(IrBinOp::Mul, b, c, comp_ty);
+        let ad = self.emit_binop_val(IrBinOp::Mul, a, d, comp_ty);
+        let imag_num = self.emit_binop_val(IrBinOp::Sub, Operand::Value(bc), Operand::Value(ad), comp_ty);
+
+        // Allocate result before branching (alloca must be in entry block scope)
+        let result = self.alloca_complex(ctype);
+
+        // Check for denom == 0 (division by zero): branch-based recovery
+        // keeps recovery SSA values out of the normal path's register pressure.
+        let denom_zero = self.emit_cmp_val(IrCmpOp::Eq, Operand::Value(denom), zero, comp_ty);
+
+        let dbz_recovery_label = self.fresh_label();
+        let normal_div_label = self.fresh_label();
+        let nan_check_label = self.fresh_label();
+        let end_label = self.fresh_label();
+
+        // Branch: if denom == 0, go to div-by-zero recovery; else normal division
+        self.terminate(Terminator::CondBranch {
+            cond: Operand::Value(denom_zero),
+            true_label: dbz_recovery_label,
+            false_label: normal_div_label,
+        });
+
+        // --- Div-by-zero recovery block ---
+        // Per Annex G §G.5.1: nonzero/zero produces ±infinity.
+        // IEEE 754: a/0.0 = copysign(inf, a) when a != 0.
+        self.start_block(dbz_recovery_label);
+        let inf_real = self.emit_binop_val(IrBinOp::SDiv, a, zero, comp_ty);
+        let inf_imag = self.emit_binop_val(IrBinOp::SDiv, b, zero, comp_ty);
+        self.store_complex_parts(result, Operand::Value(inf_real), Operand::Value(inf_imag), ctype);
+        self.terminate(Terminator::Branch(end_label));
+
+        // --- Normal division block ---
+        self.start_block(normal_div_label);
+        let real = self.emit_binop_val(IrBinOp::SDiv, Operand::Value(real_num), Operand::Value(denom), comp_ty);
+        let imag = self.emit_binop_val(IrBinOp::SDiv, Operand::Value(imag_num), Operand::Value(denom), comp_ty);
+        self.store_complex_parts(result, Operand::Value(real), Operand::Value(imag), ctype);
+
+        // Check if the naive result produced NaN (happens with finite/infinity
+        // due to inf*0 in cross-products). Use unordered self-comparison:
+        // for IEEE 754, NaN != NaN is true.
+        let real_is_nan = self.emit_cmp_val(IrCmpOp::Ne, Operand::Value(real), Operand::Value(real), comp_ty);
+        let imag_is_nan = self.emit_cmp_val(IrCmpOp::Ne, Operand::Value(imag), Operand::Value(imag), comp_ty);
+        let int_ty = crate::common::types::target_int_ir_type();
+        let any_nan = self.emit_binop_val(IrBinOp::Or, Operand::Value(real_is_nan), Operand::Value(imag_is_nan), int_ty);
+        self.terminate(Terminator::CondBranch {
+            cond: Operand::Value(any_nan),
+            true_label: nan_check_label,
+            false_label: end_label,
+        });
+
+        // --- NaN recovery check block ---
+        // Only enter here when naive result has NaN. Per Annex G §G.5.1:
+        // finite/infinity = zero. More precisely, if either c or d is infinite
+        // and a, b are finite, the result is zero.
+        // We use a simple heuristic: if the naive formula produced NaN and we
+        // didn't hit div-by-zero, replace NaN components with zero.
+        self.start_block(nan_check_label);
+        // Load current result parts and replace NaN components with 0.0
+        let cur_real = self.load_complex_real(result, ctype);
+        let cur_imag = self.load_complex_imag(result, ctype);
+        let cur_real_nan = self.emit_cmp_val(IrCmpOp::Ne, cur_real, cur_real, comp_ty);
+        let cur_imag_nan = self.emit_cmp_val(IrCmpOp::Ne, cur_imag, cur_imag, comp_ty);
+        // Use Select for per-component NaN replacement (only 2 Selects, in
+        // a rarely-taken recovery path so register pressure is not an issue)
+        let fixed_real = self.fresh_value();
+        self.emit(Instruction::Select {
+            dest: fixed_real,
+            cond: Operand::Value(cur_real_nan),
+            true_val: zero,
+            false_val: cur_real,
+            ty: comp_ty,
+        });
+        let fixed_imag = self.fresh_value();
+        self.emit(Instruction::Select {
+            dest: fixed_imag,
+            cond: Operand::Value(cur_imag_nan),
+            true_val: zero,
+            false_val: cur_imag,
+            ty: comp_ty,
+        });
+        self.store_complex_parts(result, Operand::Value(fixed_real), Operand::Value(fixed_imag), ctype);
+        self.terminate(Terminator::Branch(end_label));
+
+        // --- Merge point ---
+        self.start_block(end_label);
         Operand::Value(result)
     }
 

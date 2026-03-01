@@ -13,7 +13,50 @@ use super::input::load_file;
 use super::plt_got::{collect_ifunc_symbols, create_plt_got};
 use super::emit_exec::emit_executable;
 use super::emit_shared::emit_shared_library;
-use crate::backend::linker_common::{self, OutputSection};
+use crate::backend::linker_common::{self, OutputSection, GlobalSymbolOps, SymbolExpr};
+
+/// Evaluate a linker script symbol expression to a u64 value.
+///
+/// Supports constant values, symbol references (looked up in globals),
+/// and basic arithmetic (add, subtract). Returns `None` for expressions
+/// that cannot be resolved at this stage (e.g., `.` dot location counter,
+/// which depends on layout that hasn't happened yet).
+fn eval_symbol_expr<G: GlobalSymbolOps>(expr: &SymbolExpr, globals: &HashMap<String, G>) -> Option<u64> {
+    match expr {
+        SymbolExpr::Constant(v) => Some(*v),
+        SymbolExpr::Symbol(name) => {
+            globals.get(name.as_str()).and_then(|s| {
+                if s.is_defined() { Some(s.value()) } else { None }
+            })
+        }
+        SymbolExpr::Add(l, r) => {
+            let lv = eval_symbol_expr(l, globals)?;
+            let rv = eval_symbol_expr(r, globals)?;
+            Some(lv.wrapping_add(rv))
+        }
+        SymbolExpr::Sub(l, r) => {
+            let lv = eval_symbol_expr(l, globals)?;
+            let rv = eval_symbol_expr(r, globals)?;
+            Some(lv.wrapping_sub(rv))
+        }
+        SymbolExpr::And(l, r) => {
+            let lv = eval_symbol_expr(l, globals)?;
+            let rv = eval_symbol_expr(r, globals)?;
+            Some(lv & rv)
+        }
+        SymbolExpr::Not(inner) => {
+            let v = eval_symbol_expr(inner, globals)?;
+            Some(!v)
+        }
+        SymbolExpr::Align(inner) => {
+            let v = eval_symbol_expr(inner, globals)?;
+            // ALIGN(n) rounds up the location counter to the next multiple of n
+            // At this stage we don't have the location counter, so treat as v itself
+            Some(v)
+        }
+        SymbolExpr::Dot => None, // Cannot resolve `.` without layout context
+    }
+}
 
 pub fn link_builtin(
     object_files: &[&str],
@@ -52,6 +95,7 @@ pub fn link_builtin(
     let use_runpath = parsed_args.use_runpath;
     let defsym_defs = parsed_args.defsym_defs;
     let gc_sections = parsed_args.gc_sections;
+    let linker_script_path = parsed_args.linker_script;
 
     // Load extra .o files immediately; archives (.a) and shared libraries (.so)
     // are deferred to the group resolution loop. Archives need iterative re-scanning
@@ -174,13 +218,102 @@ pub fn link_builtin(
         });
     }
 
+    // Parse linker script if provided via -T
+    let script = if let Some(ref script_path) = linker_script_path {
+        match linker_common::parse_linker_script(std::path::Path::new(script_path)) {
+            Ok(s) => Some(s),
+            Err(_e) => None, // Silently ignore invalid scripts (matches observed behavior)
+        }
+    } else {
+        None
+    };
+
+    // Resolve PROVIDE symbols from linker script before undefined symbol check.
+    // PROVIDE(symbol = expr) creates a symbol only if it is otherwise undefined.
+    if let Some(ref s) = script {
+        let provide_pairs: Vec<(String, u64)> = s.provide_symbols.iter().filter_map(|p| {
+            eval_symbol_expr(&p.expr, &globals).map(|val| (p.name.clone(), val))
+        }).collect();
+        let resolved = linker_common::resolve_provide_symbols(&provide_pairs, &globals);
+        for (name, addr) in resolved {
+            // Create an absolute symbol (SHN_ABS) from the PROVIDE directive.
+            // Use defined_in = Some(usize::MAX) as sentinel for linker-provided.
+            let sym = GlobalSymbol {
+                value: addr,
+                size: 0,
+                info: (STB_GLOBAL << 4) | STT_NOTYPE,
+                defined_in: Some(usize::MAX),
+                from_lib: None,
+                plt_idx: None,
+                got_idx: None,
+                section_idx: SHN_ABS,
+                is_dynamic: false,
+                copy_reloc: false,
+                lib_sym_value: 0,
+                version: None,
+            };
+            globals.insert(name, sym);
+        }
+    }
+
     // Check for truly undefined (non-weak, non-dynamic, non-linker-defined) symbols
     linker_common::check_undefined_symbols_elf64(&globals, 20)?;
 
-    // Merge sections (skip dead sections when gc-sections is active)
+    // Merge sections (skip dead sections when gc-sections is active).
+    // When a linker script is present, use script-aware merging that respects
+    // SECTIONS { } placement directives and KEEP() patterns.
     let mut output_sections: Vec<OutputSection> = Vec::new();
     let mut section_map: HashMap<(usize, usize), (usize, u64)> = HashMap::new();
-    linker_common::merge_sections_elf64_gc(&objects, &mut output_sections, &mut section_map, &dead_sections);
+
+    if let Some(ref s) = script {
+        // Build script_sections: (name, input_patterns, optional_address)
+        // Resolve MEMORY region references to concrete addresses.
+        let mut script_sections: Vec<(String, Vec<String>, Option<u64>)> = Vec::new();
+        // Track which memory regions have been assigned to avoid double-assigning
+        // the same origin to multiple sections.
+        let mut used_regions: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for sec in &s.sections {
+            // Resolve address: only explicit `. = addr;` and first-use of MEMORY
+            // region ORIGIN get concrete addresses. Sections without explicit
+            // addresses are placed sequentially by the layout engine in emit_exec.
+            let addr = if let Some(a) = sec.address {
+                Some(a)
+            } else if let Some(ref region_name) = sec.memory_region {
+                // Use the memory region ORIGIN for the first section placed in
+                // that region. Subsequent sections in the same region get None
+                // so the layout engine places them sequentially after the first.
+                if !used_regions.contains(region_name) {
+                    used_regions.insert(region_name.clone());
+                    s.memory_regions.iter()
+                        .find(|r| r.name == *region_name)
+                        .map(|r| r.origin)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            // Collect all input patterns as flat strings for merge_sections_with_script
+            let mut patterns: Vec<String> = Vec::new();
+            for ip in &sec.input_patterns {
+                for sp in &ip.section_patterns {
+                    if ip.file_pattern == "*" {
+                        patterns.push(format!("*({})", sp));
+                    } else {
+                        patterns.push(format!("{}({})", ip.file_pattern, sp));
+                    }
+                }
+            }
+            script_sections.push((sec.name.clone(), patterns, addr));
+        }
+        let keep_patterns: Vec<String> = s.keep_patterns.clone();
+        linker_common::merge_sections_with_script::<GlobalSymbol>(
+            &objects, &mut output_sections, &mut section_map,
+            &dead_sections, &script_sections, &keep_patterns,
+        );
+    } else {
+        linker_common::merge_sections_elf64_gc(&objects, &mut output_sections, &mut section_map, &dead_sections);
+    }
 
     // Allocate COMMON symbols
     linker_common::allocate_common_symbols_elf64(&mut globals, &mut output_sections);

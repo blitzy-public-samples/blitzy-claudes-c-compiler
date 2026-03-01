@@ -110,6 +110,9 @@ pub enum SymbolKind {
     Object,
     TlsObject,
     NoType,
+    /// GNU indirect function (IFUNC) — the symbol points to a resolver function
+    /// that returns the actual implementation address at runtime.
+    GnuIndirectFunction,
 }
 
 /// Size expression: either a constant or `.-name` (current position minus symbol).
@@ -794,6 +797,7 @@ fn parse_type_directive(args: &str) -> Result<AsmItem, String> {
         "@object" | "%object" | "STT_OBJECT" => SymbolKind::Object,
         "@tls_object" | "%tls_object" | "STT_TLS" => SymbolKind::TlsObject,
         "@notype" | "%notype" | "STT_NOTYPE" => SymbolKind::NoType,
+        "@gnu_indirect_function" | "%gnu_indirect_function" | "STT_GNU_IFUNC" => SymbolKind::GnuIndirectFunction,
         _ => return Err(format!("unknown symbol type: {}", kind_str)),
     };
     Ok(AsmItem::SymbolType(name, kind))

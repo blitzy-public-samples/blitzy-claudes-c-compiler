@@ -611,6 +611,14 @@ impl Parser {
         self.advance(); // consume "SECTIONS"
         self.expect_punct('{')?;
 
+        // Track the location counter (`. = expr`) so that subsequent output
+        // sections inherit the address from the most recent dot assignment.
+        // This is essential for linker scripts like:
+        //   . = 0x600000;
+        //   .data : { *(.data) }
+        // where the .data section should be placed at 0x600000.
+        let mut pending_dot_addr: Option<u64> = None;
+
         while !self.at_end() && !self.is_punct('}') {
             // Dot assignment: `. = expr ;`
             if self.is_ident(".") {
@@ -618,7 +626,7 @@ impl Parser {
                 // If the token after "." is "=", it is a dot assignment.
                 if self.pos + 1 < self.tokens.len() && self.tokens[self.pos + 1] == Token::Punct('=')
                 {
-                    self.parse_dot_assignment(script)?;
+                    pending_dot_addr = self.parse_dot_assignment();
                     continue;
                 }
             }
@@ -646,7 +654,17 @@ impl Parser {
             }
 
             // Otherwise, parse an output section rule.
+            // If there is a pending dot address, apply it to the next section.
             self.parse_output_section(script)?;
+            if let Some(addr) = pending_dot_addr.take() {
+                // Apply the pending location counter to the section we just parsed.
+                // The section was just pushed, so it's the last one in the list.
+                if let Some(sec) = script.sections.last_mut() {
+                    if sec.address.is_none() {
+                        sec.address = Some(addr);
+                    }
+                }
+            }
         }
 
         if self.is_punct('}') {
@@ -656,20 +674,23 @@ impl Parser {
     }
 
     /// Parse a dot assignment: `. = expr ;`
-    fn parse_dot_assignment(&mut self, script: &mut LinkerScript) -> Result<(), String> {
+    ///
+    /// Returns the evaluated address if the expression is a simple constant,
+    /// so that the `parse_sections_block` caller can propagate the location
+    /// counter to subsequent output sections.
+    fn parse_dot_assignment(&mut self) -> Option<u64> {
         self.advance(); // consume "."
-        self.expect_punct('=')?;
-        // Parse the expression but we do not store standalone dot assignments
-        // in `LinkerScript` at this level — they are informational. However,
-        // we still need to consume them correctly.
-        let _expr = self.parse_symbol_expr()?;
+        if self.expect_punct('=').is_err() { return None; }
+        let expr = match self.parse_symbol_expr() {
+            Ok(e) => e,
+            Err(_) => { self.skip_semicolons(); return None; }
+        };
         self.skip_semicolons();
 
-        // We could store these in a more advanced representation. For now,
-        // the expression is consumed and discarded (sufficient for the subset
-        // of kernel linker scripts CCC targets).
-        let _ = _expr;
-        Ok(())
+        // Evaluate simple constant expressions to propagate the location counter.
+        // More complex expressions (involving `.` or symbols) cannot be resolved
+        // at parse time and are ignored — the linker's layout pass handles them.
+        eval_constant_expr(&expr)
     }
 
     /// Parse an output section definition:
@@ -833,7 +854,7 @@ impl Parser {
                 if self.pos + 1 < self.tokens.len()
                     && self.tokens[self.pos + 1] == Token::Punct('=')
                 {
-                    self.parse_dot_assignment(script)?;
+                    let _ = self.parse_dot_assignment();
                     continue;
                 }
             }
@@ -1301,6 +1322,29 @@ impl Parser {
 ///
 /// Returns `Ok(LinkerScript)` on success, or `Err(String)` with a
 /// human-readable error message on parse failure.
+/// Evaluate a `SymbolExpr` that contains only constants and basic arithmetic.
+///
+/// Returns `None` for expressions that require runtime context (symbol
+/// references, `.` dot location counter). Used by `parse_dot_assignment` to
+/// resolve simple location counter assignments like `. = 0x600000`.
+fn eval_constant_expr(expr: &SymbolExpr) -> Option<u64> {
+    match expr {
+        SymbolExpr::Constant(v) => Some(*v),
+        SymbolExpr::Add(l, r) => {
+            Some(eval_constant_expr(l)?.wrapping_add(eval_constant_expr(r)?))
+        }
+        SymbolExpr::Sub(l, r) => {
+            Some(eval_constant_expr(l)?.wrapping_sub(eval_constant_expr(r)?))
+        }
+        SymbolExpr::And(l, r) => {
+            Some(eval_constant_expr(l)? & eval_constant_expr(r)?)
+        }
+        SymbolExpr::Not(inner) => Some(!eval_constant_expr(inner)?),
+        SymbolExpr::Align(inner) => eval_constant_expr(inner),
+        SymbolExpr::Symbol(_) | SymbolExpr::Dot => None,
+    }
+}
+
 pub fn parse_linker_script(path: &Path) -> Result<LinkerScript, String> {
     let content = std::fs::read_to_string(path).map_err(|e| {
         format!(

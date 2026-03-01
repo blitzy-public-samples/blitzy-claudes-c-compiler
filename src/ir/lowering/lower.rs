@@ -652,6 +652,15 @@ impl Lowerer {
                                 ));
                             }
                         }
+                        // Collect __attribute__((ifunc("resolver"))) declarations
+                        if let Some(ref resolver) = declarator.attrs.ifunc_resolver {
+                            if !declarator.name.is_empty() {
+                                self.module.ifunc_aliases.push((
+                                    declarator.name.clone(),
+                                    resolver.clone(),
+                                ));
+                            }
+                        }
                         // Collect __attribute__((symver("..."))) declarations
                         if let Some(ref sv) = declarator.attrs.symver {
                             if !declarator.name.is_empty() {

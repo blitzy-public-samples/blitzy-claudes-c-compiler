@@ -603,6 +603,7 @@ pub fn generate_module(cg: &mut dyn ArchCodegen, module: &IrModule, source_mgr: 
     emit_extern_visibility_directives(cg, module, &referenced_symbols);
     emit_functions_and_sections(cg, module, source_mgr, &file_table);
     emit_aliases(cg, module);
+    emit_ifunc_aliases(cg, module);
     emit_symver_directives(cg, module);
     emit_symbol_attrs(cg, module, &referenced_symbols);
     emit_init_fini_arrays(cg, module, ptr_dir);
@@ -864,6 +865,25 @@ fn emit_aliases(cg: &mut dyn ArchCodegen, module: &IrModule) {
             cg.state().emit_fmt(format_args!(".globl {}", alias_name));
         }
         cg.state().emit_fmt(format_args!(".set {},{}", alias_name, target_name));
+    }
+}
+
+/// Emit IFUNC symbol aliases from `__attribute__((ifunc("resolver")))`.
+///
+/// For each IFUNC symbol, emits:
+/// - `.type ifunc_name, @gnu_indirect_function` to mark as STT_GNU_IFUNC
+/// - `.globl ifunc_name` to make the symbol globally visible
+/// - `.set ifunc_name, resolver` to point the symbol at the resolver function
+///
+/// At link time, the linker creates IPLT stubs with IRELATIVE relocations.
+/// At runtime, the dynamic linker (or CRT for static linking) calls the
+/// resolver function once and caches the result in the IFUNC GOT slot.
+fn emit_ifunc_aliases(cg: &mut dyn ArchCodegen, module: &IrModule) {
+    for (ifunc_name, resolver_name) in &module.ifunc_aliases {
+        cg.state().emit("");
+        cg.state().emit_fmt(format_args!(".type {}, @gnu_indirect_function", ifunc_name));
+        cg.state().emit_fmt(format_args!(".globl {}", ifunc_name));
+        cg.state().emit_fmt(format_args!(".set {},{}", ifunc_name, resolver_name));
     }
 }
 

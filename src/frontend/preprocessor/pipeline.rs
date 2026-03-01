@@ -288,6 +288,45 @@ impl Preprocessor {
             // be processed regardless of pending multi-line accumulation. Other
             // directives (#include, #define, etc.) are only processed when there's
             // no pending line in included files.
+            //
+            // Also recognize the digraph `%:` as equivalent to `#` per C11 §6.4.6.
+            // Digraphs are alternate token spellings recognized unconditionally.
+            // When `%:` starts a line, it functions as a preprocessor directive
+            // introducer just like `#`. We normalize it to `#`-prefixed form so
+            // process_directive and all downstream handling works unchanged.
+            let digraph_normalized: String;
+            let trimmed = if !trimmed.starts_with('#') && trimmed.starts_with("%:") {
+                // Replace digraph sequences for directive processing per C11 §6.4.6:
+                //   %:%: → ##  (token paste operator, must be replaced FIRST)
+                //   %:   → #   (preprocessor directive / stringify operator)
+                // This normalization ensures process_directive and macro expansion
+                // see canonical `#` and `##` tokens.
+                let s = &trimmed;
+                let mut norm = String::with_capacity(s.len());
+                let bytes = s.as_bytes();
+                let mut j = 0;
+                while j < bytes.len() {
+                    if j + 3 < bytes.len()
+                        && bytes[j] == b'%' && bytes[j + 1] == b':'
+                        && bytes[j + 2] == b'%' && bytes[j + 3] == b':'
+                    {
+                        norm.push_str("##");
+                        j += 4;
+                    } else if j + 1 < bytes.len()
+                        && bytes[j] == b'%' && bytes[j + 1] == b':'
+                    {
+                        norm.push('#');
+                        j += 2;
+                    } else {
+                        norm.push(bytes[j] as char);
+                        j += 1;
+                    }
+                }
+                digraph_normalized = norm;
+                digraph_normalized.as_str()
+            } else {
+                trimmed
+            };
             let is_directive = trimmed.starts_with('#');
             let is_conditional_directive = if is_directive {
                 let after_hash = trimmed[1..].trim_start();

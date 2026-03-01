@@ -8,8 +8,10 @@ use std::collections::HashMap;
 use super::elf::*;
 use super::types::GlobalSymbol;
 
-pub(super) fn collect_ifunc_symbols(globals: &HashMap<String, GlobalSymbol>, is_static: bool) -> Vec<String> {
-    if !is_static { return Vec::new(); }
+pub(super) fn collect_ifunc_symbols(globals: &HashMap<String, GlobalSymbol>, _is_static: bool) -> Vec<String> {
+    // Collect IFUNC symbols for both static and dynamic executables.
+    // For static: IRELATIVE relocations go in .rela.iplt, processed by CRT startup.
+    // For dynamic: IRELATIVE relocations go in .rela.dyn, processed by ld.so.
     let mut ifunc_symbols: Vec<String> = globals.iter()
         .filter(|(_, g)| g.defined_in.is_some() && (g.info & 0xf) == STT_GNU_IFUNC)
         .map(|(n, _)| n.clone())

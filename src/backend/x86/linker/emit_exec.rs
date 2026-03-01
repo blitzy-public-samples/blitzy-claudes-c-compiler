@@ -167,7 +167,11 @@ pub(super) fn emit_executable(
         !n.is_empty() && !*p && globals.get(n).map(|g| g.is_dynamic && !g.copy_reloc && g.plt_idx.is_none()).unwrap_or(false)
     }).count();
     let rela_dyn_count = rela_dyn_glob_count + copy_reloc_syms.len();
-    let rela_dyn_size = rela_dyn_count as u64 * 24;
+    // For dynamic executables, include IRELATIVE entries in .rela.dyn so the
+    // dynamic linker (ld.so) processes them at startup via DT_RELA/DT_RELASZ.
+    let num_ifunc_early = ifunc_symbols.len();
+    let rela_dyn_irelative_count = if !is_static { num_ifunc_early } else { 0 };
+    let rela_dyn_size = (rela_dyn_count + rela_dyn_irelative_count) as u64 * 24;
 
     // Build .gnu.hash table for hashed symbols (copy-reloc + exported)
     // Number of hashed symbols = total symbols after the non-hashed imports
@@ -375,7 +379,37 @@ pub(super) fn emit_executable(
     // RW segment
     offset = (offset + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
     let rw_page_offset = offset;
-    let rw_page_addr = BASE_ADDR + offset;
+
+    // Linker script virtual address adjustment: if any writable data section has
+    // a script-assigned address (sec.addr != 0 from merge_sections_with_script),
+    // shift the entire RW segment's virtual addresses to start at that address
+    // while keeping file offsets sequential and compact. This satisfies the ELF
+    // constraint p_offset % p_align == p_vaddr % p_align since both the file
+    // offset and virtual address are page-aligned.
+    let rw_script_base: Option<u64> = {
+        let mut min_addr: Option<u64> = None;
+        for sec in output_sections.iter() {
+            if sec.addr != 0 && sec.flags & SHF_ALLOC != 0 && sec.flags & SHF_WRITE != 0 {
+                if min_addr.is_none() || sec.addr < min_addr.unwrap() {
+                    min_addr = Some(sec.addr);
+                }
+            }
+        }
+        min_addr
+    };
+    // Clear script addresses so the sequential layout below works correctly.
+    // The virtual addresses will be computed using rw_vaddr_base below.
+    for sec in output_sections.iter_mut() {
+        if sec.flags & SHF_ALLOC != 0 && sec.flags & SHF_WRITE != 0 {
+            sec.addr = 0;
+        }
+    }
+    // rw_vaddr_base: virtual address of the start of the RW segment.
+    // If linker script specified a data address, use it; otherwise default.
+    let rw_vaddr_base: u64 = rw_script_base.unwrap_or(BASE_ADDR + rw_page_offset);
+    // Helper: compute virtual address from file offset within the RW segment.
+    // vaddr = rw_vaddr_base + (file_offset - rw_page_offset)
+    let rw_page_addr = rw_vaddr_base;
 
     let mut init_array_addr = 0u64; let mut init_array_size = 0u64;
     let mut fini_array_addr = 0u64; let mut fini_array_size = 0u64;
@@ -384,7 +418,7 @@ pub(super) fn emit_executable(
         if sec.name == ".init_array" {
             let a = sec.alignment.max(8);
             offset = (offset + a - 1) & !(a - 1);
-            sec.addr = BASE_ADDR + offset; sec.file_offset = offset;
+            sec.addr = rw_vaddr_base + (offset - rw_page_offset); sec.file_offset = offset;
             init_array_addr = sec.addr; init_array_size = sec.mem_size;
             offset += sec.mem_size; break;
         }
@@ -393,29 +427,31 @@ pub(super) fn emit_executable(
         if sec.name == ".fini_array" {
             let a = sec.alignment.max(8);
             offset = (offset + a - 1) & !(a - 1);
-            sec.addr = BASE_ADDR + offset; sec.file_offset = offset;
+            sec.addr = rw_vaddr_base + (offset - rw_page_offset); sec.file_offset = offset;
             fini_array_addr = sec.addr; fini_array_size = sec.mem_size;
             offset += sec.mem_size; break;
         }
     }
 
     offset = (offset + 7) & !7;
-    let dynamic_offset = offset; let dynamic_addr = BASE_ADDR + offset; offset += dynamic_size;
+    let dynamic_offset = offset; let dynamic_addr = rw_vaddr_base + (offset - rw_page_offset); offset += dynamic_size;
     offset = (offset + 7) & !7;
-    let got_offset = offset; let got_addr = BASE_ADDR + offset; offset += got_size;
+    let got_offset = offset; let got_addr = rw_vaddr_base + (offset - rw_page_offset); offset += got_size;
     offset = (offset + 7) & !7;
-    let got_plt_offset = offset; let got_plt_addr = BASE_ADDR + offset; offset += got_plt_size;
+    let got_plt_offset = offset; let got_plt_addr = rw_vaddr_base + (offset - rw_page_offset); offset += got_plt_size;
 
     // IFUNC GOT (8 bytes per entry, stores resolver addresses initially)
     offset = (offset + 7) & !7;
-    let ifunc_got_offset = offset; let ifunc_got_addr = BASE_ADDR + offset;
+    let ifunc_got_offset = offset; let ifunc_got_addr = rw_vaddr_base + (offset - rw_page_offset);
     let ifunc_got_size = num_ifunc as u64 * 8;
     offset += ifunc_got_size;
 
     // .rela.iplt (24 bytes per RELA entry for R_X86_64_IRELATIVE)
+    // For dynamic executables, IRELATIVE entries go in .rela.dyn instead,
+    // so rela_iplt_size is 0. For static, CRT uses __rela_iplt_start/__rela_iplt_end.
     offset = (offset + 7) & !7;
-    let rela_iplt_offset = offset; let rela_iplt_addr = BASE_ADDR + offset;
-    let rela_iplt_size = num_ifunc as u64 * 24;
+    let rela_iplt_offset = offset; let rela_iplt_addr = rw_vaddr_base + (offset - rw_page_offset);
+    let rela_iplt_size = if is_static { num_ifunc as u64 * 24 } else { 0 };
     offset += rela_iplt_size;
 
     for sec in output_sections.iter_mut() {
@@ -424,7 +460,7 @@ pub(super) fn emit_executable(
            sec.flags & SHF_TLS == 0 {
             let a = sec.alignment.max(1);
             offset = (offset + a - 1) & !(a - 1);
-            sec.addr = BASE_ADDR + offset; sec.file_offset = offset;
+            sec.addr = rw_vaddr_base + (offset - rw_page_offset); sec.file_offset = offset;
             offset += sec.mem_size;
         }
     }
@@ -439,7 +475,7 @@ pub(super) fn emit_executable(
         if sec.flags & SHF_TLS != 0 && sec.flags & SHF_ALLOC != 0 && sec.sh_type != SHT_NOBITS {
             let a = sec.alignment.max(1);
             offset = (offset + a - 1) & !(a - 1);
-            sec.addr = BASE_ADDR + offset; sec.file_offset = offset;
+            sec.addr = rw_vaddr_base + (offset - rw_page_offset); sec.file_offset = offset;
             if tls_addr == 0 { tls_addr = sec.addr; tls_file_offset = offset; tls_align = a; }
             tls_file_size += sec.mem_size;
             tls_mem_size += sec.mem_size;
@@ -449,7 +485,7 @@ pub(super) fn emit_executable(
     // If only .tbss (NOBITS TLS) exists with no .tdata, we still need a TLS segment.
     // Set tls_addr/tls_file_offset to the current position so TPOFF calculations work.
     if tls_addr == 0 && has_tls_sections {
-        tls_addr = BASE_ADDR + offset;
+        tls_addr = rw_vaddr_base + (offset - rw_page_offset);
         tls_file_offset = offset;
     }
     for sec in output_sections.iter_mut() {
@@ -465,7 +501,7 @@ pub(super) fn emit_executable(
     tls_mem_size = (tls_mem_size + tls_align - 1) & !(tls_align - 1);
     let has_tls = tls_addr != 0;
 
-    let bss_addr = BASE_ADDR + offset;
+    let bss_addr = rw_vaddr_base + (offset - rw_page_offset);
     let mut bss_size = 0u64;
     for sec in output_sections.iter_mut() {
         if sec.sh_type == SHT_NOBITS && sec.flags & SHF_ALLOC != 0 && sec.flags & SHF_TLS == 0 {
@@ -735,6 +771,18 @@ pub(super) fn emit_executable(
                 w64(&mut out, rd, copy_addr); w64(&mut out, rd+8, (si << 32) | 5); w64(&mut out, rd+16, 0);
                 rd += 24;
             }
+        }
+
+        // R_X86_64_IRELATIVE relocations for IFUNC symbols (dynamic executables).
+        // The dynamic linker (ld.so) processes these at startup: for each entry,
+        // it calls the resolver function (r_addend) and stores the returned
+        // function pointer into the GOT slot (r_offset).
+        for (i, &resolver_addr) in ifunc_resolver_addrs.iter().enumerate() {
+            let r_offset = ifunc_got_addr + i as u64 * 8;
+            w64(&mut out, rd, r_offset);
+            w64(&mut out, rd+8, R_X86_64_IRELATIVE as u64);
+            w64(&mut out, rd+16, resolver_addr);
+            rd += 24;
         }
 
         // .rela.plt

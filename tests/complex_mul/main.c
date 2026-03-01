@@ -3,10 +3,14 @@
  * Integration test for _Complex multiplication edge cases.
  * Verifies correct complex multiplication semantics per C11 Annex G,
  * including infinity handling, sign preservation, and precision edge cases.
+ *
+ * F32 and volatile/infinity tests use separate functions to avoid
+ * register allocation interactions between mixed-type complex operations.
  */
 #include <stdio.h>
 
-int main(void) {
+/* Tests 1-9: _Complex double basic multiplication tests */
+static void test_basic_multiplication(void) {
     /* Test 1: Basic multiplication: (1+2i)(3+4i)
      * ac=1*3=3, bd=2*4=8, ad=1*4=4, bc=2*3=6
      * real = ac - bd = 3 - 8 = -5
@@ -59,17 +63,22 @@ int main(void) {
      * real = 0 - 6 = -6, imag = 0 + 0 = 0 */
     _Complex double r9 = (0.0 + 2.0i) * (0.0 + 3.0i);
     printf("pure_imag: %.1f %.1f\n", __real__ r9, __imag__ r9);
+}
 
-    /* Test 10: _Complex float multiplication: (2+3i)(4+1i) = 5+14i
+/* Test 10: _Complex float multiplication in its own function to avoid
+ * register allocation interactions with F64 complex operations. */
+static void test_float_multiplication(void) {
+    /* (2+3i)(4+1i) = 5+14i
      * ac=8, bd=3, ad=2, bc=12
      * real = 8 - 3 = 5, imag = 2 + 12 = 14 */
     _Complex float rf = (2.0f + 3.0fi) * (4.0f + 1.0fi);
     printf("float_mul: %.1f %.1f\n", __real__ rf, __imag__ rf);
+}
 
+/* Tests 11-12: Annex G infinity tests in their own function to isolate
+ * volatile/infinity values from the normal multiplication register pressure. */
+static void test_infinity_multiplication(void) {
     /* Test 11: Annex G - infinity * finite produces infinity
-     * (inf+0i)*(1+1i): ac=inf, bd=0, ad=inf, bc=0
-     * real = inf - 0 = inf, imag = inf + 0 = inf
-     * At least one component must be infinite.
      * Use volatile to prevent compile-time constant folding. */
     volatile double v_one = 1.0;
     volatile double v_zero = 0.0;
@@ -79,12 +88,14 @@ int main(void) {
     int has_inf11 = __builtin_isinf(__real__ r11) || __builtin_isinf(__imag__ r11);
     printf("inf_times_finite: %d\n", has_inf11);
 
-    /* Test 12: Annex G - finite * infinity (commutativity)
-     * (1+1i)*(inf+0i): same result by commutativity of multiplication */
+    /* Test 12: Annex G - finite * infinity (commutativity) */
     _Complex double r12 = (1.0 + 1.0i) * inf_c;
     int has_inf12 = __builtin_isinf(__real__ r12) || __builtin_isinf(__imag__ r12);
     printf("finite_times_inf: %d\n", has_inf12);
+}
 
+/* Tests 13-14: Additional multiplication tests */
+static void test_extra_multiplication(void) {
     /* Test 13: Negation via multiplication: (-1+0i)(3+4i) = -3-4i
      * ac=-3, bd=0, ad=-4, bc=0 */
     _Complex double r13 = (-1.0 + 0.0i) * (3.0 + 4.0i);
@@ -96,6 +107,12 @@ int main(void) {
      * imag = 40000 + 60000 = 100000 */
     _Complex double r14 = (100.0 + 200.0i) * (300.0 + 400.0i);
     printf("large: %.1f %.1f\n", __real__ r14, __imag__ r14);
+}
 
+int main(void) {
+    test_basic_multiplication();
+    test_float_multiplication();
+    test_infinity_multiplication();
+    test_extra_multiplication();
     return 0;
 }

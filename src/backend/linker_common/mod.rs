@@ -96,6 +96,7 @@ pub use symbols::{
     OutputSection, GlobalSymbolOps,
     is_linker_defined_symbol,
     is_valid_c_identifier_for_section, resolve_start_stop_symbols,
+    resolve_provide_symbols, resolve_entry_symbol,
 };
 
 // merge.rs

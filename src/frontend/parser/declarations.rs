@@ -185,6 +185,7 @@ impl Parser {
         // Capture alias/weak/visibility/section/error attributes
         let is_weak = self.attrs.parsing_weak();
         let alias_target = self.attrs.parsing_alias_target.take();
+        let ifunc_resolver = self.attrs.parsing_ifunc_resolver.take();
         // Use explicit __attribute__((visibility(...))) if present, otherwise fall back
         // to the current #pragma GCC visibility default (if any).
         let visibility = self.attrs.parsing_visibility.take()
@@ -209,6 +210,7 @@ impl Parser {
         decl_attrs.set_fastcall(is_fastcall);
         decl_attrs.set_naked(is_naked);
         decl_attrs.alias_target = alias_target;
+        decl_attrs.ifunc_resolver = ifunc_resolver;
         decl_attrs.visibility = visibility;
         decl_attrs.section = section;
         decl_attrs.asm_register = first_asm_reg;
@@ -552,6 +554,9 @@ impl Parser {
         if let Some(ref target) = self.attrs.parsing_alias_target {
             last_decl.attrs.alias_target = Some(target.clone());
         }
+        if let Some(ref resolver) = self.attrs.parsing_ifunc_resolver {
+            last_decl.attrs.ifunc_resolver = Some(resolver.clone());
+        }
         if let Some(ref vis) = self.attrs.parsing_visibility {
             last_decl.attrs.visibility = Some(vis.clone());
         }
@@ -578,6 +583,7 @@ impl Parser {
         }
         self.attrs.set_weak(false);
         self.attrs.parsing_alias_target = None;
+        self.attrs.parsing_ifunc_resolver = None;
         self.attrs.parsing_visibility = None;
         self.attrs.parsing_section = None;
         self.attrs.set_error_attr(false);
@@ -760,6 +766,9 @@ impl Parser {
                     da.set_error_attr(self.attrs.parsing_error_attr());
                     if let Some(ref target) = self.attrs.parsing_alias_target {
                         da.alias_target = Some(target.clone());
+                    }
+                    if let Some(ref resolver) = self.attrs.parsing_ifunc_resolver {
+                        da.ifunc_resolver = Some(resolver.clone());
                     }
                     if let Some(ref vis) = self.attrs.parsing_visibility {
                         da.visibility = Some(vis.clone());

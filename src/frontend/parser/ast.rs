@@ -428,6 +428,10 @@ pub struct DeclAttributes {
     flags: u16,
     /// __attribute__((alias("target"))) - this symbol is an alias for target
     pub alias_target: Option<String>,
+    /// __attribute__((ifunc("resolver"))) - GNU IFUNC indirect function dispatch.
+    /// The resolver function is called at program startup to select the actual
+    /// implementation. The linker creates IPLT stubs with IRELATIVE relocations.
+    pub ifunc_resolver: Option<String>,
     /// __attribute__((visibility("hidden"))) etc.
     pub visibility: Option<String>,
     /// __attribute__((section("..."))) - place in specific ELF section

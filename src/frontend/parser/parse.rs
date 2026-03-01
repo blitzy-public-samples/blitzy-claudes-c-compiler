@@ -122,6 +122,8 @@ pub(super) struct ParsedDeclAttrs {
     // --- GCC attributes with values ---
     /// `__attribute__((alias("target")))` target symbol name.
     pub parsing_alias_target: Option<String>,
+    /// `__attribute__((ifunc("resolver")))` IFUNC resolver function name.
+    pub parsing_ifunc_resolver: Option<String>,
     /// `__attribute__((visibility("...")))` visibility string.
     pub parsing_visibility: Option<String>,
     /// `__attribute__((section("...")))` section name.
@@ -731,6 +733,10 @@ impl Parser {
             "alias" | "__alias__" => {
                 self.advance();
                 self.attrs.parsing_alias_target = self.parse_string_attr_arg();
+            }
+            "ifunc" | "__ifunc__" => {
+                self.advance();
+                self.attrs.parsing_ifunc_resolver = self.parse_string_attr_arg();
             }
             "weakref" | "__weakref__" => {
                 self.attrs.set_weak(true);

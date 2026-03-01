@@ -79,6 +79,10 @@ impl Lowerer {
                         if let Some(ref target) = declarator.attrs.alias_target {
                             referenced.insert(target.clone());
                         }
+                        // IFUNC resolver targets reference the resolver function
+                        if let Some(ref resolver) = declarator.attrs.ifunc_resolver {
+                            referenced.insert(resolver.clone());
+                        }
                     }
                 }
                 ExternalDecl::TopLevelAsm(_) => {
