@@ -133,6 +133,17 @@ pub trait TypeConvertContext {
                 let elem_ctype = self.resolve_type_spec_to_ctype(inner);
                 CType::Vector(Box::new(elem_ctype), *total_bytes)
             }
+
+            // === C11 _Atomic(type-name) specifier ===
+            // When the parser adds TypeSpecifier::Atomic(Box<TypeSpecifier>) to ast.rs,
+            // uncomment the following match arm to resolve _Atomic(T) to CType::Atomic(T).
+            // The _Atomic qualifier form (without parens) is handled by the parser producing
+            // a TypeSpecifier::Atomic wrapping the base type, so both forms converge here.
+            //
+            // TypeSpecifier::Atomic(inner) => {
+            //     let inner_type = self.resolve_type_spec_to_ctype(inner);
+            //     inner_type.with_atomic()
+            // }
         }
     }
 }
@@ -348,4 +359,42 @@ pub fn build_full_ctype_with_base(
         }
         result
     }
+}
+
+/// Validate an `_Alignas` alignment value per C11 §6.7.5.
+///
+/// C11 requires that the alignment specified by `_Alignas` be a positive power of two.
+/// This function validates that requirement and returns `Ok(alignment)` if the value
+/// is valid, or an appropriate error message if not.
+///
+/// Note: The additional C11 constraint that `_Alignas` cannot reduce alignment below
+/// the natural alignment of the declared type is enforced by semantic analysis (sema),
+/// not by this function, because it requires knowledge of the type's natural alignment.
+///
+/// # Examples
+///
+/// Valid power-of-two alignments:
+/// ```ignore
+/// assert_eq!(validate_alignas(1), Ok(1));
+/// assert_eq!(validate_alignas(4), Ok(4));
+/// assert_eq!(validate_alignas(128), Ok(128));
+/// ```
+///
+/// Rejected zero alignment:
+/// ```ignore
+/// assert_eq!(validate_alignas(0), Err("alignment must be positive"));
+/// ```
+///
+/// Rejected non-power-of-two alignment:
+/// ```ignore
+/// assert_eq!(validate_alignas(3), Err("alignment must be a power of 2"));
+/// ```
+pub fn validate_alignas(alignment: usize) -> Result<usize, &'static str> {
+    if alignment == 0 {
+        return Err("alignment must be positive");
+    }
+    if !alignment.is_power_of_two() {
+        return Err("alignment must be a power of 2");
+    }
+    Ok(alignment)
 }
