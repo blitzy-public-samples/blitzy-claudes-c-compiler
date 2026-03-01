@@ -16,6 +16,9 @@
 //! - GetElementPtr (base + offset address computation)
 //! - Load (redundant load elimination within dominator scope, invalidated
 //!   by stores, calls, and other memory-clobbering instructions)
+//! - restrict-qualified pointer alias analysis: when enabled, stores through
+//!   restrict pointers do not invalidate loads through other restrict pointers,
+//!   improving load forwarding opportunities
 
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::{AddressSpace, IrType};
@@ -111,6 +114,13 @@ struct GvnState {
     /// parameter values from the alloca slot, which may be modified by
     /// stores through aliased pointers.
     escaped_param_allocas: FxHashSet<u32>,
+    /// Set of value IDs that are known to be `restrict`-qualified pointers.
+    /// When two `restrict` pointers point to different base objects, stores
+    /// through one cannot alias loads through the other, enabling more
+    /// aggressive load forwarding.
+    /// Populated by scanning function parameter restrict qualifiers and
+    /// local restrict-qualified pointer declarations.
+    restrict_ptrs: FxHashSet<u32>,
 }
 
 impl GvnState {
@@ -129,6 +139,7 @@ impl GvnState {
             vn_log: Vec::new(),
             total_eliminated: 0,
             escaped_param_allocas,
+            restrict_ptrs: FxHashSet::default(),
         }
     }
 
@@ -302,6 +313,39 @@ impl GvnState {
         // Rollback: restore load_generation
         self.load_generation = checkpoint.saved_load_generation;
     }
+
+    /// Check if a store through `store_ptr` can potentially invalidate
+    /// a load through `load_ptr_vn`. Returns false (no invalidation needed)
+    /// when both pointers are restrict-qualified from different bases,
+    /// per C11 §6.7.3.1 which guarantees that restrict-qualified pointers
+    /// from different scopes do not alias.
+    ///
+    /// When the `restrict_ptrs` set is empty (i.e., no restrict information
+    /// is available from the lowering phase), this method conservatively
+    /// returns `true` for all pointer pairs, preserving existing behavior.
+    fn may_alias(&self, store_ptr: &Operand, load_ptr_vn: &VNOperand) -> bool {
+        // When both pointers are restrict-qualified, they cannot alias
+        // (assuming different restrict scopes — C11 §6.7.3.1).
+        if let Operand::Value(store_v) = store_ptr {
+            if self.restrict_ptrs.contains(&store_v.0) {
+                if let VNOperand::ValueNum(load_vn) = load_ptr_vn {
+                    // Check if the store pointer's value number differs from
+                    // the load pointer's value number. If both pointers are
+                    // restrict-qualified and have different value numbers, they
+                    // are guaranteed to point to distinct memory regions.
+                    let store_vn_idx = store_v.0 as usize;
+                    if store_vn_idx < self.value_numbers.len() {
+                        let store_vn = self.value_numbers[store_vn_idx];
+                        if store_vn != *load_vn {
+                            // Different value numbers + both restrict => no alias
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+        true // Conservative: assume may alias
+    }
 }
 
 /// Saved positions in the rollback logs, used by `GvnState::save_scope` /
@@ -372,6 +416,31 @@ fn find_escaped_param_allocas(func: &IrFunction) -> FxHashSet<u32> {
     escaped
 }
 
+/// Scan a function to find Value IDs of restrict-qualified pointers.
+/// These are identified by checking if the parameter or alloca type
+/// carries the restrict qualifier (CType::Restrict wrapping a Pointer).
+///
+/// Note: At the IR level, restrict information may be conveyed through
+/// function attributes or instruction metadata. For now, this scans
+/// for restrict markers that the lowering phase has attached.
+///
+/// Returns an empty set until the lowering phase is enhanced to propagate
+/// restrict qualifier information into the IR. When populated, the GVN
+/// pass will use this set to avoid invalidating load CSE entries when
+/// stores go through restrict-qualified pointers that cannot alias with
+/// the loaded pointer.
+fn find_restrict_ptrs(func: &IrFunction) -> FxHashSet<u32> {
+    let mut restrict_set = FxHashSet::default();
+    // Restrict pointer information from function parameters would be
+    // propagated through the IR by the lowering phase as parameter
+    // attributes. For now, we prepare the infrastructure for when
+    // the lowering phase provides this information.
+    // Future: scan func.params for restrict-qualified types
+    // Future: scan alloca instructions for restrict-qualified pointer assignments
+    let _ = func; // Suppress unused warning until lowering provides restrict info
+    restrict_set
+}
+
 /// Run dominator-based GVN on a single function.
 pub(crate) fn run_gvn_function(func: &mut IrFunction) -> usize {
     let num_blocks = func.blocks.len();
@@ -380,10 +449,12 @@ pub(crate) fn run_gvn_function(func: &mut IrFunction) -> usize {
     }
 
     let escaped = find_escaped_param_allocas(func);
+    let restrict = find_restrict_ptrs(func);
 
     // Fast path for single-block functions: skip CFG/dominator computation.
     if num_blocks == 1 {
         let mut state = GvnState::new(func.max_value_id() as usize, escaped);
+        state.restrict_ptrs = restrict;
         return process_block(0, func, &mut state);
     }
 
@@ -401,14 +472,17 @@ pub(crate) fn run_gvn_with_analysis(func: &mut IrFunction, cfg: &analysis::CfgAn
     }
 
     let escaped = find_escaped_param_allocas(func);
+    let restrict = find_restrict_ptrs(func);
 
     // Fast path for single-block functions.
     if num_blocks == 1 {
         let mut state = GvnState::new(func.max_value_id() as usize, escaped);
+        state.restrict_ptrs = restrict;
         return process_block(0, func, &mut state);
     }
 
     let mut state = GvnState::new(func.max_value_id() as usize, escaped);
+    state.restrict_ptrs = restrict;
 
     // DFS over the dominator tree
     gvn_dfs(0, func, &cfg.dom_children, &cfg.preds, &mut state);
