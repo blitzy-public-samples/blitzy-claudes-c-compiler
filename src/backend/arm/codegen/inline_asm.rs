@@ -315,7 +315,9 @@ impl ArmCodegen {
     /// - Release: ldxr/stlxr (release on store)
     /// - AcqRel/SeqCst: ldaxr/stlxr (acquire on load, release on store)
     pub(super) fn exclusive_instrs(ty: IrType, ordering: AtomicOrdering) -> (&'static str, &'static str, &'static str) {
-        let need_acquire = matches!(ordering, AtomicOrdering::Acquire | AtomicOrdering::AcqRel | AtomicOrdering::SeqCst);
+        // Consume is treated as Acquire per GCC/Clang convention — dependency-tracking
+        // optimization for consume ordering is too complex and fragile in practice.
+        let need_acquire = matches!(ordering, AtomicOrdering::Acquire | AtomicOrdering::AcqRel | AtomicOrdering::SeqCst | AtomicOrdering::Consume);
         let need_release = matches!(ordering, AtomicOrdering::Release | AtomicOrdering::AcqRel | AtomicOrdering::SeqCst);
         match ty {
             IrType::I8 | IrType::U8 => (
@@ -353,29 +355,29 @@ impl ArmCodegen {
                 state.emit_fmt(format_args!("    and {}, {}, {}", dest_reg, old_reg, val_reg));
                 state.emit_fmt(format_args!("    mvn {}, {}", dest_reg, dest_reg));
             }
+            AtomicRmwOp::Min => {
+                // Signed minimum: compare old with val, select the lesser
+                state.emit_fmt(format_args!("    cmp {}, {}", old_reg, val_reg));
+                state.emit_fmt(format_args!("    csel {}, {}, {}, lt", dest_reg, old_reg, val_reg));
+            }
+            AtomicRmwOp::Max => {
+                // Signed maximum: compare old with val, select the greater
+                state.emit_fmt(format_args!("    cmp {}, {}", old_reg, val_reg));
+                state.emit_fmt(format_args!("    csel {}, {}, {}, gt", dest_reg, old_reg, val_reg));
+            }
+            AtomicRmwOp::UMin => {
+                // Unsigned minimum: compare old with val, select unsigned-lower
+                state.emit_fmt(format_args!("    cmp {}, {}", old_reg, val_reg));
+                state.emit_fmt(format_args!("    csel {}, {}, {}, lo", dest_reg, old_reg, val_reg));
+            }
+            AtomicRmwOp::UMax => {
+                // Unsigned maximum: compare old with val, select unsigned-higher
+                state.emit_fmt(format_args!("    cmp {}, {}", old_reg, val_reg));
+                state.emit_fmt(format_args!("    csel {}, {}, {}, hi", dest_reg, old_reg, val_reg));
+            }
             AtomicRmwOp::Xchg | AtomicRmwOp::TestAndSet => {
                 // Handled separately in emit_atomic_rmw
                 state.emit_fmt(format_args!("    mov {}, {}", dest_reg, val_reg));
-            }
-            AtomicRmwOp::Min => {
-                // Signed min: dest = min(old, val)
-                state.emit_fmt(format_args!("    cmp {}, {}", old_reg, val_reg));
-                state.emit_fmt(format_args!("    csel {}, {}, {}, le", dest_reg, old_reg, val_reg));
-            }
-            AtomicRmwOp::Max => {
-                // Signed max: dest = max(old, val)
-                state.emit_fmt(format_args!("    cmp {}, {}", old_reg, val_reg));
-                state.emit_fmt(format_args!("    csel {}, {}, {}, ge", dest_reg, old_reg, val_reg));
-            }
-            AtomicRmwOp::UMin => {
-                // Unsigned min: dest = umin(old, val)
-                state.emit_fmt(format_args!("    cmp {}, {}", old_reg, val_reg));
-                state.emit_fmt(format_args!("    csel {}, {}, {}, ls", dest_reg, old_reg, val_reg));
-            }
-            AtomicRmwOp::UMax => {
-                // Unsigned max: dest = umax(old, val)
-                state.emit_fmt(format_args!("    cmp {}, {}", old_reg, val_reg));
-                state.emit_fmt(format_args!("    csel {}, {}, {}, hs", dest_reg, old_reg, val_reg));
             }
         }
     }
