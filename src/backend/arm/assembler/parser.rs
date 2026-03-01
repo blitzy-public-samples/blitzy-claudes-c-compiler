@@ -161,6 +161,9 @@ pub enum AsmDirective {
     RawBytes(Vec<u8>),
     /// Literal pool dump: `.ltorg` or `.pool`
     Ltorg,
+    /// `.org` directive: pad current section to a target offset with fill byte.
+    /// The expression is stored as a raw string for deferred evaluation.
+    Org { expr: String, fill: u8 },
     /// Other ignored directives (.file, .loc, .ident, etc.)
     Ignored,
 }
@@ -1670,9 +1673,17 @@ fn parse_directive(line: &str) -> Result<AsmStatement, String> {
             AsmDirective::Ignored
         }
         ".org" => {
-            // .org expressions like ". - (X) + (Y)" are used as size assertions
-            // in kernel alternative macros. Silently ignore them.
-            AsmDirective::Ignored
+            // .org expr[, fill]
+            // Parse the org expression and optional fill byte.
+            // Used by the Linux kernel's vector table for 128-byte entry padding.
+            let parts: Vec<&str> = args.splitn(2, ',').collect();
+            let expr = parts[0].trim().to_string();
+            let fill = if parts.len() > 1 {
+                parse_data_value(parts[1].trim()).unwrap_or(0) as u8
+            } else {
+                0u8
+            };
+            AsmDirective::Org { expr, fill }
         }
         ".incbin" => {
             let parts: Vec<&str> = args.splitn(3, ',').collect();

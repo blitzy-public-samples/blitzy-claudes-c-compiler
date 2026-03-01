@@ -542,6 +542,33 @@ impl ElfWriter {
 
             AsmDirective::RawBytes(bytes) => { self.base.emit_bytes(bytes); Ok(()) }
 
+            AsmDirective::Org { expr, fill } => {
+                // .org directive: pad current section to target offset with fill bytes.
+                // The expression may reference labels that are already defined.
+                // Try to resolve the expression; if it references forward labels,
+                // evaluate it as a section-relative offset.
+                let current_offset = self.base.current_offset();
+                if let Some(target) = self.resolve_label_expr(expr) {
+                    let target = target as u64;
+                    if target > current_offset {
+                        let pad_size = (target - current_offset) as usize;
+                        self.base.emit_bytes(&vec![*fill; pad_size]);
+                    }
+                    // If target <= current_offset, it's a no-op (or size assertion)
+                } else {
+                    // If we can't resolve the expression, try treating it as a simple integer
+                    if let Ok(target) = crate::backend::asm_expr::parse_integer_expr(expr) {
+                        let target = target as u64;
+                        if target > current_offset {
+                            let pad_size = (target - current_offset) as usize;
+                            self.base.emit_bytes(&vec![*fill; pad_size]);
+                        }
+                    }
+                    // If neither resolves, silently ignore (backward compat with kernel assertions)
+                }
+                Ok(())
+            }
+
             AsmDirective::Cfi | AsmDirective::Ignored | AsmDirective::Ltorg => Ok(()),
         }
     }
@@ -699,6 +726,22 @@ impl ElfWriter {
                         reloc_type: reloc.reloc_type,
                         symbol_name: target_section.clone(),
                         addend: target_offset as i64 + reloc.addend,
+                    });
+                }
+                continue;
+            }
+
+            // If the target symbol is global, emit a relocation instead of resolving
+            // in-place. This matches GAS behavior: global symbols always get
+            // relocations so the linker can interpose, redirect, or resolve them
+            // across object files.
+            if self.base.global_symbols.contains_key(&reloc.symbol) {
+                if let Some(section) = self.base.sections.get_mut(&reloc.section) {
+                    section.relocs.push(ObjReloc {
+                        offset: reloc.offset,
+                        reloc_type: reloc.reloc_type,
+                        symbol_name: reloc.symbol.clone(),
+                        addend: reloc.addend,
                     });
                 }
                 continue;
