@@ -124,6 +124,13 @@ pub struct MacroTable {
     /// identifier. Without this, `$FOO` is tokenized as one identifier and the
     /// macro `FOO` is never expanded.
     pub(super) asm_mode: bool,
+    /// Pending `_Pragma` directive strings collected during macro expansion.
+    /// When `_Pragma("...")` is encountered during expansion, the pragma text
+    /// is desugared and stored here for the preprocessor pipeline to process
+    /// after the expansion pass completes (since expansion takes `&self` but
+    /// pragma handling requires `&mut self`). Wrapped in RefCell to allow
+    /// mutation during expansion methods that take `&self`.
+    pending_pragmas: std::cell::RefCell<Vec<String>>,
 }
 
 impl MacroTable {
@@ -135,6 +142,7 @@ impl MacroTable {
             expanded_macros: std::cell::RefCell::new(Vec::new()),
             track_expansions: Cell::new(false),
             asm_mode: false,
+            pending_pragmas: std::cell::RefCell::new(Vec::new()),
         }
     }
 
@@ -215,6 +223,14 @@ impl MacroTable {
     /// Returns an empty Vec if tracking is disabled or no macros were expanded.
     pub fn take_expanded_macros(&self) -> Vec<String> {
         std::mem::take(&mut *self.expanded_macros.borrow_mut())
+    }
+
+    /// Take pending `_Pragma` directive strings collected during macro expansion.
+    /// Returns the accumulated pragma texts and clears the internal buffer.
+    /// Called by the preprocessor pipeline after each expansion pass to process
+    /// desugared `_Pragma("...")` operators as equivalent `#pragma` directives.
+    pub fn take_pending_pragmas(&self) -> Vec<String> {
+        std::mem::take(&mut *self.pending_pragmas.borrow_mut())
     }
 
     /// Expand macros in a line of text.
