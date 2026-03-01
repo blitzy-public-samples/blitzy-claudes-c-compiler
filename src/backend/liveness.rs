@@ -10,6 +10,21 @@
 //!    This correctly handles values that are live across loop back-edges.
 //! 3. Build intervals by taking the union of def/use points and live-through blocks.
 //!
+//! ## Loop-Depth Weighting for Spill Cost
+//!
+//! The analysis also computes per-block loop nesting depth via DFS-based back-edge
+//! detection (`block_loop_depth` in `LivenessResult`). This information is consumed
+//! by the register allocator (`regalloc.rs`) to implement loop-depth-aware spill
+//! weight calculation:
+//!
+//! - Uses inside loops are weighted by 10^depth (capped at 10,000 for depth ≥ 4),
+//!   so inner-loop temporaries get priority for register allocation.
+//! - Per-value maximum loop depth provides an additive spill cost bonus, ensuring
+//!   values that touch hot loops are not spilled in favor of straight-line values.
+//! - The depth cap at 10,000 prevents u64 overflow when multiplied by use counts
+//!   (max weighted score per value is bounded by num_instructions × 10,000, well
+//!   within u64 range).
+//!
 //! ## Performance
 //!
 //! The dataflow uses compact bitsets instead of hash sets for gen/kill/live_in/live_out.
@@ -40,6 +55,11 @@ pub struct LiveInterval {
 }
 
 /// Result of liveness analysis: maps value IDs to their live intervals.
+///
+/// In addition to live intervals, this result provides loop-depth information
+/// that the register allocator uses for spill weight calculation. The
+/// `block_loop_depth` vector is populated for ALL blocks in the function:
+/// non-loop blocks have depth 0, and the depth is always ≥ 0.
 pub struct LivenessResult {
     pub intervals: Vec<LiveInterval>,
     /// Program points that are Call or CallIndirect instructions.
@@ -47,8 +67,43 @@ pub struct LivenessResult {
     pub call_points: Vec<u32>,
     /// Loop nesting depth for each block (block_index -> depth).
     /// Depth 0 = not in any loop. Depth 1 = in one loop. Depth 2 = nested, etc.
-    /// Used by the register allocator to weight uses inside loops more heavily.
+    ///
+    /// Populated for ALL blocks (not just loop-containing ones). Non-loop blocks
+    /// have depth 0. The register allocator uses this to compute per-use weights
+    /// (10^depth, capped at 10,000 for depth ≥ 4) and per-value spill cost bonuses.
+    ///
+    /// The depth values are accurate for reducible control flow (standard loops).
+    /// For irreducible control flow, depths are conservative (may overcount due to
+    /// multiple back-edges targeting the same header or cross-edges misclassified
+    /// as back-edges), which is safe for spill weight heuristics — overweighting
+    /// a value in irreducible flow is preferable to underweighting it.
     pub block_loop_depth: Vec<u32>,
+}
+
+impl LivenessResult {
+    /// Get the loop nesting depth for a specific block index.
+    ///
+    /// Returns 0 for blocks not inside any loop, or if `block_idx` is out of range.
+    /// This is a convenience accessor for the register allocator's spill weight
+    /// computation, providing safe bounds-checked access to `block_loop_depth`.
+    #[inline]
+    pub fn loop_depth_for_block(&self, block_idx: usize) -> u32 {
+        if block_idx < self.block_loop_depth.len() {
+            self.block_loop_depth[block_idx]
+        } else {
+            0
+        }
+    }
+
+    /// Get the maximum loop nesting depth across all blocks in the function.
+    ///
+    /// Returns 0 if the function contains no loops. Useful for the register
+    /// allocator to quickly determine whether loop-depth weighting is needed
+    /// (when max_depth == 0, all block weights are 1 and the depth bonus is 0).
+    #[inline]
+    pub fn max_loop_depth(&self) -> u32 {
+        self.block_loop_depth.iter().copied().max().unwrap_or(0)
+    }
 }
 
 // ── Compact bitset for dataflow ──────────────────────────────────────────────
@@ -1041,6 +1096,29 @@ pub(super) fn for_each_operand_in_terminator(term: &Terminator, mut f: impl FnMu
 ///
 /// This is used by the register allocator to weight uses inside loops more
 /// heavily, so that inner-loop temporaries get priority for register allocation.
+///
+/// ## Accuracy Properties
+///
+/// - **Simple loops** (single back-edge): depth is exactly 1 for all body blocks.
+/// - **Nested loops**: depth equals the nesting level (e.g., 2 for a loop inside
+///   a loop, 3 for triply-nested, etc.).
+/// - **Multiple same-level loops**: blocks in non-overlapping sibling loops each
+///   have depth 1 independently.
+/// - **Self-loops** (single-block loop): the header block gets depth 1.
+/// - **Multiple back-edges to the same header**: each back-edge defines a separate
+///   natural loop body, and the header accumulates depth from each. This is
+///   conservative but safe for spill weight heuristics.
+/// - **Irreducible control flow**: may report conservative (higher) depths due to
+///   cross-edges misclassified as back-edges in DFS ordering. This is acceptable
+///   because overweighting values in irreducible regions errs on the side of
+///   keeping them in registers, which is the safer heuristic.
+///
+/// ## Weight Cap Integration
+///
+/// The register allocator caps the loop weight at 10^depth with a ceiling of
+/// 10,000 (depth ≥ 4). This prevents u64 overflow when accumulating weighted
+/// use counts: even with 1,000,000 instructions at max depth, the total
+/// weighted score is 10^10, well within u64 range (~1.8 × 10^19).
 fn compute_loop_depth(successors: &[Vec<usize>], num_blocks: usize) -> Vec<u32> {
     if num_blocks == 0 {
         return Vec::new();
@@ -1207,5 +1285,201 @@ mod tests {
         // Call points should only contain the calls, not the empty barrier
         assert!(result.call_points.is_empty(),
             "Empty inline asm barriers should NOT be call points");
+    }
+
+    // ── Loop depth accuracy tests ────────────────────────────────────────────
+
+    /// Verify loop depth for a simple loop: entry → body → exit, with body → body back-edge.
+    ///
+    /// CFG:  [0:entry] → [1:body] → [2:exit]
+    ///                     ↑    ↓
+    ///                     └────┘ (back-edge)
+    ///
+    /// Expected: block 0 = depth 0, block 1 = depth 1, block 2 = depth 0.
+    #[test]
+    fn test_loop_depth_simple_loop() {
+        // Build a simple loop: entry(0) -> body(1) -> exit(2), body(1) -> body(1)
+        let successors = vec![
+            vec![1],     // block 0: entry -> body
+            vec![1, 2],  // block 1: body -> body (back-edge), body -> exit
+            vec![],      // block 2: exit (return)
+        ];
+        let depth = compute_loop_depth(&successors, 3);
+        assert_eq!(depth.len(), 3);
+        assert_eq!(depth[0], 0, "Entry block should have depth 0");
+        assert_eq!(depth[1], 1, "Loop body should have depth 1");
+        assert_eq!(depth[2], 0, "Exit block should have depth 0");
+    }
+
+    /// Verify loop depth for nested loops: outer body contains an inner loop.
+    ///
+    /// CFG:  [0:entry] → [1:outer_header] → [2:inner_header] → [3:inner_body] → [4:exit]
+    ///                     ↑                   ↑       ↓
+    ///                     │                   └───────┘ (inner back-edge)
+    ///                     └──────────────────────────── (outer back-edge from inner_header)
+    ///
+    /// Expected: block 0 = 0, block 1 = depth 1 (outer), block 2 = depth 2 (inner+outer),
+    ///           block 3 = depth 2, block 4 = depth 0.
+    #[test]
+    fn test_loop_depth_nested_loops() {
+        let successors = vec![
+            vec![1],        // block 0: entry -> outer_header
+            vec![2],        // block 1: outer_header -> inner_header
+            vec![3, 4],     // block 2: inner_header -> inner_body, inner_header -> exit
+            vec![2, 1],     // block 3: inner_body -> inner_header (inner back-edge), inner_body -> outer_header (outer back-edge)
+            vec![],         // block 4: exit
+        ];
+        let depth = compute_loop_depth(&successors, 5);
+        assert_eq!(depth.len(), 5);
+        assert_eq!(depth[0], 0, "Entry should have depth 0");
+        assert_eq!(depth[1], 1, "Outer header should have depth 1 (outer loop)");
+        assert_eq!(depth[2], 2, "Inner header should have depth 2 (outer + inner)");
+        assert_eq!(depth[3], 2, "Inner body should have depth 2 (outer + inner)");
+        assert_eq!(depth[4], 0, "Exit should have depth 0");
+    }
+
+    /// Verify that a diamond CFG (if-then-else) has depth 0 everywhere.
+    ///
+    /// CFG:  [0:entry] → [1:then], [2:else]
+    ///        [1:then] → [3:merge]
+    ///        [2:else] → [3:merge]
+    #[test]
+    fn test_loop_depth_diamond_no_loops() {
+        let successors = vec![
+            vec![1, 2],  // block 0: entry -> then, else
+            vec![3],     // block 1: then -> merge
+            vec![3],     // block 2: else -> merge
+            vec![],      // block 3: merge (return)
+        ];
+        let depth = compute_loop_depth(&successors, 4);
+        assert_eq!(depth.len(), 4);
+        for (i, &d) in depth.iter().enumerate() {
+            assert_eq!(d, 0, "Block {} should have depth 0 in diamond CFG", i);
+        }
+    }
+
+    /// Verify depth for a self-loop (single-block loop with back-edge to itself).
+    ///
+    /// CFG:  [0:entry] → [1:loop_block] → [2:exit]
+    ///                     ↑      ↓
+    ///                     └──────┘ (self back-edge)
+    #[test]
+    fn test_loop_depth_self_loop() {
+        let successors = vec![
+            vec![1],     // block 0: entry -> loop_block
+            vec![1, 2],  // block 1: loop_block -> loop_block (self-loop), -> exit
+            vec![],      // block 2: exit
+        ];
+        let depth = compute_loop_depth(&successors, 3);
+        assert_eq!(depth[0], 0, "Entry should have depth 0");
+        assert_eq!(depth[1], 1, "Self-loop block should have depth 1");
+        assert_eq!(depth[2], 0, "Exit should have depth 0");
+    }
+
+    /// Verify depth for two sibling (non-nested) loops at the same level.
+    ///
+    /// CFG:  [0:entry] → [1:loop1_header] → [2:between] → [3:loop2_header] → [4:exit]
+    ///                     ↑      ↓                         ↑      ↓
+    ///                     └──────┘                         └──────┘
+    ///
+    /// Expected: both loop headers at depth 1, entry/between/exit at depth 0.
+    #[test]
+    fn test_loop_depth_sibling_loops() {
+        let successors = vec![
+            vec![1],     // block 0: entry -> loop1
+            vec![1, 2],  // block 1: loop1 -> loop1 (back-edge), -> between
+            vec![3],     // block 2: between -> loop2
+            vec![3, 4],  // block 3: loop2 -> loop2 (back-edge), -> exit
+            vec![],      // block 4: exit
+        ];
+        let depth = compute_loop_depth(&successors, 5);
+        assert_eq!(depth[0], 0, "Entry should have depth 0");
+        assert_eq!(depth[1], 1, "First loop should have depth 1");
+        assert_eq!(depth[2], 0, "Between block should have depth 0");
+        assert_eq!(depth[3], 1, "Second loop should have depth 1");
+        assert_eq!(depth[4], 0, "Exit should have depth 0");
+    }
+
+    /// Verify that an empty function (no blocks) returns empty depth vector.
+    #[test]
+    fn test_loop_depth_empty_function() {
+        let depth = compute_loop_depth(&[], 0);
+        assert!(depth.is_empty(), "Empty function should have empty depth");
+    }
+
+    /// Verify that a single-block function has depth 0.
+    #[test]
+    fn test_loop_depth_single_block() {
+        let successors = vec![vec![]]; // block 0: return
+        let depth = compute_loop_depth(&successors, 1);
+        assert_eq!(depth.len(), 1);
+        assert_eq!(depth[0], 0, "Single block should have depth 0");
+    }
+
+    /// Verify that block_loop_depth is populated for ALL blocks in full liveness analysis.
+    /// The register allocator relies on this being present for every block index.
+    #[test]
+    fn test_block_loop_depth_populated_for_all_blocks() {
+        // Create a two-block function: entry -> return
+        let mut func = IrFunction::new("test".to_string(), IrType::I32, vec![], false);
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::BinOp {
+                    dest: Value(0), op: IrBinOp::Add,
+                    lhs: Operand::Const(IrConst::I32(1)),
+                    rhs: Operand::Const(IrConst::I32(2)),
+                    ty: IrType::I32,
+                },
+            ],
+            terminator: Terminator::Branch(BlockId(1)),
+            source_spans: Vec::new(),
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(1),
+            instructions: vec![],
+            terminator: Terminator::Return(Some(Operand::Value(Value(0)))),
+            source_spans: Vec::new(),
+        });
+        func.next_value_id = 1;
+
+        let result = compute_live_intervals(&func);
+        // block_loop_depth must have an entry for every block
+        assert_eq!(result.block_loop_depth.len(), func.blocks.len(),
+            "block_loop_depth must be populated for ALL blocks");
+        // Both blocks should be depth 0 (no loops)
+        for (i, &d) in result.block_loop_depth.iter().enumerate() {
+            assert_eq!(d, 0, "Block {} should have depth 0 (no loops)", i);
+        }
+    }
+
+    /// Verify the LivenessResult convenience accessors.
+    #[test]
+    fn test_liveness_result_accessors() {
+        let result = LivenessResult {
+            intervals: Vec::new(),
+            call_points: Vec::new(),
+            block_loop_depth: vec![0, 2, 1, 0, 3],
+        };
+        // loop_depth_for_block: in-range
+        assert_eq!(result.loop_depth_for_block(0), 0);
+        assert_eq!(result.loop_depth_for_block(1), 2);
+        assert_eq!(result.loop_depth_for_block(4), 3);
+        // loop_depth_for_block: out-of-range returns 0
+        assert_eq!(result.loop_depth_for_block(5), 0);
+        assert_eq!(result.loop_depth_for_block(100), 0);
+        // max_loop_depth
+        assert_eq!(result.max_loop_depth(), 3);
+    }
+
+    /// Verify that max_loop_depth returns 0 for an empty depth vector.
+    #[test]
+    fn test_max_loop_depth_empty() {
+        let result = LivenessResult {
+            intervals: Vec::new(),
+            call_points: Vec::new(),
+            block_loop_depth: Vec::new(),
+        };
+        assert_eq!(result.max_loop_depth(), 0);
     }
 }
