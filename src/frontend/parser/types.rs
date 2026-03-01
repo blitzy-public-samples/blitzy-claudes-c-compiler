@@ -32,16 +32,22 @@ struct TypeSpecFlags {
     has_union: bool,
     has_enum: bool,
     has_typeof: bool,
+    /// C11 `_Atomic` qualifier (without parentheses).  When `_Atomic` appears as
+    /// a qualifier rather than as the `_Atomic(type-name)` specifier form, this
+    /// flag is set and the resolved base type is later wrapped in
+    /// `TypeSpecifier::Atomic(Box::new(base))`.
+    has_atomic: bool,
     long_count: u32,
     typedef_name: Option<String>,
 }
 
 impl Parser {
+    // grammar: declaration-specifiers / type-specifier / type-qualifier
     /// Parse a complete type specifier. Returns None if no type specifier found.
     ///
     /// Handles arbitrary ordering of type keywords (C allows "long unsigned int"
     /// or "unsigned long int"), struct/union/enum definitions, typedef names,
-    /// typeof expressions, and _Complex types.
+    /// typeof expressions, _Complex types, and C11 `_Atomic` qualifier/specifier.
     pub(super) fn parse_type_specifier(&mut self) -> Option<TypeSpecifier> {
         self.skip_gcc_extensions();
 
@@ -133,12 +139,20 @@ impl Parser {
                     self.advance();
                 }
                 // _Atomic as type specifier: _Atomic(type-name)
-                // C11 §6.7.2.4: _Atomic(T) is a type specifier equivalent to T
-                // with atomic qualification. Since we don't track atomic-ness,
-                // we just parse and return the inner type.
+                // C11 §6.7.2.4: _Atomic(T) is a type specifier that produces a
+                // type with atomic qualification.
+                //
+                // Two forms:
+                //   1. _Atomic(type-name)  — specifier form, wraps inner type
+                //   2. _Atomic <type>      — qualifier form, sets has_atomic flag
+                //
+                // C11 constraints (enforced by sema, not here):
+                //   - _Atomic cannot be applied to array or function types
+                //   - Double-atomic (_Atomic(_Atomic(T))) is undefined
                 TokenKind::Atomic => {
                     self.advance();
                     if matches!(self.peek(), TokenKind::LParen) {
+                        // _Atomic(type-name) specifier form
                         let open = self.peek_span();
                         self.advance(); // consume '('
                         // Save and restore const qualifier across inner type parse
@@ -151,7 +165,9 @@ impl Parser {
                         if let Some(inner_type) = inner {
                             let result = self.parse_abstract_declarator_suffix(inner_type);
                             self.expect_closing(&TokenKind::RParen, open);
-                            return Some(result);
+                            // Apply pending vector attribute BEFORE wrapping in Atomic
+                            let result = self.apply_pending_vector_attr(result);
+                            return Some(TypeSpecifier::Atomic(Box::new(result)));
                         }
                         // Fallback: if we can't parse a type, emit error and skip
                         let err_span = self.peek_span();
@@ -162,9 +178,10 @@ impl Parser {
                         self.consume_if(&TokenKind::RParen);
                         return Some(TypeSpecifier::Int);
                     }
-                    // _Atomic without parens is a type qualifier; since we don't
-                    // track atomic-ness, it falls through to continue collecting
-                    // type specifiers.
+                    // _Atomic without parens is a type qualifier — set the flag
+                    // and continue collecting type specifiers so the base type
+                    // is later wrapped in TypeSpecifier::Atomic.
+                    flags.has_atomic = true;
                 }
                 // Alignas
                 TokenKind::Alignas => {
@@ -282,18 +299,34 @@ impl Parser {
         self.collect_trailing_specifiers(&mut flags, &mut mode_kind);
 
         if !any_base_specifier {
-            // C89 implicit int: if a storage class specifier was consumed but no
-            // type specifier was found, the type defaults to int.
-            // E.g., "static x = 5;" means "static int x = 5;",
-            //       "register y;" means "register int y;".
-            if any_storage_class {
-                return Some(TypeSpecifier::Int);
+            // C89 implicit int: if a storage class specifier or _Atomic qualifier
+            // was consumed but no type specifier was found, the type defaults to int.
+            // E.g., "static x = 5;"  means "static int x = 5;",
+            //       "register y;"    means "register int y;",
+            //       "_Atomic x;"     means "_Atomic int x;".
+            if any_storage_class || flags.has_atomic {
+                let base = TypeSpecifier::Int;
+                let base = if flags.has_atomic {
+                    TypeSpecifier::Atomic(Box::new(base))
+                } else {
+                    base
+                };
+                return Some(base);
             }
             return None;
         }
 
         // Resolve collected flags into a TypeSpecifier
         let base = self.resolve_type_flags(&flags);
+
+        // If _Atomic qualifier form was used (without parens), wrap the resolved
+        // base type in TypeSpecifier::Atomic so that downstream type_builder
+        // produces CType::Atomic(inner).
+        let base = if flags.has_atomic {
+            TypeSpecifier::Atomic(Box::new(base))
+        } else {
+            base
+        };
 
         // Handle trailing _Complex, qualifiers, and storage classes after the base type
         let base = self.consume_trailing_qualifiers(base);
@@ -310,7 +343,7 @@ impl Parser {
 
     /// Collect additional type specifier tokens that follow the initial base type.
     /// E.g., "short" can be followed by "unsigned int", "double" by "long",
-    /// "float" by "_Complex".
+    /// "float" by "_Complex".  Also consumes `_Atomic` as a trailing qualifier.
     fn collect_trailing_specifiers(
         &mut self,
         flags: &mut TypeSpecFlags,
@@ -326,6 +359,7 @@ impl Parser {
                     TokenKind::Short => { self.advance(); flags.has_short = true; }
                     TokenKind::Char => { self.advance(); flags.has_char = true; }
                     TokenKind::Complex => { self.advance(); flags.has_complex = true; }
+                    TokenKind::Atomic => { self.advance(); flags.has_atomic = true; }
                     TokenKind::Const | TokenKind::Volatile | TokenKind::Restrict => { self.advance(); }
                     TokenKind::SegGs => { self.advance(); self.attrs.parsing_address_space = AddressSpace::SegGs; }
                     TokenKind::SegFs => { self.advance(); self.attrs.parsing_address_space = AddressSpace::SegFs; }
@@ -351,6 +385,7 @@ impl Parser {
             loop {
                 match self.peek() {
                     TokenKind::Complex => { self.advance(); flags.has_complex = true; }
+                    TokenKind::Atomic => { self.advance(); flags.has_atomic = true; }
                     TokenKind::Const | TokenKind::Volatile | TokenKind::Restrict => { self.advance(); }
                     TokenKind::SegGs => { self.advance(); self.attrs.parsing_address_space = AddressSpace::SegGs; }
                     TokenKind::SegFs => { self.advance(); self.attrs.parsing_address_space = AddressSpace::SegFs; }
@@ -370,6 +405,7 @@ impl Parser {
                 match self.peek() {
                     TokenKind::Long => { self.advance(); flags.long_count += 1; }
                     TokenKind::Complex => { self.advance(); flags.has_complex = true; }
+                    TokenKind::Atomic => { self.advance(); flags.has_atomic = true; }
                     TokenKind::Const | TokenKind::Volatile | TokenKind::Restrict => { self.advance(); }
                     TokenKind::SegGs => { self.advance(); self.attrs.parsing_address_space = AddressSpace::SegGs; }
                     TokenKind::SegFs => { self.advance(); self.attrs.parsing_address_space = AddressSpace::SegFs; }
@@ -387,6 +423,8 @@ impl Parser {
     }
 
     /// Resolve the collected type specifier flags into a concrete TypeSpecifier.
+    /// Note: `has_atomic` is handled by the caller (wrapping the result in
+    /// `TypeSpecifier::Atomic`) rather than here, so it is explicitly ignored.
     fn resolve_type_flags(
         &mut self,
         flags: &TypeSpecFlags,
@@ -394,8 +432,8 @@ impl Parser {
         let TypeSpecFlags {
             has_void, has_bool, has_float, has_double, has_complex,
             has_char, has_short, has_int: _, has_unsigned, has_signed: _,
-            has_struct, has_union, has_enum, has_typeof, long_count,
-            ref typedef_name,
+            has_struct, has_union, has_enum, has_typeof, has_atomic: _,
+            long_count, ref typedef_name,
         } = *flags;
         if has_void {
             TypeSpecifier::Void
@@ -440,6 +478,7 @@ impl Parser {
         }
     }
 
+    // grammar: struct-or-union-specifier
     /// Parse a struct or union definition/reference.
     fn parse_struct_or_union(&mut self, is_struct: bool) -> TypeSpecifier {
         let (mut is_packed, mut struct_aligned, _, _) = self.parse_gcc_attributes();
@@ -488,6 +527,7 @@ impl Parser {
         ts
     }
 
+    // grammar: enum-specifier
     /// Parse an enum definition/reference.
     fn parse_enum_specifier(&mut self) -> TypeSpecifier {
         let (mut is_packed, _, _, _) = self.parse_gcc_attributes();
@@ -514,6 +554,7 @@ impl Parser {
         TypeSpecifier::Enum(name, variants, is_packed)
     }
 
+    // grammar: typeof-specifier (GNU extension)
     /// Parse typeof(expr) or typeof(type-name).
     fn parse_typeof_specifier(&mut self) -> TypeSpecifier {
         let open = self.peek_span();
@@ -545,8 +586,10 @@ impl Parser {
         TypeSpecifier::Typeof(Box::new(expr))
     }
 
+    // grammar: trailing type-qualifier / storage-class-specifier after base type
     /// Consume trailing qualifiers and _Complex that may follow a resolved base type.
-    /// C allows "int static x;" and "double _Complex".
+    /// C allows "int static x;" and "double _Complex".  Also handles trailing
+    /// `_Atomic` by wrapping the base type in `TypeSpecifier::Atomic`.
     fn consume_trailing_qualifiers(&mut self, mut base: TypeSpecifier) -> TypeSpecifier {
         loop {
             match self.peek() {
@@ -558,6 +601,14 @@ impl Parser {
                         TypeSpecifier::LongDouble => TypeSpecifier::ComplexLongDouble,
                         _ => TypeSpecifier::ComplexDouble,
                     };
+                }
+                // C11 _Atomic as trailing qualifier: "int _Atomic x;"
+                TokenKind::Atomic => {
+                    self.advance();
+                    // Only wrap if not already wrapped (prevent double-atomic)
+                    if !matches!(base, TypeSpecifier::Atomic(_)) {
+                        base = TypeSpecifier::Atomic(Box::new(base));
+                    }
                 }
                 TokenKind::Const | TokenKind::Volatile | TokenKind::Restrict => {
                     self.advance();
@@ -602,6 +653,7 @@ impl Parser {
         base
     }
 
+    // grammar: struct-declaration-list
     /// Parse struct or union field declarations inside braces.
     pub(super) fn parse_struct_fields(&mut self) -> Vec<StructFieldDecl> {
         let mut fields = Vec::new();
@@ -784,6 +836,7 @@ impl Parser {
         (result, Vec::new())
     }
 
+    // grammar: enumerator-list
     /// Parse enum variant declarations inside braces.
     pub(super) fn parse_enum_variants(&mut self) -> Vec<EnumVariant> {
         let mut variants = Vec::new();
@@ -836,6 +889,7 @@ impl Parser {
         }
     }
 
+    // grammar: type-name (for __builtin_va_arg)
     /// Parse a type-name for __builtin_va_arg: type-specifier + abstract declarator.
     pub(super) fn parse_va_arg_type(&mut self) -> TypeSpecifier {
         if let Some(type_spec) = self.parse_type_specifier() {
@@ -882,6 +936,7 @@ impl Parser {
         }
     }
 
+    // grammar: abstract-declarator (suffix portion: pointer / direct-abstract-declarator)
     /// Parse an abstract declarator suffix: pointer(s), parenthesized pointer groups,
     /// and array dimensions after a type name. Used by cast expressions, sizeof,
     /// typeof, and _Alignof to avoid duplicating this logic.
