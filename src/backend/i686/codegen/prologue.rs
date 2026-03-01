@@ -1,4 +1,12 @@
 //! I686Codegen: prologue/epilogue and stack frame operations.
+//!
+//! Handles:
+//! - Stack frame setup (pushl %ebp / movl %esp, %ebp) with optional frame pointer omission
+//! - Callee-saved register save/restore (ebx, esi, edi, optionally ebp)
+//! - PIC mode %ebx setup via __x86.get_pc_thunk.bx
+//! - VLA (Variable-Length Array) support via dynamic alloca with frame pointer anchoring
+//! - Parameter storage from stack/registers to SSA alloca slots
+//! - Fastcall and regparm calling convention parameter handling
 
 use crate::ir::reexports::{Instruction, IrFunction, Value};
 use crate::common::types::IrType;
@@ -165,6 +173,18 @@ impl I686Codegen {
         if frame_size > 0 {
             emit!(self.state, "    subl ${}, %esp", frame_size);
         }
+
+        // VLA (Variable-Length Array) stack management:
+        // When has_dyn_alloca is true:
+        // 1. Frame pointer (%ebp) is always enabled (forced at calculate_stack_space_impl)
+        // 2. Fixed locals are at %ebp-relative offsets (set up by subl $frame_size, %esp above)
+        // 3. VLA allocations use DynAlloca: subl %size, %esp (grows stack downward)
+        //    with 16-byte alignment enforced by emit_round_up_acc_to_16 (andl $-16, %eax)
+        // 4. StackSave saves %esp to a slot for later scope restoration
+        //    (emit_stack_save: movl %esp, %eax; movl %eax, slot_ref)
+        // 5. StackRestore restores %esp from saved slot at VLA scope exit
+        //    (emit_stack_restore: movl slot_ref, %eax; movl %eax, %esp)
+        // 6. Epilogue: leal -N(%ebp), %esp restores past all VLAs
 
         if self.omit_frame_pointer {
             let callee_saved_bytes = self.used_callee_saved.len() as i64 * 4;
@@ -570,10 +590,28 @@ impl I686Codegen {
 
         if self.is_fastcall && param_idx < self.fastcall_reg_param_count {
             if let Some(Some((slot, _slot_ty))) = self.state.param_alloca_slots.get(param_idx) {
-                let load_instr = self.mov_load_for_type(ty);
-                let slot_ref = self.slot_ref(*slot);
-                emit!(self.state, "    {} {}, %eax", load_instr, slot_ref);
-                self.store_eax_to(dest);
+                // Fastcall register-eligible types are only I8/U8/I16/U16/I32/U32/Ptr
+                // (see is_fastcall_reg_eligible), so 64-bit types should not reach here.
+                // Defensive handling: if a 64-bit type does appear (e.g. via type
+                // mismatch in ParamRef), emit both low-word and high-word movl to
+                // avoid leaving the upper half uninitialized.
+                if ty == IrType::F64 || ty == IrType::I64 || ty == IrType::U64 {
+                    if let Some(dest_slot) = self.state.get_slot(dest.0) {
+                        let src_ref = self.slot_ref(*slot);
+                        let dst_ref = self.slot_ref(dest_slot);
+                        emit!(self.state, "    movl {}, %eax", src_ref);
+                        emit!(self.state, "    movl %eax, {}", dst_ref);
+                        let src_ref_hi = self.slot_ref_offset(*slot, 4);
+                        let dst_ref_hi = self.slot_ref_offset(dest_slot, 4);
+                        emit!(self.state, "    movl {}, %eax", src_ref_hi);
+                        emit!(self.state, "    movl %eax, {}", dst_ref_hi);
+                    }
+                } else {
+                    let load_instr = self.mov_load_for_type(ty);
+                    let slot_ref = self.slot_ref(*slot);
+                    emit!(self.state, "    {} {}, %eax", load_instr, slot_ref);
+                    self.store_eax_to(dest);
+                }
             }
             return;
         }
