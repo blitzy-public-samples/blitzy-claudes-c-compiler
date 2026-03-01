@@ -33,11 +33,13 @@ pub(super) enum ParenAbstractDecl {
 }
 
 impl Parser {
+    // grammar: declarator
     pub(super) fn parse_declarator(&mut self) -> (Option<String>, Vec<DerivedDeclarator>) {
         let (name, derived, _, _, _, _) = self.parse_declarator_with_attrs();
         (name, derived)
     }
 
+    // grammar: declarator (with GCC attribute extensions)
     /// Parse a declarator, also returning attribute info:
     /// (name, derived, mode_kind, has_common, aligned_value, is_packed)
     pub(super) fn parse_declarator_with_attrs(&mut self) -> (Option<String>, Vec<DerivedDeclarator>, Option<ModeKind>, bool, Option<usize>, bool) {
@@ -88,19 +90,21 @@ impl Parser {
                     // [static restrict const 10], [restrict n], [const], etc.
                     // Skip all qualifiers and 'static' before the size expression.
                     self.skip_array_qualifiers();
-                    let size = if matches!(self.peek(), TokenKind::RBracket) {
-                        None
+                    let (size, is_vla_unspecified) = if matches!(self.peek(), TokenKind::RBracket) {
+                        (None, false)
                     } else if matches!(self.peek(), TokenKind::Star)
                         && self.pos + 1 < self.tokens.len()
                         && matches!(self.tokens[self.pos + 1].kind, TokenKind::RBracket) {
-                        // C99 VLA star syntax: [*] or [const *] means unspecified VLA size
+                        // C99 VLA star syntax: [*] or [const *] means unspecified VLA size.
+                        // Distinct from [] (incomplete array): [*] is only valid in function
+                        // prototype scope and declares a VLA of unspecified size (C11 §6.7.6.2p4).
                         self.advance(); // consume '*'
-                        None
+                        (None, true)
                     } else {
-                        Some(Box::new(self.parse_expr()))
+                        (Some(Box::new(self.parse_expr())), false)
                     };
                     self.expect_closing(&TokenKind::RBracket, open_bracket);
-                    outer_suffixes.push(DerivedDeclarator::Array { size, is_vla_unspecified: false });
+                    outer_suffixes.push(DerivedDeclarator::Array { size, is_vla_unspecified });
                 }
                 TokenKind::LParen => {
                     let (params, variadic) = self.parse_param_list();
@@ -308,6 +312,7 @@ impl Parser {
         outer_pointers
     }
 
+    // grammar: parameter-type-list
     /// Parse a function parameter list: (params...) or (void) or ()
     pub(super) fn parse_param_list(&mut self) -> (Vec<ParamDecl>, bool) {
         let open = self.peek_span();
@@ -412,6 +417,7 @@ impl Parser {
         (params, variadic)
     }
 
+    // grammar: identifier-list
     /// Parse a K&R-style identifier list: foo(a, b, c)
     fn parse_kr_identifier_list(&mut self) -> (Vec<ParamDecl>, bool) {
         let mut params = Vec::new();
@@ -434,6 +440,7 @@ impl Parser {
         (params, false)
     }
 
+    // grammar: parameter-declaration (declarator portion)
     /// Parse a parameter declarator with full type information.
     /// Returns (name, pointer_depth, array_dims, is_func_ptr, ptr_to_array_dims, fptr_params, fptr_inner_ptr_depth).
     pub(super) fn parse_param_declarator_full(&mut self) -> (Option<String>, u32, Vec<Option<Box<Expr>>>, bool, Vec<Option<Box<Expr>>>, Option<Vec<ParamDecl>>, u32) {
@@ -496,6 +503,7 @@ impl Parser {
         (name, pointer_depth, array_dims, is_func_ptr, ptr_to_array_dims, fptr_params, fptr_inner_ptr_depth)
     }
 
+    // grammar: direct-declarator (parenthesized parameter declarator)
     /// Parse a parenthesized parameter declarator: (*name)(params), (name), etc.
     fn parse_paren_param_declarator(
         &mut self,
@@ -711,6 +719,7 @@ impl Parser {
         name
     }
 
+    // grammar: abstract-declarator (parenthesized)
     /// Try to parse a parenthesized abstract declarator: (*), ((*)), (**), (*[3][4])
     /// Also handles nested function pointers: (*(*)(params))
     /// Returns a ParenAbstractDecl if successful, None otherwise.
