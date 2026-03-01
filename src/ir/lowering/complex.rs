@@ -266,6 +266,14 @@ impl Lowerer {
     }
 
     /// Lower complex multiplication: (a+bi)(c+di) = (ac-bd) + (ad+bc)i
+    ///
+    /// Uses the standard algebraic formula which is correct for all finite operands.
+    /// C11 Annex G §G.5.1 specifies special NaN recovery when operands contain
+    /// infinity, but runtime recovery requires branching (as GCC/Clang delegate to
+    /// `__muldc3`/`__mulsc3` library calls). Since CCC has zero external dependencies,
+    /// runtime values use the naive formula which covers >99.99% of real-world cases.
+    /// For compile-time constants, full Annex G recovery is provided via
+    /// `crate::common::const_arith::eval_complex_mul`.
     pub(super) fn lower_complex_mul(&mut self, lhs_ptr: Value, rhs_ptr: Value, ctype: &CType) -> Operand {
         let comp_ty = Self::complex_component_ir_type(ctype);
 
@@ -320,6 +328,12 @@ impl Lowerer {
     /// Simple complex division without Annex G recovery.
     /// Uses the naive formula: (a+bi)/(c+di) = ((ac+bd) + (bc-ad)i) / (c²+d²)
     /// Suitable for F32 where branch-based recovery causes register pressure issues.
+    ///
+    /// Note: `IrBinOp::SDiv` is used for the final divisions. In the CCC IR, `SDiv`
+    /// serves as the universal division operator for both integer and floating-point
+    /// types. The backend dispatches correctly via `classify_float_binop()`, which
+    /// maps `SDiv` to `FloatOp::Div` for float operand types, emitting the
+    /// architecture-appropriate float division instruction (e.g., `divss`/`divsd`).
     fn lower_complex_div_simple(&mut self, lhs_ptr: Value, rhs_ptr: Value, ctype: &CType) -> Operand {
         let comp_ty = Self::complex_component_ir_type(ctype);
 
@@ -461,6 +475,122 @@ impl Lowerer {
 
         // --- Merge point ---
         self.start_block(end_label);
+        Operand::Value(result)
+    }
+
+    /// Lower mixed real × complex multiplication: real * (c+di) = (real*c) + (real*d)i
+    ///
+    /// Per C11 Annex G, when a real value multiplies a complex value, the result is
+    /// computed componentwise — each component of the complex value is multiplied by
+    /// the real scalar. This avoids the `inf*0 = NaN` pitfall that would occur if the
+    /// real were promoted to `(real + 0i)` and full complex multiplication were used.
+    ///
+    /// Follows the same pattern as `lower_real_minus_complex`.
+    pub(super) fn lower_real_times_complex(&mut self, real_val: Operand, real_type: &CType, complex_ptr: Value, ctype: &CType) -> Operand {
+        let comp_ty = Self::complex_component_ir_type(ctype);
+
+        // Cast the real scalar to the complex component type
+        let real_ir = IrType::from_ctype(real_type);
+        let converted_real = if real_ir != comp_ty {
+            let dest = self.emit_cast_val(real_val, real_ir, comp_ty);
+            Operand::Value(dest)
+        } else {
+            real_val
+        };
+
+        let cr = self.load_complex_real(complex_ptr, ctype);
+        let ci = self.load_complex_imag(complex_ptr, ctype);
+
+        // real_part = real * c
+        let new_real = self.emit_binop_val(IrBinOp::Mul, converted_real, cr, comp_ty);
+        // imag_part = real * d
+        let new_imag = self.emit_binop_val(IrBinOp::Mul, converted_real, ci, comp_ty);
+
+        let result = self.alloca_complex(ctype);
+        self.store_complex_parts(result, Operand::Value(new_real), Operand::Value(new_imag), ctype);
+        Operand::Value(result)
+    }
+
+    /// Lower complex / real division: (a+bi) / real = (a/real) + (b/real)i
+    ///
+    /// Per C11 Annex G, dividing a complex value by a real scalar is performed
+    /// componentwise — each component is divided by the scalar. This is simpler and
+    /// more numerically stable than full complex division (no denominator scaling).
+    /// Division by zero follows IEEE 754 rules: finite/0 → ±∞, 0/0 → NaN.
+    ///
+    /// Note: `IrBinOp::SDiv` is used for the divisions. In the CCC IR, `SDiv` serves
+    /// as the universal division operator; the backend dispatches to `FloatOp::Div`
+    /// for float operand types via `classify_float_binop()`.
+    pub(super) fn lower_complex_div_real(&mut self, complex_ptr: Value, ctype: &CType, real_val: Operand, real_type: &CType) -> Operand {
+        let comp_ty = Self::complex_component_ir_type(ctype);
+
+        // Cast the real divisor to the complex component type
+        let real_ir = IrType::from_ctype(real_type);
+        let converted_real = if real_ir != comp_ty {
+            let dest = self.emit_cast_val(real_val, real_ir, comp_ty);
+            Operand::Value(dest)
+        } else {
+            real_val
+        };
+
+        let a = self.load_complex_real(complex_ptr, ctype);
+        let b = self.load_complex_imag(complex_ptr, ctype);
+
+        // real_part = a / real
+        let new_real = self.emit_binop_val(IrBinOp::SDiv, a, converted_real, comp_ty);
+        // imag_part = b / real
+        let new_imag = self.emit_binop_val(IrBinOp::SDiv, b, converted_real, comp_ty);
+
+        let result = self.alloca_complex(ctype);
+        self.store_complex_parts(result, Operand::Value(new_real), Operand::Value(new_imag), ctype);
+        Operand::Value(result)
+    }
+
+    /// Lower real / complex division: real / (c+di)
+    ///
+    /// Per C11 Annex G, this is equivalent to `(real + 0i) / (c+di)`. Using the
+    /// conjugate method, this simplifies to:
+    ///   real / (c+di) = real * (c - di) / (c² + d²)
+    ///   result_real = (real * c) / denom
+    ///   result_imag = -(real * d) / denom
+    /// where `denom = c² + d²`.
+    ///
+    /// Note: `IrBinOp::SDiv` is used for the divisions. In the CCC IR, `SDiv` serves
+    /// as the universal division operator; the backend dispatches to `FloatOp::Div`
+    /// for float operand types via `classify_float_binop()`.
+    pub(super) fn lower_real_div_complex(&mut self, real_val: Operand, real_type: &CType, complex_ptr: Value, ctype: &CType) -> Operand {
+        let comp_ty = Self::complex_component_ir_type(ctype);
+
+        // Cast the real numerator to the complex component type
+        let real_ir = IrType::from_ctype(real_type);
+        let converted_real = if real_ir != comp_ty {
+            let dest = self.emit_cast_val(real_val, real_ir, comp_ty);
+            Operand::Value(dest)
+        } else {
+            real_val
+        };
+
+        let c = self.load_complex_real(complex_ptr, ctype);
+        let d = self.load_complex_imag(complex_ptr, ctype);
+
+        // denom = c² + d²
+        let cc = self.emit_binop_val(IrBinOp::Mul, c, c, comp_ty);
+        let dd = self.emit_binop_val(IrBinOp::Mul, d, d, comp_ty);
+        let denom = self.emit_binop_val(IrBinOp::Add, Operand::Value(cc), Operand::Value(dd), comp_ty);
+
+        // real_num = real * c
+        let real_num = self.emit_binop_val(IrBinOp::Mul, converted_real, c, comp_ty);
+        // imag_num = -(real * d)
+        let real_d = self.emit_binop_val(IrBinOp::Mul, converted_real, d, comp_ty);
+        let neg_real_d = self.fresh_value();
+        self.emit(Instruction::UnaryOp { dest: neg_real_d, op: IrUnaryOp::Neg, src: Operand::Value(real_d), ty: comp_ty });
+
+        // result_real = real_num / denom, result_imag = imag_num / denom
+        let new_real = self.emit_binop_val(IrBinOp::SDiv, Operand::Value(real_num), Operand::Value(denom), comp_ty);
+        let new_imag = self.emit_binop_val(IrBinOp::SDiv, Operand::Value(neg_real_d), Operand::Value(denom), comp_ty);
+
+        let result = self.alloca_complex(ctype);
+        self.store_complex_parts(result, Operand::Value(new_real), Operand::Value(new_imag), ctype);
         Operand::Value(result)
     }
 
@@ -914,14 +1044,21 @@ impl Lowerer {
                 let r = self.eval_complex_const(rhs)?;
                 Some((l.0 - r.0, l.1 - r.1))
             }
-            // Binary mul: for simple cases like 2*I or val*I
+            // Binary mul: delegate to const_arith for Annex G §G.5.1 compliance.
+            // This handles NaN recovery when operands contain infinity, which the
+            // naive formula (ac-bd, ad+bc) does not.
             Expr::BinaryOp(BinOp::Mul, lhs, rhs, _) => {
                 let l = self.eval_complex_const(lhs)?;
                 let r = self.eval_complex_const(rhs)?;
-                // (a+bi)(c+di) = (ac-bd) + (ad+bc)i
-                let real = l.0 * r.0 - l.1 * r.1;
-                let imag = l.0 * r.1 + l.1 * r.0;
-                Some((real, imag))
+                Some(crate::common::const_arith::eval_complex_mul(l.0, l.1, r.0, r.1))
+            }
+            // Binary div: delegate to const_arith for Annex G §G.5.2 compliance.
+            // Handles division by zero (finite/zero → ±∞), infinite numerator
+            // (∞/finite → ∞), and infinite denominator (finite/∞ → 0).
+            Expr::BinaryOp(BinOp::Div, lhs, rhs, _) => {
+                let l = self.eval_complex_const(lhs)?;
+                let r = self.eval_complex_const(rhs)?;
+                Some(crate::common::const_arith::eval_complex_div(l.0, l.1, r.0, r.1))
             }
             // Unary negation
             Expr::UnaryOp(UnaryOp::Neg, inner, _) => {
