@@ -5,21 +5,32 @@ pipeline. The pipeline transforms the compiler's intermediate representation (IR
 to produce better machine code by eliminating redundant computation, simplifying
 control flow, and replacing expensive operations with cheaper equivalents.
 
-All optimization levels (`-O0` through `-O3`, `-Os`, `-Oz`) run the same full set
-of passes. While the compiler is still maturing, having separate tiers creates
-hard-to-find bugs where code works at one level but breaks at another. We always
-run all passes to maximize test coverage of the optimizer and catch issues early.
+The optimizer supports six optimization tiers that control which passes run and
+how aggressively they optimize:
+
+| Level | Description | Pass Selection |
+|-------|-------------|----------------|
+| `-O0` | No optimization | Skips ALL passes including mem2reg. Returns immediately. |
+| `-O1` | Basic optimization | Runs only `constant_fold`, `copy_prop`, `dce`, and mem2reg. |
+| `-O2` | Full optimization (default) | Runs the complete pass pipeline described below. |
+| `-O3` | Aggressive optimization | Full pipeline plus `loop_unroll` pass and raised inlining thresholds (150% budget). |
+| `-Os` | Size-optimized | Full pipeline minus loop unrolling, with reduced inlining thresholds (50% budget). |
+| `-Oz` | Minimal size | Full pipeline minus loop unrolling, inlining entirely disabled. |
+
+At `-O0`, the `CCC_TIME_PASSES` environment variable reports zero passes executed.
+At all other levels, per-pass timing continues to work as described below.
 
 ## Table of Contents
 
 1. [Pipeline Overview](#pipeline-overview)
-2. [Phase Structure](#phase-structure)
-3. [Dirty Tracking and Iteration Strategy](#dirty-tracking-and-iteration-strategy)
-4. [Shared CFG Analysis](#shared-cfg-analysis)
-5. [Pass Descriptions](#pass-descriptions)
-6. [Pass Dependency Graph](#pass-dependency-graph)
-7. [Disabling Individual Passes](#disabling-individual-passes)
-8. [Files](#files)
+2. [Optimization Tiers](#optimization-tiers)
+3. [Phase Structure](#phase-structure)
+4. [Dirty Tracking and Iteration Strategy](#dirty-tracking-and-iteration-strategy)
+5. [Shared CFG Analysis](#shared-cfg-analysis)
+6. [Pass Descriptions](#pass-descriptions)
+7. [Pass Dependency Graph](#pass-dependency-graph)
+8. [Disabling Individual Passes](#disabling-individual-passes)
+9. [Files](#files)
 
 ---
 
@@ -66,6 +77,53 @@ The optimizer executes in four sequential phases:
  Phase 11: Dead Static Elimination
      dead_statics
 ```
+
+**Note:** The diagram above shows the `-O2` (and higher) pipeline. At `-O0`,
+none of these phases execute. At `-O1`, only mem2reg, constant_fold, copy_prop,
+and dce from the main loop run (as a single non-iterating pass sequence). At
+`-O3`, the `loop_unroll` pass runs as part of the main loop after `licm`. At
+`-Os` and `-Oz`, loop unrolling is skipped and inlining thresholds are adjusted.
+
+## Optimization Tiers
+
+The optimization level is passed to the pipeline as a parameter from the driver.
+Each tier selects a specific subset of passes:
+
+### `-O0` — No Optimization
+Skips the entire pass pipeline. No inlining, no mem2reg, no optimization passes.
+This produces debug-friendly code where every variable is on the stack and every
+operation is faithfully represented. `CCC_TIME_PASSES` reports zero passes.
+
+### `-O1` — Basic Optimization  
+Runs a minimal set of passes for reasonable performance without aggressive
+transformations: mem2reg (SSA promotion), constant folding, copy propagation,
+and dead code elimination. Skips inlining, GVN, LICM, IVSR, if-conversion,
+simplify, narrow, div_by_const, cfg_simplify, and IPCP.
+
+### `-O2` — Full Optimization (Default)
+Runs the complete pipeline as described in the Pipeline Overview section below.
+This is the default level and matches the behavior of `-O` and `-O2` in GCC.
+
+### `-O3` — Aggressive Optimization
+Runs the full `-O2` pipeline plus:
+- **Loop unrolling** (`loop_unroll` pass) — unrolls constant-bound loops with
+  ≤32 iterations and ≤256 post-unroll instructions
+- **Raised inlining thresholds** — per-caller budgets increased to 150% of
+  default, allowing more aggressive function inlining
+
+### `-Os` — Size Optimization
+Runs the full `-O2` pipeline with modifications for smaller code:
+- **No loop unrolling** — loop unrolling is disabled
+- **Reduced inlining** — per-caller budgets reduced to 50% of default
+
+### `-Oz` — Minimal Size
+Runs the full `-O2` pipeline with maximum size reduction:
+- **No loop unrolling** — loop unrolling is disabled  
+- **No inlining** — the inlining pass is entirely skipped (except
+  `__attribute__((always_inline))` functions which are still inlined for
+  correctness)
+
+---
 
 ## Phase Structure
 
@@ -619,6 +677,40 @@ insertion into the preheader to ensure def-before-use ordering.
 - **All other loads** (runtime-computed pointers) are conservatively rejected
   since there is no alias analysis.
 
+### loop_unroll -- Loop Unrolling
+
+Unrolls the bodies of loops with constant trip counts to reduce loop overhead
+(branch, increment, compare) and expose instruction-level parallelism and
+further optimization opportunities (constant folding of unrolled iterations,
+better register allocation across unrolled iterations).
+
+**Activation.** This pass is only active at `-O3`. At all other optimization
+levels it is skipped.
+
+**Eligibility criteria:**
+
+- The loop must have a constant trip count (statically known iteration bound)
+- The trip count must be ≤32 iterations
+- The post-unroll body size must be ≤256 IR instructions (hard limit)
+- The loop must be a simple natural loop with detectable bounds from
+  `loop_analysis`
+
+**Mechanism.** The pass uses loop analysis information from `loop_analysis.rs`
+to identify candidate loops. For each eligible loop, the body is replicated
+N times (where N is the trip count), with the induction variable replaced by
+the corresponding constant value in each copy. The loop header and back-edge
+are removed, producing a straight-line sequence of the unrolled iterations.
+
+**Limits:**
+
+| Limit | Value | Purpose |
+|-------|-------|---------|
+| Max iterations | 32 | Prevents excessive code bloat from large loops |
+| Max post-unroll instructions | 256 | Hard cap on unrolled body size |
+
+**Correctness.** Break and continue statements within the loop body are
+correctly handled. Side effects are preserved in iteration order.
+
 ### iv_strength_reduce -- Induction Variable Strength Reduction
 
 Transforms expensive per-iteration index computations in loops into cheaper
@@ -906,6 +998,7 @@ behavior across iterations.
 | `iv_strength_reduce.rs`  | Loop induction variable strength reduction             |
 | `licm.rs`                | Loop-invariant code motion                             |
 | `loop_analysis.rs`       | Shared loop detection and body computation utilities   |
+| `loop_unroll.rs`         | Loop unrolling for constant-bound loops (-O3 only)     |
 | `narrow.rs`              | Integer narrowing (3-phase C promotion elimination)    |
 | `resolve_asm.rs`         | Post-inline assembly symbol resolution                 |
 | `simplify.rs`            | Algebraic simplification, strength reduction, and peephole |
