@@ -8,6 +8,93 @@
 //!
 //! These functions are arch-independent — they use the `ArchCodegen` trait to call
 //! into the backend-specific implementations.
+//!
+//! # Architecture-Independent Code Generation Dispatch
+//!
+//! The codegen driver is the bridge between the target-independent IR and the
+//! four architecture backends (x86-64, AArch64, RISC-V 64, i686). All dispatch
+//! goes through the `ArchCodegen` trait (~185 methods), which each backend
+//! implements. This module never emits architecture-specific assembly directly;
+//! it orchestrates the *sequence* of calls into the trait.
+//!
+//! ## Function Code Generation Phases
+//!
+//! `generate_function` drives an 8-phase sequence for each IR function:
+//!
+//! 1. **Linkage & Visibility** — `.globl`, `.weak`, `.hidden` directives
+//! 2. **Patchable Function Entry** — NOP sleds for Linux ftrace (`-fpatchable-function-entry`)
+//! 3. **Type & Label** — `.type funcname, @function` and the entry label
+//! 4. **CFI Start** — `.cfi_startproc` when CFI is enabled
+//! 5. **Prologue** — `emit_prologue()` — stack frame setup, callee-saved register spills
+//! 6. **Parameter Stores** — `emit_store_params()` — move ABI register/stack args to allocas
+//! 7. **Basic Blocks** — instruction-by-instruction dispatch via `generate_instruction`,
+//!    with pre-scan optimizations (GEP folding, compare-branch fusion, GlobalAddr folding)
+//! 8. **Epilogue** — implicit via `emit_return()` in the Return terminator, followed by
+//!    `.cfi_endproc` and `.size` directives
+//!
+//! ## Parameter Store Conventions Per Architecture
+//!
+//! Each backend's `emit_store_params` implements its ABI's parameter passing rules:
+//!
+//! - **x86-64 (SysV AMD64)**: First 6 integer/pointer args in `rdi, rsi, rdx, rcx, r8, r9`;
+//!   first 8 float/double args in `xmm0–xmm7`; remaining on stack. Struct returns via
+//!   hidden pointer in `rdi` (sret). Variadic callee saves all FP regs to register save area.
+//!
+//! - **AArch64 (AAPCS64)**: First 8 integer/pointer args in `x0–x7`; first 8 float/double
+//!   args in `d0–d7` (NEON/FP regs); remaining on stack. Struct returns ≤16 bytes via
+//!   `x0`/`x1`; larger via hidden pointer in `x8`. Variadic args after the last named param
+//!   go on stack.
+//!
+//! - **RISC-V 64 (LP64D)**: First 8 integer/pointer args in `a0–a7`; first 8 float/double
+//!   args in `fa0–fa7`; remaining on stack. Small structs with float fields may be passed
+//!   in mixed int+float register pairs. Struct returns ≤16 bytes via `a0`/`a1`.
+//!
+//! - **i686 (cdecl)**: ALL arguments on stack (right-to-left push order). Float args also
+//!   on stack (no register passing). Struct returns via hidden pointer pushed as first arg
+//!   (`ret $4` pops it). Fastcall uses `ecx`/`edx` for first two int args.
+//!
+//! ## Accumulator Register Convention
+//!
+//! The register cache (`state.reg_cache`) tracks which IR Value is currently in the
+//! architecture's primary accumulator register:
+//!
+//! - **x86-64**: `rax` (or `eax`/`ax`/`al` for smaller types)
+//! - **AArch64**: `x0` (or `w0` for 32-bit)
+//! - **RISC-V 64**: `t0` (caller-saved temporary)
+//! - **i686**: `eax` (or `ax`/`al` for smaller types)
+//!
+//! Many instructions follow the pattern: load operand → compute → store result to
+//! accumulator, so the cache avoids redundant reloads. Instructions that clobber the
+//! accumulator unpredictably (calls, stores, atomics, inline asm, va_arg, memcpy)
+//! invalidate the cache after execution.
+//!
+//! ## `_Noreturn` Handling (Defense-in-Depth)
+//!
+//! Functions marked `_Noreturn` (C11 §6.7.4) or `__attribute__((noreturn))` are handled
+//! at three levels in the compilation pipeline:
+//!
+//! 1. **IR Lowering** (`src/ir/lowering/expr_calls.rs`): After a call to a noreturn
+//!    function, an `Unreachable` terminator is emitted, making subsequent code dead.
+//! 2. **DCE Pass** (`src/passes/dce.rs`): Unreachable code after noreturn calls is
+//!    eliminated during optimization.
+//! 3. **Codegen** (this module): The `Unreachable` terminator emits a trap instruction
+//!    (e.g., `ud2` on x86-64) as a safety net, ensuring execution never falls through
+//!    if the callee unexpectedly returns.
+//!
+//! ## Attribute Propagation to ELF
+//!
+//! Several GCC-compatible attributes are propagated to ELF output via assembly directives:
+//!
+//! - **`section("name")`**: Handled in `emit_functions_and_sections` — emits
+//!   `.section name,"ax",@progbits` before the function definition.
+//! - **`used`**: Handled in `emit_functions_and_sections` — when `-ffunction-sections`
+//!   is active, adds the `R` flag (SHF_GNU_RETAIN) to the section directive to prevent
+//!   `--gc-sections` from discarding the function.
+//! - **`alias("target")`**: Handled in `emit_aliases` — emits `.globl alias` (or `.weak`)
+//!   followed by `.set alias, target`.
+//! - **`constructor` / `destructor`**: Handled in `emit_init_fini_arrays` — emits
+//!   `.section .init_array` / `.section .fini_array` entries with pointer-sized references
+//!   to the annotated function.
 
 use crate::ir::reexports::{
     BasicBlock,
@@ -712,6 +799,13 @@ fn emit_extern_visibility_directives(cg: &mut dyn ArchCodegen, module: &IrModule
 /// When `-ffunction-sections` is enabled, each function without a custom section
 /// attribute gets its own `.text.funcname` section, enabling `--gc-sections` to
 /// discard unreferenced functions at link time.
+///
+/// Functions with `__attribute__((used))` get the `R` flag (SHF_GNU_RETAIN) in their
+/// section directive when using `-ffunction-sections`, preventing the linker's
+/// `--gc-sections` from discarding them even if they appear unreferenced.
+///
+/// Functions with `__attribute__((section("name")))` are placed in the specified custom
+/// section with `"ax"` flags (allocatable, executable).
 fn emit_functions_and_sections(
     cg: &mut dyn ArchCodegen,
     module: &IrModule,
@@ -726,13 +820,19 @@ fn emit_functions_and_sections(
     for func in &module.functions {
         if !func.is_declaration {
             if let Some(ref sect) = func.section {
-                cg.state().emit_fmt(format_args!(".section {},\"ax\",@progbits", sect));
+                // __attribute__((section("name"))): place function in custom section.
+                // Add R flag (SHF_GNU_RETAIN) if __attribute__((used)) to survive --gc-sections.
+                let flags = if func.is_used { "axR" } else { "ax" };
+                cg.state().emit_fmt(format_args!(".section {},\"{}\",@progbits", sect, flags));
                 cg.state().current_text_section = sect.clone();
                 in_custom_section = true;
             } else if function_sections {
-                // -ffunction-sections: each function gets its own section
+                // -ffunction-sections: each function gets its own section.
+                // Add R flag (SHF_GNU_RETAIN) for __attribute__((used)) functions
+                // so --gc-sections cannot discard them.
                 let sect_name = format!(".text.{}", func.name);
-                cg.state().emit_fmt(format_args!(".section {},\"ax\",@progbits", sect_name));
+                let flags = if func.is_used { "axR" } else { "ax" };
+                cg.state().emit_fmt(format_args!(".section {},\"{}\",@progbits", sect_name, flags));
                 cg.state().current_text_section = sect_name;
                 in_custom_section = false;
             } else if in_custom_section {
@@ -747,7 +847,14 @@ fn emit_functions_and_sections(
     }
 }
 
-/// Emit symbol aliases from __attribute__((alias("target"))).
+/// Emit symbol aliases from `__attribute__((alias("target")))`.
+///
+/// For each alias, emits:
+/// - `.weak alias` (for weak aliases) or `.globl alias` (for strong aliases)
+/// - `.set alias, target` to make the alias point to the target symbol
+///
+/// This allows defining multiple names for the same function/variable, commonly
+/// used in libc implementations (e.g., `__GI_strlen` aliasing `strlen`).
 fn emit_aliases(cg: &mut dyn ArchCodegen, module: &IrModule) {
     for (alias_name, target_name, is_weak) in &module.aliases {
         cg.state().emit("");
@@ -780,7 +887,13 @@ fn emit_symbol_attrs(cg: &mut dyn ArchCodegen, module: &IrModule, referenced_sym
     }
 }
 
-/// Emit .init_array and .fini_array sections for constructor/destructor functions.
+/// Emit `.init_array` and `.fini_array` sections for constructor/destructor functions.
+///
+/// Functions annotated with `__attribute__((constructor))` get a pointer-sized entry in
+/// `.init_array`, which the runtime linker calls before `main()`. Functions annotated with
+/// `__attribute__((destructor))` get an entry in `.fini_array`, called after `main()` returns
+/// or `exit()` is called. The section type `@init_array` / `@fini_array` ensures the linker
+/// merges these correctly with other translation units' constructor/destructor lists.
 fn emit_init_fini_arrays(cg: &mut dyn ArchCodegen, module: &IrModule, ptr_dir: super::common::PtrDirective) {
     let align = crate::common::types::target_ptr_size();
     for ctor in &module.constructors {
@@ -1122,6 +1235,11 @@ fn generate_instruction(cg: &mut dyn ArchCodegen, inst: &Instruction, gep_fold_m
             cg.emit_dyn_alloca(dest, size, *align);
             cg.state().reg_cache.invalidate_all();
         }
+        // Note on _Noreturn: calls to functions marked `_Noreturn` or
+        // `__attribute__((noreturn))` are followed by an `Unreachable` terminator
+        // at the IR level (inserted during lowering). The DCE pass eliminates dead
+        // code after such calls. At codegen time, the Unreachable terminator emits
+        // a trap instruction as defense-in-depth (see generate_terminator).
         Instruction::Call { func, info } => {
             cg.emit_call(&info.args, &info.arg_types, Some(func), None, info.dest, info.return_type, info.is_variadic, info.num_fixed_args, &info.struct_arg_sizes, &info.struct_arg_aligns, &info.struct_arg_classes, &info.struct_arg_riscv_float_classes, info.is_sret, info.is_fastcall, &info.ret_eightbyte_classes);
             cg.state().reg_cache.invalidate_all();
@@ -1158,8 +1276,15 @@ fn generate_instruction(cg: &mut dyn ArchCodegen, inst: &Instruction, gep_fold_m
             cg.emit_atomic_rmw(dest, *op, ptr, val, *ty, *ordering);
             cg.state().reg_cache.invalidate_all();
         }
-        Instruction::AtomicCmpxchg { dest, ptr, expected, desired, ty, success_ordering, failure_ordering, returns_bool, .. } => {
-            cg.emit_atomic_cmpxchg(dest, ptr, expected, desired, *ty, *success_ordering, *failure_ordering, *returns_bool);
+        Instruction::AtomicCmpxchg { dest, ptr, expected, desired, ty, success_ordering, failure_ordering, returns_bool, weak } => {
+            // C11 §7.17.7.4: weak compare-exchange may fail spuriously on LL/SC
+            // architectures (AArch64, RISC-V), enabling simpler single-attempt loops.
+            // Strong CAS requires a retry loop on those architectures.
+            if *weak {
+                cg.emit_atomic_cmpxchg_weak(dest, ptr, expected, desired, *ty, *success_ordering, *failure_ordering, *returns_bool);
+            } else {
+                cg.emit_atomic_cmpxchg(dest, ptr, expected, desired, *ty, *success_ordering, *failure_ordering, *returns_bool);
+            }
             cg.state().reg_cache.invalidate_all();
         }
         Instruction::AtomicLoad { dest, ptr, ty, ordering } => {
@@ -1371,6 +1496,12 @@ fn generate_terminator(cg: &mut dyn ArchCodegen, term: &Terminator, frame_size: 
             cg.emit_switch(val, cases, default, *ty);
         }
         Terminator::Unreachable => {
+            // Defense-in-depth for `_Noreturn` / `__attribute__((noreturn))`:
+            // The IR lowering phase emits Unreachable after calls to noreturn functions,
+            // and the DCE pass may eliminate dead code following such calls. This trap
+            // instruction (ud2 on x86, udf on ARM, unimp on RISC-V) ensures that if
+            // execution somehow reaches this point, it faults immediately rather than
+            // falling through into the next function's code.
             cg.emit_unreachable();
         }
     }
