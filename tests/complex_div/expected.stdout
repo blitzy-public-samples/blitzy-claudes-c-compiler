@@ -1,0 +1,14 @@
+basic: 3.0 1.0
+by_real: 4.0 3.0
+by_imag: 3.0 -2.0
+self_div: 1.0 0.0
+real_by_imag: 0.0 -1.0
+neg_div: -3.0 -4.0
+general: 2.2 -0.4
+zero_div: 0.0 0.0
+div_by_zero: 1
+finite_div_inf: 0.0 0.0
+inf_div_finite: 1
+conjugate: -0.6 0.8
+float_div: 3.0 4.0
+small_denom: 2.0 0.0
