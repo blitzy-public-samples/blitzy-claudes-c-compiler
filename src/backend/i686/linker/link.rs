@@ -106,6 +106,8 @@ pub fn link_builtin(
         num_plt, num_got_total, &ifunc_symbols,
         is_static, is_nostdlib, needed_libs_param,
         output_path,
+        None, // entry_override: no linker script ENTRY() yet
+        None, // script_sections: no linker script SECTIONS yet
     )
 }
 

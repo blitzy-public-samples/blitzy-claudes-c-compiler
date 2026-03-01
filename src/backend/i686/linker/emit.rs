@@ -10,6 +10,7 @@ use super::reloc::{self, RelocContext};
 use super::gnu_hash::build_gnu_hash_32;
 use super::DynStrTab;
 use crate::backend::linker_common;
+use crate::backend::linker_common::ScriptSection;
 
 pub(super) fn emit_executable(
     inputs: &[InputObject],
@@ -29,8 +30,20 @@ pub(super) fn emit_executable(
     is_nostdlib: bool,
     _needed_libs_param: &[&str],
     output_path: &str,
+    entry_override: Option<&str>,
+    script_sections: Option<&[ScriptSection]>,
 ) -> Result<(), String> {
     let num_ifunc = ifunc_symbols.len();
+
+    // Helper: look up a fixed virtual address for a section name in the linker
+    // script SECTIONS directives. Returns `None` when no linker script is active
+    // or the section is not mentioned in the script, allowing the default
+    // sequential layout to proceed.
+    let script_addr_for = |name: &str| -> Option<u32> {
+        script_sections.and_then(|secs| {
+            secs.iter().find(|s| s.name == name).and_then(|s| s.address.map(|a| a as u32))
+        })
+    };
 
     // ── Build dynamic symbol/string tables ────────────────────────────────
     let mut needed_libs: Vec<String> = Vec::new();
@@ -380,8 +393,14 @@ pub(super) fn emit_executable(
     // ── Segment 1 (RX): .init + .plt + .text + .fini ──
     file_offset = align_up(file_offset, PAGE_SIZE);
     vaddr = align_up(vaddr, PAGE_SIZE);
-    vaddr = (vaddr & !0xfff) | (file_offset & 0xfff);
-    if vaddr < BASE_ADDR + file_offset { vaddr += PAGE_SIZE; }
+    // If the linker script specifies a fixed address for .text, use it as the
+    // text segment start vaddr; otherwise use the standard sequential layout.
+    if let Some(text_addr) = script_addr_for(".text") {
+        vaddr = text_addr;
+    } else {
+        vaddr = (vaddr & !0xfff) | (file_offset & 0xfff);
+        if vaddr < BASE_ADDR + file_offset { vaddr += PAGE_SIZE; }
+    }
 
     let text_seg_file_start = file_offset;
     let text_seg_vaddr_start = vaddr;
@@ -454,9 +473,15 @@ pub(super) fn emit_executable(
 
     // ── Segment 2 (RO): .rodata + .eh_frame ──
     file_offset = align_up(file_offset, PAGE_SIZE); vaddr = align_up(vaddr, PAGE_SIZE);
-    vaddr = (vaddr & !0xfff) | (file_offset & 0xfff);
-    if vaddr <= text_seg_vaddr_end {
-        vaddr = align_up(text_seg_vaddr_end, PAGE_SIZE) | (file_offset & 0xfff);
+    // If the linker script specifies a fixed address for .rodata, use it as the
+    // rodata segment start vaddr; otherwise use the standard sequential layout.
+    if let Some(rodata_addr) = script_addr_for(".rodata") {
+        vaddr = rodata_addr;
+    } else {
+        vaddr = (vaddr & !0xfff) | (file_offset & 0xfff);
+        if vaddr <= text_seg_vaddr_end {
+            vaddr = align_up(text_seg_vaddr_end, PAGE_SIZE) | (file_offset & 0xfff);
+        }
     }
 
     let rodata_seg_file_start = file_offset;
@@ -507,9 +532,15 @@ pub(super) fn emit_executable(
 
     // ── Segment 3 (RW): .init_array + .fini_array + .dynamic + .got + .got.plt + .data + .bss ──
     file_offset = align_up(file_offset, PAGE_SIZE); vaddr = align_up(vaddr, PAGE_SIZE);
-    vaddr = (vaddr & !0xfff) | (file_offset & 0xfff);
-    if vaddr <= rodata_seg_vaddr_end {
-        vaddr = align_up(rodata_seg_vaddr_end, PAGE_SIZE) | (file_offset & 0xfff);
+    // If the linker script specifies a fixed address for .data, use it as the
+    // data segment start vaddr; otherwise use the standard sequential layout.
+    if let Some(data_addr) = script_addr_for(".data") {
+        vaddr = data_addr;
+    } else {
+        vaddr = (vaddr & !0xfff) | (file_offset & 0xfff);
+        if vaddr <= rodata_seg_vaddr_end {
+            vaddr = align_up(rodata_seg_vaddr_end, PAGE_SIZE) | (file_offset & 0xfff);
+        }
     }
 
     let data_seg_file_start = file_offset;
@@ -828,10 +859,21 @@ pub(super) fn emit_executable(
         push_dyn(&mut dynamic_data, DT_NULL, 0);
     }
 
-    // Entry point
-    let entry_point = global_symbols.get("_start")
-        .map(|s| s.address)
-        .unwrap_or_else(|| global_symbols.get("main").map(|s| s.address).unwrap_or(BASE_ADDR));
+    // Entry point — linker script ENTRY(symbol) overrides the default _start/main lookup.
+    // If the ENTRY symbol is not found, fall back to the default behavior.
+    let entry_point = if let Some(entry_name) = entry_override {
+        global_symbols.get(entry_name)
+            .map(|s| s.address)
+            .unwrap_or_else(|| {
+                // ENTRY symbol not found — fall back to default
+                global_symbols.get("_start").map(|s| s.address)
+                    .unwrap_or_else(|| global_symbols.get("main").map(|s| s.address).unwrap_or(BASE_ADDR))
+            })
+    } else {
+        global_symbols.get("_start")
+            .map(|s| s.address)
+            .unwrap_or_else(|| global_symbols.get("main").map(|s| s.address).unwrap_or(BASE_ADDR))
+    };
 
     // Patch dynsym for copy-reloc symbols
     for name in &copy_syms_for_dynsym {
