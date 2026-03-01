@@ -282,6 +282,28 @@ impl ArmCodegen {
                     }
                 }
             }
+            // ARM NEON intrinsics — zero dest as placeholder until full NEON codegen is implemented
+            IntrinsicOp::NeonGetLane | IntrinsicOp::NeonSetLane
+            | IntrinsicOp::NeonDupScalar | IntrinsicOp::NeonDupLane
+            | IntrinsicOp::NeonMovl | IntrinsicOp::NeonMovn | IntrinsicOp::NeonQmovn
+            | IntrinsicOp::NeonAddl | IntrinsicOp::NeonSubl
+            | IntrinsicOp::NeonQadd | IntrinsicOp::NeonQsub | IntrinsicOp::NeonQdmull
+            | IntrinsicOp::NeonLd1 | IntrinsicOp::NeonLd2 | IntrinsicOp::NeonLd3 | IntrinsicOp::NeonLd4
+            | IntrinsicOp::NeonSt1 | IntrinsicOp::NeonSt2
+            | IntrinsicOp::NeonCeq | IntrinsicOp::NeonCgt | IntrinsicOp::NeonCge
+            | IntrinsicOp::NeonAnd | IntrinsicOp::NeonOrr | IntrinsicOp::NeonEor
+            | IntrinsicOp::NeonBic | IntrinsicOp::NeonBsl
+            | IntrinsicOp::NeonAdd | IntrinsicOp::NeonSub | IntrinsicOp::NeonMul
+            | IntrinsicOp::NeonAbs | IntrinsicOp::NeonNeg
+            | IntrinsicOp::NeonShl | IntrinsicOp::NeonShr => {
+                // NEON vector operations: zero dest as stub until native emission is wired up
+                if let Some(dptr) = dest_ptr {
+                    if let Some(slot) = self.state.get_slot(dptr.0) {
+                        self.state.emit_fmt(format_args!("    add x9, sp, #{}", slot.0));
+                        self.state.emit("    stp xzr, xzr, [x9]");
+                    }
+                }
+            }
         }
     }
 

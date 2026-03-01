@@ -559,6 +559,22 @@ impl X86Codegen {
                     self.emit_sse_shuffle_imm_128(dptr, args, inst);
                 }
             }
+            // ARM NEON intrinsics — not available on x86-64
+            IntrinsicOp::NeonGetLane | IntrinsicOp::NeonSetLane
+            | IntrinsicOp::NeonDupScalar | IntrinsicOp::NeonDupLane
+            | IntrinsicOp::NeonMovl | IntrinsicOp::NeonMovn | IntrinsicOp::NeonQmovn
+            | IntrinsicOp::NeonAddl | IntrinsicOp::NeonSubl
+            | IntrinsicOp::NeonQadd | IntrinsicOp::NeonQsub | IntrinsicOp::NeonQdmull
+            | IntrinsicOp::NeonLd1 | IntrinsicOp::NeonLd2 | IntrinsicOp::NeonLd3 | IntrinsicOp::NeonLd4
+            | IntrinsicOp::NeonSt1 | IntrinsicOp::NeonSt2
+            | IntrinsicOp::NeonCeq | IntrinsicOp::NeonCgt | IntrinsicOp::NeonCge
+            | IntrinsicOp::NeonAnd | IntrinsicOp::NeonOrr | IntrinsicOp::NeonEor
+            | IntrinsicOp::NeonBic | IntrinsicOp::NeonBsl
+            | IntrinsicOp::NeonAdd | IntrinsicOp::NeonSub | IntrinsicOp::NeonMul
+            | IntrinsicOp::NeonAbs | IntrinsicOp::NeonNeg
+            | IntrinsicOp::NeonShl | IntrinsicOp::NeonShr => {
+                unreachable!("NEON intrinsic {:?} not available on x86-64", op);
+            }
         }
     }
 }
