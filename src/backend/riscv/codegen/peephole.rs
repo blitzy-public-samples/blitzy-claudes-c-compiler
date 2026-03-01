@@ -1127,14 +1127,19 @@ fn optimize_tail_calls(lines: &mut Vec<String>, kinds: &mut Vec<LineKind>, n: us
 
         // Check if the instructions after this call form a pure epilogue
         // (callee-save restores + frame teardown + ret).
-        if let Some(ret_idx) = is_riscv_epilogue_candidate(lines, kinds, i, n) {
+        if let Some(tci) = is_riscv_epilogue_candidate(lines, kinds, i, n) {
             let trimmed = lines[i].trim().to_string();
             if let Some(tail_text) = convert_call_to_tail(&trimmed) {
                 // NOP the call instruction.
                 kinds[i] = LineKind::Nop;
+                // NOP dead instructions between call and epilogue (return
+                // value shuffles and dead stores to the stack frame).
+                for &di in &tci.dead_indices {
+                    kinds[di] = LineKind::Nop;
+                }
                 // Replace `ret` with the tail call instruction.
-                lines[ret_idx] = format!("    {}", tail_text);
-                kinds[ret_idx] = classify_line(&lines[ret_idx]);
+                lines[tci.ret_idx] = format!("    {}", tail_text);
+                kinds[tci.ret_idx] = classify_line(&lines[tci.ret_idx]);
                 changed = true;
             }
         }
@@ -1145,8 +1150,18 @@ fn optimize_tail_calls(lines: &mut Vec<String>, kinds: &mut Vec<LineKind>, n: us
     changed
 }
 
+/// Result of a successful RISC-V tail call candidate check.
+struct RiscvTailCallInfo {
+    /// Index of the `ret` instruction to replace with the tail call.
+    ret_idx: usize,
+    /// Indices of dead instructions between the call and epilogue that should
+    /// be NOPed when applying TCO. These are typically register moves that
+    /// shuffle the return value and dead stores to the stack frame.
+    dead_indices: Vec<usize>,
+}
+
 /// Check if the instructions after a call at position `call_idx` form a pure
-/// RISC-V epilogue sequence ending in `ret`. Returns the index of the `ret`
+/// RISC-V epilogue sequence ending in `ret`. Returns a `RiscvTailCallInfo`
 /// if a valid tail call candidate is found.
 ///
 /// Valid epilogue sequence:
@@ -1158,16 +1173,25 @@ fn optimize_tail_calls(lines: &mut Vec<String>, kinds: &mut Vec<LineKind>, n: us
 /// 6. `ret`
 ///
 /// `.cfi_*` directives and Nop lines are allowed between any instructions.
-/// Any instruction that writes to `a0` (clobbers return value) causes rejection.
+/// Dead register moves (shuffling the return value) between the call and
+/// the start of the real epilogue are tolerated and will be NOPed.
+/// Any instruction that writes to `a0` via a callee-save restore causes rejection.
 fn is_riscv_epilogue_candidate(
     lines: &[String],
     kinds: &[LineKind],
     call_idx: usize,
     n: usize,
-) -> Option<usize> {
+) -> Option<RiscvTailCallInfo> {
     // Limit how far we scan forward to avoid unbounded searching.
     let limit = (call_idx + 30).min(n);
     let mut j = call_idx + 1;
+
+    // Track dead instructions between call and epilogue (return value shuffles).
+    let mut dead_indices: Vec<usize> = Vec::new();
+
+    // Track store offsets (StoreS0) to detect if a stored value is later loaded
+    // (which would mean the store is NOT dead).
+    let mut stored_offsets: Vec<i32> = Vec::new();
 
     while j < limit {
         if kinds[j] == LineKind::Nop {
@@ -1182,18 +1206,33 @@ fn is_riscv_epilogue_candidate(
                 continue;
             }
 
+            // Store to S0 offset: potentially a dead store of the return value
+            // to a stack slot. Tolerate it unless the offset is later loaded.
+            LineKind::StoreS0 { offset, .. } => {
+                dead_indices.push(j);
+                stored_offsets.push(offset);
+                j += 1;
+                continue;
+            }
+
             // Load from S0 offset: callee-save restore pattern.
             // This covers `ld sN, OFF(s0)`, `ld ra, OFF(s0)`, `ld t0, OFF(s0)`.
             // Reject if destination is a0 (would clobber return value).
-            LineKind::LoadS0 { reg, .. } => {
+            // Also reject if this loads from an offset we previously stored
+            // (meaning the store is live, not dead).
+            LineKind::LoadS0 { reg, offset, .. } => {
                 if reg == REG_A0 {
                     return None;
+                }
+                if stored_offsets.contains(&offset) {
+                    return None; // Store is live — not a pure epilogue
                 }
                 j += 1;
                 continue;
             }
 
-            // Register move: accept specific epilogue patterns.
+            // Register move: accept epilogue patterns and tolerate dead
+            // register-to-register moves that shuffle the return value.
             LineKind::Move { dst, src } => {
                 // `mv sp, s0` — stack pointer restore (large frame / DynAlloca).
                 if dst == REG_SP && src == REG_S0 {
@@ -1206,7 +1245,15 @@ fn is_riscv_epilogue_candidate(
                     j += 1;
                     continue;
                 }
-                // Any other move is not part of the epilogue.
+                // Other register moves between call and epilogue are dead in
+                // a tail call context (the callee produces its own return value).
+                // Tolerate them as long as they don't write to sp or modify
+                // the stack frame structure.
+                if dst != REG_SP {
+                    dead_indices.push(j);
+                    j += 1;
+                    continue;
+                }
                 return None;
             }
 
@@ -1246,10 +1293,13 @@ fn is_riscv_epilogue_candidate(
 
             // Found `ret` — valid epilogue.
             LineKind::Ret => {
-                return Some(j);
+                return Some(RiscvTailCallInfo {
+                    ret_idx: j,
+                    dead_indices,
+                });
             }
 
-            // Any other kind (Label, Jump, Branch, Call, StoreS0, LoadImm,
+            // Any other kind (Label, Jump, Branch, Call, LoadImm,
             // SextW, LoadAddr) breaks the epilogue pattern.
             _ => return None,
         }

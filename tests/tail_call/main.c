@@ -1,40 +1,31 @@
-// Test: tail call optimization
+// Test: tail call optimization — self-recursive factorial with large N
 //
-// Compile: ccc -O2 -o test main.c
+// Verifies that tail call optimization converts recursive calls to branch
+// loops, preventing stack overflow. Without TCO, 2000000 recursive calls
+// would require ~96MB of stack (far exceeding the 8MB default), causing
+// a segmentation fault.
 //
-// This test verifies that the compiler performs tail call optimization (TCO)
-// by using deep recursion that would overflow the stack without it.
-//
-// The function tail_sum performs 1,000,000 recursive calls. The default
-// stack size on Linux is 8 MiB. Each call frame requires ~32-64 bytes,
-// so 1 million calls would need ~32-64 MiB of stack, which exceeds the
-// limit and causes a segfault WITHOUT tail call optimization.
-//
-// With TCO at -O2, the compiler transforms the tail-recursive call into
-// a loop, using constant stack space regardless of recursion depth.
-//
-// The function computes: sum(1..1000000) mod 2^32 = 1784293664
-// (Using unsigned int to ensure well-defined wrapping behavior.)
-//
-// Tests:
-// - src/backend/x86/codegen/peephole/passes/tail_call.rs (x86-64 existing)
-// - src/backend/arm/codegen/peephole.rs (AArch64 new)
-// - src/backend/riscv/codegen/peephole.rs (RISC-V new)
-// - src/backend/i686/codegen/peephole.rs (i686 new)
+// Tests across all 4 architectures: x86-64, AArch64, RISC-V 64, i686.
 
 int printf(const char *fmt, ...);
 
-// Tail-recursive accumulator function.
-// The recursive call is in tail position: the return value of the
-// recursive call is immediately returned without further computation.
-static unsigned int tail_sum(unsigned int n, unsigned int acc) {
-    if (n == 0) return acc;
-    return tail_sum(n - 1, acc + n);
+// Tail-recursive factorial modulo a large prime.
+// The recursive call is in tail position: its return value is directly
+// returned without further computation — enabling tail call optimization.
+//
+// Uses modular arithmetic (mod 1000000007) to prevent integer overflow
+// while maintaining a verifiable result: 2000000! mod 1000000007 = 578095319
+static long long factorial_mod(int n, long long acc) {
+    if (n <= 1)
+        return acc;
+    return factorial_mod(n - 1, (acc * (long long)n) % 1000000007LL);
 }
 
 int main(void) {
-    // 1,000,000 recursive calls — would segfault without TCO
-    unsigned int result = tail_sum(1000000, 0);
-    printf("%u\n", result);
+    // N = 2000000: requires tail call optimization to avoid stack overflow.
+    // Without TCO: ~48 bytes/frame * 2000000 = ~96MB > 8MB stack limit.
+    // With TCO: recursive call becomes a jump, using only one stack frame.
+    long long result = factorial_mod(2000000, 1);
+    printf("%lld\n", result);
     return 0;
 }

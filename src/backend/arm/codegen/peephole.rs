@@ -1088,9 +1088,13 @@ fn optimize_tail_calls(lines: &mut [String], kinds: &mut [LineKind], n: usize) -
         }
 
         // Collect epilogue lines: we expect ldp pairs, possibly add sp, then ret.
+        // Track dead instructions (register moves that shuffle the return value)
+        // between the call and the real epilogue — these should be NOPed when
+        // applying TCO since the tail-called function produces its own return value.
         let epilogue_start = j;
         let mut found_ret = false;
         let mut ret_idx = 0;
+        let mut dead_indices: Vec<usize> = Vec::new();
 
         while j < n {
             match kinds[j] {
@@ -1126,12 +1130,49 @@ fn optimize_tail_calls(lines: &mut [String], kinds: &mut [LineKind], n: usize) -
                     }
                     break;
                 }
+                LineKind::Move { .. } => {
+                    // Register-to-register moves between call and epilogue are
+                    // dead in a tail call context. Codegen often shuffles the
+                    // return value (x0) into callee-saved registers and back.
+                    // Since the tail-called function produces its own x0 return
+                    // value, these moves are unnecessary. NOP them.
+                    dead_indices.push(j);
+                    j += 1;
+                    continue;
+                }
+                LineKind::StoreSp { .. } => {
+                    // Stores to the stack between call and epilogue are dead:
+                    // the frame is about to be torn down, so the stored value
+                    // is never read back.
+                    dead_indices.push(j);
+                    j += 1;
+                    continue;
+                }
+                LineKind::StorePairSp => {
+                    // Store-pair to stack: dead for the same reason as StoreSp.
+                    dead_indices.push(j);
+                    j += 1;
+                    continue;
+                }
                 LineKind::Other => {
                     // Check for "ldp x29, x30, [sp], #N" (post-indexed, may classify as Other)
                     let trimmed = lines[j].trim();
                     if trimmed.starts_with("ldp x29, x30, [sp]")
                         || trimmed.starts_with("ldp ")
                     {
+                        j += 1;
+                        continue;
+                    }
+                    // Tolerate store-pair to stack (dead stores of return value)
+                    // that might be classified as Other instead of StorePairSp:
+                    if trimmed.starts_with("stp ") && trimmed.contains("[sp") {
+                        dead_indices.push(j);
+                        j += 1;
+                        continue;
+                    }
+                    // Tolerate single store to stack:
+                    if trimmed.starts_with("str ") && trimmed.contains("[sp") {
+                        dead_indices.push(j);
                         j += 1;
                         continue;
                     }
@@ -1157,6 +1198,12 @@ fn optimize_tail_calls(lines: &mut [String], kinds: &mut [LineKind], n: usize) -
         // Transform: replace `bl target` with Nop and `ret` with `b target`.
         // The epilogue instructions (ldp, add sp) remain to clean up the frame.
         kinds[call_idx] = LineKind::Nop;
+
+        // NOP dead instructions between call and epilogue (return value shuffles).
+        for &di in &dead_indices {
+            kinds[di] = LineKind::Nop;
+        }
+
         lines[ret_idx] = format!("    b {}", call_target);
         kinds[ret_idx] = LineKind::Branch;
         changed = true;
