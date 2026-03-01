@@ -645,6 +645,40 @@ impl RiscvCodegen {
         }
     }
 
+    // ---- VLA (variable-length array) stack management ----
+
+    /// Save the current stack pointer to `save_slot` before VLA allocation.
+    /// This records SP so it can be restored at scope exit to reclaim VLA space.
+    pub(super) fn emit_vla_save_sp_impl(&mut self, save_slot: &crate::ir::reexports::Value) {
+        if let Some(slot) = self.state.get_slot(save_slot.0) {
+            self.emit_store_to_s0("sp", slot.0, "sd");
+        }
+    }
+
+    /// Restore the stack pointer from a previously saved value at VLA scope exit.
+    /// This reclaims all dynamically allocated VLA stack space from the current scope.
+    pub(super) fn emit_vla_restore_sp_impl(&mut self, save_slot: &crate::ir::reexports::Value) {
+        if let Some(slot) = self.state.get_slot(save_slot.0) {
+            self.emit_load_from_s0("sp", slot.0, "ld");
+        }
+    }
+
+    /// Emit dynamic stack allocation for a VLA.
+    /// Loads the byte count from `size`, rounds up to 16-byte alignment,
+    /// subtracts from SP, and stores the resulting pointer in `dest`.
+    pub(super) fn emit_vla_alloc_impl(&mut self, dest: &crate::ir::reexports::Value, size: &crate::ir::reexports::Operand) {
+        // Load the requested byte count into t0
+        self.operand_to_t0(size);
+        // Round up to 16-byte alignment: size = (size + 15) & ~15
+        self.state.emit("    addi t0, t0, 15");
+        self.state.emit("    andi t0, t0, -16");
+        // Subtract from SP to allocate stack space
+        self.state.emit("    sub sp, sp, t0");
+        // The allocated region starts at the new SP value
+        self.state.emit("    mv t0, sp");
+        self.store_t0_to(dest);
+    }
+
     /// Emit epilogue: restore ra/s0 and deallocate stack.
     pub(super) fn emit_epilogue_riscv(&mut self, frame_size: i64) {
         let total_alloc = if self.is_variadic { frame_size + 64 } else { frame_size };

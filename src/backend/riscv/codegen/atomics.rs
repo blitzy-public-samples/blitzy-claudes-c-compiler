@@ -579,6 +579,66 @@ impl RiscvCodegen {
         self.store_t0_to(dest);
     }
 
+    /// Weak compare-and-exchange: a single LR/SC attempt without retry.
+    ///
+    /// On RISC-V, weak CAS maps naturally to a single LR/SC pair. Unlike the
+    /// strong CAS (`emit_atomic_cmpxchg_impl`) which loops on SC failure, weak
+    /// CAS is allowed to fail spuriously, so we emit only one attempt. For
+    /// sub-word types, we delegate to the strong CAS since the masking logic
+    /// is the same and a single LR.W/SC.W attempt is already sufficient.
+    pub(super) fn emit_atomic_cmpxchg_weak_impl(
+        &mut self,
+        dest: &Value,
+        ptr: &Operand,
+        expected: &Operand,
+        desired: &Operand,
+        ty: IrType,
+        ordering: AtomicOrdering,
+        failure_ordering: AtomicOrdering,
+        returns_bool: bool,
+    ) {
+        if Self::is_subword_type(ty) {
+            // Sub-word: use strong CAS path (already a single LR.W/SC.W loop
+            // with masking; the retry is only on SC failure which is fine for weak).
+            self.emit_atomic_cmpxchg_impl(dest, ptr, expected, desired, ty, ordering, failure_ordering, returns_bool);
+            return;
+        }
+
+        // Word/doubleword: single LR/SC attempt without retry loop.
+        self.operand_to_t0(ptr);
+        self.state.emit("    mv t1, t0");
+        self.operand_to_t0(desired);
+        self.state.emit("    mv t3, t0");
+        self.operand_to_t0(expected);
+        self.state.emit("    mv t2, t0");
+
+        let aq_rl = Self::amo_ordering(ordering);
+        let suffix = Self::amo_width_suffix(ty);
+        let fail_label = self.state.fresh_label("wcas_fail");
+        let done_label = self.state.fresh_label("wcas_done");
+
+        // Single LR/SC attempt — no retry on SC failure (spurious fail allowed).
+        self.state.emit_fmt(format_args!("    lr.{}{} t0, (t1)", suffix, aq_rl));
+        self.state.emit_fmt(format_args!("    bne t0, t2, {}", fail_label));
+        self.state.emit_fmt(format_args!("    sc.{}{} t4, t3, (t1)", suffix, aq_rl));
+        // SC failure (t4 != 0) is treated as a spurious failure for weak CAS.
+        if returns_bool {
+            // Success if SC succeeded (t4 == 0) AND value matched.
+            self.state.emit_fmt(format_args!("    bnez t4, {}", fail_label));
+            self.state.emit("    li t0, 1");
+            self.state.emit_fmt(format_args!("    j {}", done_label));
+            self.state.emit_fmt(format_args!("{}:", fail_label));
+            self.state.emit("    li t0, 0");
+            self.state.emit_fmt(format_args!("{}:", done_label));
+        } else {
+            // returns the loaded value (old value at ptr)
+            self.state.emit_fmt(format_args!("    j {}", done_label));
+            self.state.emit_fmt(format_args!("{}:", fail_label));
+            self.state.emit_fmt(format_args!("{}:", done_label));
+        }
+        self.store_t0_to(dest);
+    }
+
     pub(super) fn emit_atomic_load_impl(&mut self, dest: &Value, ptr: &Operand, ty: IrType, ordering: AtomicOrdering) {
         self.operand_to_t0(ptr);
         if Self::is_subword_type(ty) {

@@ -1,3 +1,45 @@
+//! RISC-V 64-bit code generator implementing the LP64D calling convention.
+//!
+//! ## RISC-V LP64D Calling Convention Summary
+//!
+//! ### Integer Argument Passing
+//! - Arguments passed in GP registers: `a0`–`a7` (8 registers)
+//! - Additional arguments passed on the stack, 8-byte aligned
+//! - Arguments larger than XLEN (64 bits) are passed in register pairs (e.g., i128 in a0:a1)
+//!
+//! ### Floating-Point Argument Passing
+//! - FP arguments in `fa0`–`fa7` (8 FP registers) for non-variadic functions
+//! - For variadic functions, float args are promoted to GP registers (a0–a7)
+//! - Structs with float fields may be passed in FP+GP register combinations
+//!
+//! ### Return Values
+//! - Integer return: `a0` (64-bit or smaller), `a0:a1` (128-bit)
+//! - Float return: `fa0` (f32/f64)
+//! - Struct return: hidden first argument pointer in `a0` (consumes a register slot)
+//!
+//! ### Stack Alignment
+//! - Stack pointer (`sp`) must be 16-byte aligned at all times
+//! - Variadic register save area: 64 bytes (a0–a7) above the frame pointer
+//!
+//! ### Callee-Saved Registers
+//! - `s0`/`fp` (frame pointer), `s1`, `s2`–`s11`, `ra` (return address)
+//! - `fs0`–`fs11` (FP callee-saved, not currently used by regalloc)
+//!
+//! ### Caller-Saved (Temporary) Registers
+//! - `t0`–`t6` (GP temporaries, used as accumulator/scratch)
+//! - `ft0`–`ft11` (FP temporaries)
+//! - `a0`–`a7` (argument registers, caller-saved)
+//!
+//! ### Register Usage in This Backend
+//! - `t0`: primary accumulator (loaded by `operand_to_t0`)
+//! - `t1`: secondary operand (comparison, atomics pointer)
+//! - `t2`: tertiary operand (atomics value, comparison)
+//! - `t3`–`t5`: used in call argument staging and 128-bit operations
+//! - `t6`: scratch for large immediate materialization
+//! - `s0`: frame pointer (always allocated)
+//! - `s1`, `s7`–`s11`: primary callee-saved pool for register allocation
+//! - `s2`–`s6`: extended callee-saved pool for register allocation
+
 use crate::delegate_to_impl;
 use crate::ir::reexports::{
     AtomicOrdering,
@@ -87,6 +129,14 @@ pub(super) const RISCV_ARG_REGS: [&str; 8] = ["a0", "a1", "a2", "a3", "a4", "a5"
 
 /// RISC-V 64 code generator. Implements the ArchCodegen trait for the shared framework.
 /// Uses standard RISC-V calling convention with register allocation for hot values.
+// TODO(fix_dash): Investigate RISC-V-specific failure in dash shell compilation.
+// The issue may be in code generation, register allocation, or peephole optimization.
+// Symptom: RISC-V dash build fails while x86/i686/ARM succeed.
+// Potential investigation areas:
+//   - Signal handling (sigaction struct layout differences)
+//   - setjmp/longjmp (register save/restore correctness)
+//   - String operations with specific alignment patterns
+//   - Peephole optimization incorrectly transforming a valid sequence
 pub struct RiscvCodegen {
     pub(crate) state: CodegenState,
     pub(super) current_return_type: IrType,
@@ -112,6 +162,9 @@ pub struct RiscvCodegen {
     pub(super) used_callee_saved: Vec<PhysReg>,
     /// Whether to suppress linker relaxation (-mno-relax).
     pub(super) no_relax: bool,
+    /// Stack slot offset (relative to s0) for saving sp before VLA allocations.
+    /// `None` if the current function has no VLAs.
+    pub(super) vla_save_slot: Option<i64>,
 }
 
 impl RiscvCodegen {
@@ -129,6 +182,7 @@ impl RiscvCodegen {
             reg_assignments: FxHashMap::default(),
             used_callee_saved: Vec::new(),
             no_relax: false,
+            vla_save_slot: None,
         }
     }
 
@@ -648,6 +702,10 @@ impl ArchCodegen for RiscvCodegen {
         fn emit_epilogue_and_ret(&mut self, frame_size: i64) => emit_epilogue_and_ret_impl;
         fn store_instr_for_type(&self, ty: IrType) -> &'static str => store_instr_for_type_impl;
         fn load_instr_for_type(&self, ty: IrType) -> &'static str => load_instr_for_type_impl;
+        // VLA (variable-length array) support
+        fn emit_vla_save_sp(&mut self, save_slot: &Value) => emit_vla_save_sp_impl;
+        fn emit_vla_restore_sp(&mut self, save_slot: &Value) => emit_vla_restore_sp_impl;
+        fn emit_vla_alloc(&mut self, dest: &Value, size: &Operand) => emit_vla_alloc_impl;
         // memory
         fn emit_store(&mut self, val: &Operand, ptr: &Value, ty: IrType) => emit_store_impl;
         fn emit_load(&mut self, dest: &Value, ptr: &Value, ty: IrType) => emit_load_impl;
@@ -717,6 +775,7 @@ impl ArchCodegen for RiscvCodegen {
         // atomics
         fn emit_atomic_rmw(&mut self, dest: &Value, op: AtomicRmwOp, ptr: &Operand, val: &Operand, ty: IrType, ordering: AtomicOrdering) => emit_atomic_rmw_impl;
         fn emit_atomic_cmpxchg(&mut self, dest: &Value, ptr: &Operand, expected: &Operand, desired: &Operand, ty: IrType, ordering: AtomicOrdering, failure_ordering: AtomicOrdering, returns_bool: bool) => emit_atomic_cmpxchg_impl;
+        fn emit_atomic_cmpxchg_weak(&mut self, dest: &Value, ptr: &Operand, expected: &Operand, desired: &Operand, ty: IrType, ordering: AtomicOrdering, failure_ordering: AtomicOrdering, returns_bool: bool) => emit_atomic_cmpxchg_weak_impl;
         fn emit_atomic_load(&mut self, dest: &Value, ptr: &Operand, ty: IrType, ordering: AtomicOrdering) => emit_atomic_load_impl;
         fn emit_atomic_store(&mut self, ptr: &Operand, val: &Operand, ty: IrType, ordering: AtomicOrdering) => emit_atomic_store_impl;
         fn emit_fence(&mut self, ordering: AtomicOrdering) => emit_fence_impl;
