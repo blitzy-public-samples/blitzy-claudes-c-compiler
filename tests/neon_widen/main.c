@@ -1,139 +1,101 @@
-// Test: NEON widening and narrowing intrinsics
-//
-// Compile: ccc-arm -o test main.c
-// Run:     qemu-aarch64 -L /usr/aarch64-linux-gnu ./test
-//
-// Exercises NEON widening (promote to wider type) and narrowing operations:
-//   vmovl_u16     — widen uint16x4_t to uint32x4_t (zero-extend)
-//   vmovl_s16     — widen int16x4_t to int32x4_t (sign-extend)
-//   vmovl_high_u8 — widen high half of uint8x16_t to uint16x8_t
-//   vmovn_u16     — narrow uint16x8_t to uint8x8_t (truncate)
-//   vmovn_u32     — narrow uint32x4_t to uint16x4_t (truncate)
-//   vmovn_u64     — narrow uint64x2_t to uint32x2_t (truncate)
-//   vqmovn_s32    — saturating narrow int32x4_t to int16x4_t
-//   vaddl_u8      — widening add uint8x8_t to uint16x8_t
-//   vsubl_u8      — widening subtract uint8x8_t to uint16x8_t (simulated)
-
 #include <arm_neon.h>
 
+/* Forward-declare printf to avoid pulling in system stdio.h which contains
+   attribute syntax not yet fully supported by CCC's parser. */
 int printf(const char *fmt, ...);
 
 int main(void) {
-    // --- vmovl_u16: widen uint16x4_t to uint32x4_t (zero-extend) ---
-    // Input:  {100, 30000, 65535, 0}
-    // Output: {100, 30000, 65535, 0}
-    {
-        uint16x4_t v = {{100, 30000, 65535, 0}};
-        uint32x4_t r = vmovl_u16(v);
-        printf("vmovl_u16: %u %u %u %u\n",
-               r.__val[0], r.__val[1], r.__val[2], r.__val[3]);
-    }
+    /* Test 1: vmovl_u16 — widen uint16x4_t to uint32x4_t (zero-extension) */
+    uint16x4_t widen_u16_in;
+    widen_u16_in.__val[0] = 100;
+    widen_u16_in.__val[1] = 30000;
+    widen_u16_in.__val[2] = 65535;
+    widen_u16_in.__val[3] = 0;
+    uint32x4_t widen_u16_out = vmovl_u16(widen_u16_in);
+    printf("vmovl_u16: %u %u %u %u\n",
+           widen_u16_out.__val[0], widen_u16_out.__val[1],
+           widen_u16_out.__val[2], widen_u16_out.__val[3]);
 
-    // --- vmovl_s16: widen int16x4_t to int32x4_t (sign-extend) ---
-    // Input:  {100, -100, 32767, -32768}
-    // Output: {100, -100, 32767, -32768}
-    {
-        int16x4_t v = {{100, -100, 32767, -32768}};
-        int32x4_t r = vmovl_s16(v);
-        printf("vmovl_s16: %d %d %d %d\n",
-               r.__val[0], r.__val[1], r.__val[2], r.__val[3]);
-    }
+    /* Test 2: vmovl_s16 — widen int16x4_t to int32x4_t (sign-extension) */
+    int16x4_t widen_s16_in;
+    widen_s16_in.__val[0] = 100;
+    widen_s16_in.__val[1] = -100;
+    widen_s16_in.__val[2] = 32767;
+    widen_s16_in.__val[3] = -32768;
+    int32x4_t widen_s16_out = vmovl_s16(widen_s16_in);
+    printf("vmovl_s16: %d %d %d %d\n",
+           widen_s16_out.__val[0], widen_s16_out.__val[1],
+           widen_s16_out.__val[2], widen_s16_out.__val[3]);
 
-    // --- vmovl_high_u8: widen high half (bytes 8-15) of u8x16 to u16x8 ---
-    // Input u8x16: {_, _, _, _, _, _, _, _, 10, 20, 100, 200, 255, 0, 128, 1}
-    // Output u16x8: {10, 20, 100, 200, 255, 0, 128, 1}
-    {
-        uint8x16_t v = {{0, 0, 0, 0, 0, 0, 0, 0,
-                         10, 20, 100, 200, 255, 0, 128, 1}};
-        uint16x8_t r = vmovl_high_u8(v);
-        printf("vmovl_high_u8: %u %u %u %u %u %u %u %u\n",
-               (unsigned)r.__val[0], (unsigned)r.__val[1],
-               (unsigned)r.__val[2], (unsigned)r.__val[3],
-               (unsigned)r.__val[4], (unsigned)r.__val[5],
-               (unsigned)r.__val[6], (unsigned)r.__val[7]);
-    }
+    /* Test 3: vmovl_high_u8 — widen high half of uint8x16_t to uint16x8_t */
+    unsigned char high_u8_data[] = {0,1,2,3,4,5,6,7, 10,20,100,200,255,0,128,1};
+    uint8x16_t high_u8_in = vld1q_u8(high_u8_data);
+    uint16x8_t high_u8_out = vmovl_high_u8(high_u8_in);
+    printf("vmovl_high_u8: %u %u %u %u %u %u %u %u\n",
+           high_u8_out.__val[0], high_u8_out.__val[1],
+           high_u8_out.__val[2], high_u8_out.__val[3],
+           high_u8_out.__val[4], high_u8_out.__val[5],
+           high_u8_out.__val[6], high_u8_out.__val[7]);
 
-    // --- vmovn_u16: narrow uint16x8_t to uint8x8_t (truncate to low 8 bits) ---
-    // Input:  {100, 200, 255, 256, 512, 1, 300, 65535}
-    // Output: {100, 200, 255, 0, 0, 1, 44, 255}
-    {
-        uint16x8_t v = {{100, 200, 255, 256, 512, 1, 300, 65535}};
-        uint8x8_t r = vmovn_u16(v);
-        printf("vmovn_u16: %u %u %u %u %u %u %u %u\n",
-               (unsigned)r.__val[0], (unsigned)r.__val[1],
-               (unsigned)r.__val[2], (unsigned)r.__val[3],
-               (unsigned)r.__val[4], (unsigned)r.__val[5],
-               (unsigned)r.__val[6], (unsigned)r.__val[7]);
-    }
+    /* Test 4: vmovn_u16 — narrow uint16x8_t to uint8x8_t (truncation, low 8 bits) */
+    unsigned short narrow_u16_data[] = {100, 200, 255, 256, 0, 1, 300, 65535};
+    uint16x8_t narrow_u16_in = vld1q_u16(narrow_u16_data);
+    uint8x8_t narrow_u16_out = vmovn_u16(narrow_u16_in);
+    printf("vmovn_u16: %u %u %u %u %u %u %u %u\n",
+           narrow_u16_out.__val[0], narrow_u16_out.__val[1],
+           narrow_u16_out.__val[2], narrow_u16_out.__val[3],
+           narrow_u16_out.__val[4], narrow_u16_out.__val[5],
+           narrow_u16_out.__val[6], narrow_u16_out.__val[7]);
 
-    // --- vmovn_u32: narrow uint32x4_t to uint16x4_t (truncate to low 16 bits) ---
-    // Input:  {12345, 65536, 100000, 65536}
-    // Output: {12345, 0, 34464, 0}
-    // (100000 = 0x186A0, low 16 = 0x86A0 = 34464)
-    {
-        unsigned int data[4] = {12345, 65536, 100000, 65536};
-        uint32x4_t v = vld1q_u32(data);
-        uint16x4_t r = vmovn_u32(v);
-        printf("vmovn_u32: %u %u %u %u\n",
-               (unsigned)r.__val[0], (unsigned)r.__val[1],
-               (unsigned)r.__val[2], (unsigned)r.__val[3]);
-    }
+    /* Test 5: vmovn_u32 — narrow uint32x4_t to uint16x4_t (truncation, low 16 bits) */
+    unsigned int narrow_u32_data[] = {12345, 65536, 100000, 0};
+    uint32x4_t narrow_u32_in = vld1q_u32(narrow_u32_data);
+    uint16x4_t narrow_u32_out = vmovn_u32(narrow_u32_in);
+    printf("vmovn_u32: %u %u %u %u\n",
+           narrow_u32_out.__val[0], narrow_u32_out.__val[1],
+           narrow_u32_out.__val[2], narrow_u32_out.__val[3]);
 
-    // --- vmovn_u64: narrow uint64x2_t to uint32x2_t (truncate to low 32 bits) ---
-    // Input:  {4294967296 (0x100000000), 12345}
-    // Output: {0, 12345}
-    {
-        uint64x2_t v;
-        v.__val[0] = 4294967296ULL;
-        v.__val[1] = 12345ULL;
-        uint32x2_t r = vmovn_u64(v);
-        printf("vmovn_u64: %u %u\n", r.__val[0], r.__val[1]);
-    }
+    /* Test 6: vmovn_u64 — narrow uint64x2_t to uint32x2_t (truncation, low 32 bits) */
+    unsigned long long narrow_u64_data[] = {4294967296ULL, 12345ULL};
+    uint64x2_t narrow_u64_in = vld1q_u64(narrow_u64_data);
+    uint32x2_t narrow_u64_out = vmovn_u64(narrow_u64_in);
+    printf("vmovn_u64: %u %u\n",
+           narrow_u64_out.__val[0], narrow_u64_out.__val[1]);
 
-    // --- vqmovn_s32: saturating narrow int32x4_t to int16x4_t ---
-    // Input:  {100000, -100000, 1000, -500}
-    // Output: {32767, -32768, 1000, -500} (100000 and -100000 saturated)
-    {
-        int32x4_t v = {{100000, -100000, 1000, -500}};
-        int16x4_t r = vqmovn_s32(v);
-        printf("vqmovn_s32: %d %d %d %d\n",
-               (int)r.__val[0], (int)r.__val[1],
-               (int)r.__val[2], (int)r.__val[3]);
-    }
+    /* Test 7: vqmovn_s32 — saturating narrow int32x4_t to int16x4_t */
+    int32x4_t sat_narrow_in;
+    sat_narrow_in.__val[0] = 100000;
+    sat_narrow_in.__val[1] = -100000;
+    sat_narrow_in.__val[2] = 1000;
+    sat_narrow_in.__val[3] = -500;
+    int16x4_t sat_narrow_out = vqmovn_s32(sat_narrow_in);
+    printf("vqmovn_s32: %d %d %d %d\n",
+           sat_narrow_out.__val[0], sat_narrow_out.__val[1],
+           sat_narrow_out.__val[2], sat_narrow_out.__val[3]);
 
-    // --- vaddl_u8: widening add u8x8 → u16x8 ---
-    // a = {200, 200, 255, 0, 128, 50, 1, 254}
-    // b = {100, 100, 255, 0, 128, 50, 1, 254}
-    // Result: {300, 300, 510, 0, 256, 100, 2, 508}
-    {
-        uint8x8_t a = {{200, 200, 255, 0, 128, 50, 1, 254}};
-        uint8x8_t b = {{100, 100, 255, 0, 128, 50, 1, 254}};
-        uint16x8_t r = vaddl_u8(a, b);
-        printf("vaddl_u8: %u %u %u %u %u %u %u %u\n",
-               (unsigned)r.__val[0], (unsigned)r.__val[1],
-               (unsigned)r.__val[2], (unsigned)r.__val[3],
-               (unsigned)r.__val[4], (unsigned)r.__val[5],
-               (unsigned)r.__val[6], (unsigned)r.__val[7]);
-    }
+    /* Test 8: vaddl_u8 — widening add uint8x8_t + uint8x8_t -> uint16x8_t */
+    unsigned char addl_a[] = {200, 100, 255, 0, 128, 50, 1, 254};
+    unsigned char addl_b[] = {100, 200, 255, 0, 128, 50, 1, 254};
+    uint8x8_t addl_va = vld1_u8(addl_a);
+    uint8x8_t addl_vb = vld1_u8(addl_b);
+    uint16x8_t addl_out = vaddl_u8(addl_va, addl_vb);
+    printf("vaddl_u8: %u %u %u %u %u %u %u %u\n",
+           addl_out.__val[0], addl_out.__val[1],
+           addl_out.__val[2], addl_out.__val[3],
+           addl_out.__val[4], addl_out.__val[5],
+           addl_out.__val[6], addl_out.__val[7]);
 
-    // --- vsubl_u8: widening subtract u8x8 → u16x8 (simulated) ---
-    // Since vsubl_u8 may not be in the header, simulate manually:
-    //   result[i] = (uint16)a[i] - (uint16)b[i]
-    // a = {200, 150, 255, 100, 129, 50, 51, 50}
-    // b = {100, 100, 128,  50, 128, 50, 50, 50}
-    // Result: {100, 50, 127, 50, 1, 0, 1, 0}
-    {
-        unsigned char a_arr[8] = {200, 150, 255, 100, 129, 50, 51, 50};
-        unsigned char b_arr[8] = {100, 100, 128,  50, 128, 50, 50, 50};
-        unsigned short out[8];
-        for (int i = 0; i < 8; i++)
-            out[i] = (unsigned short)a_arr[i] - (unsigned short)b_arr[i];
-        printf("vsubl_u8: %u %u %u %u %u %u %u %u\n",
-               (unsigned)out[0], (unsigned)out[1],
-               (unsigned)out[2], (unsigned)out[3],
-               (unsigned)out[4], (unsigned)out[5],
-               (unsigned)out[6], (unsigned)out[7]);
-    }
+    /* Test 9: vsubl_u8 — widening subtract uint8x8_t - uint8x8_t -> uint16x8_t */
+    unsigned char subl_a[] = {200, 100, 255, 50, 128, 0, 254, 1};
+    unsigned char subl_b[] = {100, 50, 128, 0, 127, 0, 253, 1};
+    uint8x8_t subl_va = vld1_u8(subl_a);
+    uint8x8_t subl_vb = vld1_u8(subl_b);
+    uint16x8_t subl_out = vsubl_u8(subl_va, subl_vb);
+    printf("vsubl_u8: %u %u %u %u %u %u %u %u\n",
+           subl_out.__val[0], subl_out.__val[1],
+           subl_out.__val[2], subl_out.__val[3],
+           subl_out.__val[4], subl_out.__val[5],
+           subl_out.__val[6], subl_out.__val[7]);
 
     return 0;
 }
