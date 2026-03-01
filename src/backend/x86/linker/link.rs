@@ -13,7 +13,10 @@ use super::input::load_file;
 use super::plt_got::{collect_ifunc_symbols, create_plt_got};
 use super::emit_exec::emit_executable;
 use super::emit_shared::emit_shared_library;
-use crate::backend::linker_common::{self, OutputSection, GlobalSymbolOps, SymbolExpr};
+use crate::backend::linker_common::{
+    self, OutputSection, GlobalSymbolOps, SymbolExpr,
+    parse_linker_script, LinkerScript,
+};
 
 /// Evaluate a linker script symbol expression to a u64 value.
 ///
@@ -218,12 +221,12 @@ pub fn link_builtin(
         });
     }
 
-    // Parse linker script if provided via -T
-    let script = if let Some(ref script_path) = linker_script_path {
-        match linker_common::parse_linker_script(std::path::Path::new(script_path)) {
-            Ok(s) => Some(s),
-            Err(_e) => None, // Silently ignore invalid scripts (matches observed behavior)
-        }
+    // Parse linker script if provided via -T.
+    // The linker script controls section placement, memory layout, entry point,
+    // and conditional symbol generation (PROVIDE). Used primarily by kernel and
+    // embedded builds where precise memory layout is required.
+    let script: Option<LinkerScript> = if let Some(ref script_path) = linker_script_path {
+        Some(parse_linker_script(Path::new(script_path))?)
     } else {
         None
     };
@@ -256,6 +259,38 @@ pub fn link_builtin(
         }
     }
 
+    // Apply ENTRY directive from linker script.
+    // When the linker script specifies ENTRY(symbol), that symbol's address
+    // becomes the ELF e_entry field. For the common case of ENTRY(_start),
+    // this is already handled by emit_executable. For non-_start entry symbols
+    // (e.g., kernel builds with a custom entry), ensure _start is set up as
+    // an alias so that the executable emitter picks up the correct address.
+    if let Some(ref s) = script {
+        if let Some(ref entry_name) = s.entry {
+            if entry_name != "_start" {
+                if let Some(entry_sym) = globals.get(entry_name).cloned() {
+                    if entry_sym.defined_in.is_some() {
+                        // If _start is not already defined by an object file,
+                        // create it pointing to the ENTRY symbol's address.
+                        let start_defined = globals
+                            .get("_start")
+                            .map_or(false, |s| s.defined_in.is_some());
+                        if !start_defined {
+                            globals.insert("_start".to_string(), entry_sym);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Emit NSS warning for static linking.
+    // When linking statically, glibc's NSS (Name Service Switch) functions
+    // (getaddrinfo, getpwnam, gethostbyname, etc.) require shared libraries
+    // at runtime even though the binary is statically linked. This is a common
+    // source of subtle runtime failures, so we emit a diagnostic.
+    linker_common::check_nss_static_warning(&globals, is_static);
+
     // Check for truly undefined (non-weak, non-dynamic, non-linker-defined) symbols
     linker_common::check_undefined_symbols_elf64(&globals, 20)?;
 
@@ -271,7 +306,7 @@ pub fn link_builtin(
         let mut script_sections: Vec<(String, Vec<String>, Option<u64>)> = Vec::new();
         // Track which memory regions have been assigned to avoid double-assigning
         // the same origin to multiple sections.
-        let mut used_regions: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut used_regions: HashSet<String> = HashSet::new();
         for sec in &s.sections {
             // Resolve address: only explicit `. = addr;` and first-use of MEMORY
             // region ORIGIN get concrete addresses. Sections without explicit
@@ -321,7 +356,24 @@ pub fn link_builtin(
     // Create PLT/GOT
     let (plt_names, got_entries) = create_plt_got(&objects, &mut globals);
 
-    // Collect IFUNC symbols for static linking
+    // Collect GNU IFUNC (indirect function) symbols for dispatch.
+    //
+    // x86-64 fully supports GNU IFUNC in both static and dynamic linking modes:
+    //
+    //   Static linking: IFUNC resolver functions are called at program startup
+    //   via R_X86_64_IRELATIVE relocations in the .rela.iplt section. The CRT
+    //   iterates __rela_iplt_start..__rela_iplt_end and invokes each resolver,
+    //   storing the result in the corresponding .iplt GOT slot. Subsequent
+    //   calls go through the .iplt PLT stub which loads from the resolved GOT.
+    //
+    //   Dynamic linking: IFUNC symbols are handled through the standard PLT/GOT
+    //   infrastructure. The dynamic linker (ld-linux-x86-64.so.2) resolves
+    //   STT_GNU_IFUNC symbols by calling the resolver function during lazy or
+    //   eager binding, then patching the GOT entry with the result.
+    //
+    // Both paths are handled by collect_ifunc_symbols (which gathers
+    // STT_GNU_IFUNC globals) and the corresponding emission code in
+    // emit_exec.rs (static: .iplt/.rela.iplt) and plt_got.rs (dynamic: PLT/GOT).
     let ifunc_symbols = collect_ifunc_symbols(&globals, is_static);
 
     // Emit executable
