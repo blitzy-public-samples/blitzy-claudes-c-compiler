@@ -381,7 +381,7 @@ pub fn link_builtin(
         &objects, &mut globals, &mut output_sections, &section_map,
         &plt_names, &got_entries, &needed_sonames, output_path,
         export_dynamic, &rpath_entries, use_runpath, is_static,
-        &ifunc_symbols,
+        &ifunc_symbols, script.as_ref(),
     )
 }
 

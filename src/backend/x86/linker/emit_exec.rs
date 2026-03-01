@@ -9,6 +9,7 @@ use std::collections::{HashMap, BTreeSet};
 use super::elf::*;
 use super::types::{GlobalSymbol, BASE_ADDR, PAGE_SIZE, INTERP};
 use crate::backend::linker_common::{self, DynStrTab, OutputSection};
+use crate::backend::linker_common::linker_script::LinkerScript;
 
 pub(super) fn emit_executable(
     objects: &[ElfObject], globals: &mut HashMap<String, GlobalSymbol>,
@@ -18,7 +19,15 @@ pub(super) fn emit_executable(
     needed_sonames: &[String], output_path: &str,
     export_dynamic: bool, rpath_entries: &[String], use_runpath: bool,
     is_static: bool, ifunc_symbols: &[String],
+    linker_script: Option<&LinkerScript>,
 ) -> Result<(), String> {
+    // ── NSS static linking diagnostics ──────────────────────────────────
+    // When linking statically, glibc NSS functions (getaddrinfo, getpwnam,
+    // gethostbyname, etc.) use dlopen() at runtime to load service modules.
+    // This will fail in a fully static binary. Emit non-fatal warnings to
+    // stderr so the user is aware of potential runtime failures.
+    linker_common::check_nss_static_warning(globals, is_static);
+
     let mut dynstr = DynStrTab::new();
     for lib in needed_sonames { dynstr.add(lib); }
     let rpath_string = if rpath_entries.is_empty() { None } else {
@@ -334,19 +343,47 @@ pub(super) fn emit_executable(
     // Text segment
     offset = (offset + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
     let text_page_offset = offset;
-    let text_page_addr = BASE_ADDR + offset;
+
+    // Linker script text address adjustment: if a linker script assigned an
+    // explicit virtual address to any executable section (e.g.,
+    // `.text 0xffffffff80000000 : { *(.text) }`), shift the entire text
+    // segment's virtual addresses to start at that address while keeping file
+    // offsets sequential and compact. This satisfies the ELF constraint
+    // p_offset % p_align == p_vaddr % p_align since both the file offset and
+    // virtual address are page-aligned.
+    let text_script_base: Option<u64> = {
+        let mut min_addr: Option<u64> = None;
+        for sec in output_sections.iter() {
+            if sec.addr != 0 && sec.flags & SHF_EXECINSTR != 0 && sec.flags & SHF_ALLOC != 0 {
+                if min_addr.is_none() || sec.addr < min_addr.unwrap() {
+                    min_addr = Some(sec.addr);
+                }
+            }
+        }
+        min_addr
+    };
+    // Clear script-assigned addresses so the sequential layout below works
+    // correctly. Virtual addresses are computed using text_vaddr_base.
+    for sec in output_sections.iter_mut() {
+        if sec.flags & SHF_EXECINSTR != 0 && sec.flags & SHF_ALLOC != 0 {
+            sec.addr = 0;
+        }
+    }
+    let text_vaddr_base: u64 = text_script_base.unwrap_or(BASE_ADDR + text_page_offset);
+    let text_page_addr = text_vaddr_base;
+
     for sec in output_sections.iter_mut() {
         if sec.flags & SHF_EXECINSTR != 0 && sec.flags & SHF_ALLOC != 0 {
             let a = sec.alignment.max(1);
             offset = (offset + a - 1) & !(a - 1);
-            sec.addr = BASE_ADDR + offset;
+            sec.addr = text_vaddr_base + (offset - text_page_offset);
             sec.file_offset = offset;
             offset += sec.mem_size;
         }
     }
     let (plt_addr, plt_offset) = if plt_size > 0 {
         offset = (offset + 15) & !15;
-        let a = BASE_ADDR + offset; let o = offset; offset += plt_size; (a, o)
+        let a = text_vaddr_base + (offset - text_page_offset); let o = offset; offset += plt_size; (a, o)
     } else { (0u64, 0u64) };
 
     // .iplt (IFUNC PLT entries for static linking)
@@ -355,7 +392,7 @@ pub(super) fn emit_executable(
     let iplt_total_size = num_ifunc as u64 * iplt_entry_size;
     let (iplt_addr, iplt_offset) = if iplt_total_size > 0 {
         offset = (offset + 15) & !15;
-        let a = BASE_ADDR + offset; let o = offset; offset += iplt_total_size; (a, o)
+        let a = text_vaddr_base + (offset - text_page_offset); let o = offset; offset += iplt_total_size; (a, o)
     } else { (0u64, 0u64) };
 
     let text_total_size = offset - text_page_offset;
@@ -363,13 +400,41 @@ pub(super) fn emit_executable(
     // Rodata segment
     offset = (offset + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
     let rodata_page_offset = offset;
-    let rodata_page_addr = BASE_ADDR + offset;
+
+    // Linker script rodata address adjustment: same pattern as text segment.
+    // If a linker script assigned an explicit virtual address to any read-only
+    // data section, use it as the segment base address.
+    let rodata_script_base: Option<u64> = {
+        let mut min_addr: Option<u64> = None;
+        for sec in output_sections.iter() {
+            if sec.addr != 0 && sec.flags & SHF_ALLOC != 0
+                && sec.flags & SHF_EXECINSTR == 0
+                && sec.flags & SHF_WRITE == 0
+                && sec.sh_type != SHT_NOBITS
+            {
+                if min_addr.is_none() || sec.addr < min_addr.unwrap() {
+                    min_addr = Some(sec.addr);
+                }
+            }
+        }
+        min_addr
+    };
+    for sec in output_sections.iter_mut() {
+        if sec.flags & SHF_ALLOC != 0 && sec.flags & SHF_EXECINSTR == 0
+            && sec.flags & SHF_WRITE == 0 && sec.sh_type != SHT_NOBITS
+        {
+            sec.addr = 0;
+        }
+    }
+    let rodata_vaddr_base: u64 = rodata_script_base.unwrap_or(BASE_ADDR + rodata_page_offset);
+    let rodata_page_addr = rodata_vaddr_base;
+
     for sec in output_sections.iter_mut() {
         if sec.flags & SHF_ALLOC != 0 && sec.flags & SHF_EXECINSTR == 0 &&
            sec.flags & SHF_WRITE == 0 && sec.sh_type != SHT_NOBITS {
             let a = sec.alignment.max(1);
             offset = (offset + a - 1) & !(a - 1);
-            sec.addr = BASE_ADDR + offset;
+            sec.addr = rodata_vaddr_base + (offset - rodata_page_offset);
             sec.file_offset = offset;
             offset += sec.mem_size;
         }
@@ -512,6 +577,32 @@ pub(super) fn emit_executable(
         }
     }
 
+    // ── Linker script MEMORY region validation ─────────────────────────
+    // When a linker script defines MEMORY { } regions with address ranges and
+    // attributes, validate that output section placements fall within their
+    // designated memory regions. Violations are reported as warnings (not
+    // errors) to allow builds to proceed with potentially incorrect layout.
+    if let Some(ls) = linker_script {
+        for script_sec in &ls.sections {
+            if let Some(ref region_name) = script_sec.memory_region {
+                if let Some(region) = ls.memory_regions.iter().find(|r| r.name == *region_name) {
+                    for sec in output_sections.iter() {
+                        if sec.name == script_sec.name && sec.mem_size > 0 {
+                            let sec_end = sec.addr.saturating_add(sec.mem_size);
+                            let region_end = region.origin.saturating_add(region.length);
+                            if sec.addr < region.origin || sec_end > region_end {
+                                eprintln!(
+                                    "warning: section '{}' ({:#x}..{:#x}) exceeds MEMORY region '{}' ({:#x}..{:#x})",
+                                    sec.name, sec.addr, sec_end, region.name, region.origin, region_end
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // Allocate BSS space for copy-relocated symbols.
     // Symbols that are aliases (same from_lib + lib_sym_value) share the same BSS slot.
     let mut copy_reloc_addr_map: HashMap<(String, u64), u64> = HashMap::new(); // (lib, lib_value) -> bss_addr
@@ -626,7 +717,14 @@ pub(super) fn emit_executable(
         }
     }
 
-    let entry_addr = globals.get("_start").map(|s| s.value).unwrap_or(text_page_addr);
+    // Resolve entry point: if a linker script provides ENTRY(symbol), use that
+    // symbol name; otherwise fall back to the conventional _start symbol. If
+    // neither is defined (e.g., freestanding embedded code), fall back to the
+    // text segment base address.
+    let entry_symbol = linker_script
+        .and_then(|ls| ls.entry.as_deref())
+        .unwrap_or("_start");
+    let entry_addr = globals.get(entry_symbol).map(|s| s.value).unwrap_or(text_page_addr);
 
     // === Build output buffer ===
     let file_size = offset as usize;
@@ -890,7 +988,40 @@ pub(super) fn emit_executable(
         }
     }
 
-    // IFUNC: write .iplt, IFUNC GOT, and .rela.iplt data
+    // ── IFUNC static linking dispatch ──────────────────────────────────
+    // GNU IFUNC (indirect functions) on x86-64 use the following mechanism
+    // for static executables:
+    //
+    //   1. Each IFUNC symbol's address is redirected to an IPLT entry (a
+    //      small PLT-like stub in the .iplt section). Callers that reference
+    //      the IFUNC symbol call into the IPLT stub.
+    //
+    //   2. The IPLT stub executes `jmp *ifunc_got_entry(%rip)`, jumping
+    //      through the IFUNC GOT (a dedicated GOT region separate from
+    //      .got.plt used by dynamic symbols).
+    //
+    //   3. At link time, the IFUNC GOT entries are initialized with the
+    //      address of the resolver function (the function the programmer
+    //      annotated with `__attribute__((ifunc("resolver")))`).
+    //
+    //   4. The linker emits R_X86_64_IRELATIVE relocations in the .rela.iplt
+    //      section. Each IRELATIVE relocation specifies:
+    //        r_offset = address of the IFUNC GOT entry
+    //        r_addend = address of the resolver function
+    //
+    //   5. The CRT startup code (crt1.o / Scrt1.o) iterates the region
+    //      bounded by __rela_iplt_start and __rela_iplt_end symbols before
+    //      calling main(). For each IRELATIVE entry, it calls the resolver
+    //      function and writes the returned function pointer into the GOT
+    //      entry at r_offset.
+    //
+    //   6. After CRT initialization, subsequent calls through the IPLT
+    //      stubs jump to the resolved (hardware-optimized) implementation.
+    //
+    // For dynamic executables, IFUNC dispatch is handled by the dynamic
+    // linker (ld-linux-x86-64.so.2) through STT_GNU_IFUNC type symbols
+    // and the standard PLT/GOT infrastructure in plt_got.rs. Dynamic IFUNC
+    // IRELATIVE entries are placed in .rela.dyn (see above).
     if num_ifunc > 0 {
         // .iplt - each entry is: jmp *ifunc_got_entry(%rip); nop padding
         for i in 0..num_ifunc {
