@@ -41,6 +41,18 @@ impl X86Codegen {
             AtomicRmwOp::Nand => {
                 self.emit_x86_atomic_op_loop(ty, "nand");
             }
+            AtomicRmwOp::Min => {
+                self.emit_x86_atomic_op_loop(ty, "smin");
+            }
+            AtomicRmwOp::Max => {
+                self.emit_x86_atomic_op_loop(ty, "smax");
+            }
+            AtomicRmwOp::UMin => {
+                self.emit_x86_atomic_op_loop(ty, "umin");
+            }
+            AtomicRmwOp::UMax => {
+                self.emit_x86_atomic_op_loop(ty, "umax");
+            }
         }
         self.store_rax_to(dest);
     }

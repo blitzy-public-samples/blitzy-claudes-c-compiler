@@ -816,6 +816,38 @@ impl X86Codegen {
                 self.state.emit_fmt(format_args!("    and{} %{}, %{}", size_suffix, r8_reg, rdx_reg));
                 self.state.emit_fmt(format_args!("    not{} %{}", size_suffix, rdx_reg));
             }
+            "smin" => {
+                // Signed min: if old > val (signed), new = val; else keep old
+                self.state.emit_fmt(format_args!("    cmp{} %{}, %{}", size_suffix, r8_reg, rdx_reg));
+                let skip_label = format!(".Latomic_skip_{}", label_id);
+                self.state.out.emit_jcc_label("    jle", &skip_label);
+                self.state.emit_fmt(format_args!("    mov{} %{}, %{}", size_suffix, r8_reg, rdx_reg));
+                self.state.out.emit_named_label(&skip_label);
+            }
+            "smax" => {
+                // Signed max: if old < val (signed), new = val; else keep old
+                self.state.emit_fmt(format_args!("    cmp{} %{}, %{}", size_suffix, r8_reg, rdx_reg));
+                let skip_label = format!(".Latomic_skip_{}", label_id);
+                self.state.out.emit_jcc_label("    jge", &skip_label);
+                self.state.emit_fmt(format_args!("    mov{} %{}, %{}", size_suffix, r8_reg, rdx_reg));
+                self.state.out.emit_named_label(&skip_label);
+            }
+            "umin" => {
+                // Unsigned min: if old > val (unsigned), new = val; else keep old
+                self.state.emit_fmt(format_args!("    cmp{} %{}, %{}", size_suffix, r8_reg, rdx_reg));
+                let skip_label = format!(".Latomic_skip_{}", label_id);
+                self.state.out.emit_jcc_label("    jbe", &skip_label);
+                self.state.emit_fmt(format_args!("    mov{} %{}, %{}", size_suffix, r8_reg, rdx_reg));
+                self.state.out.emit_named_label(&skip_label);
+            }
+            "umax" => {
+                // Unsigned max: if old < val (unsigned), new = val; else keep old
+                self.state.emit_fmt(format_args!("    cmp{} %{}, %{}", size_suffix, r8_reg, rdx_reg));
+                let skip_label = format!(".Latomic_skip_{}", label_id);
+                self.state.out.emit_jcc_label("    jae", &skip_label);
+                self.state.emit_fmt(format_args!("    mov{} %{}, %{}", size_suffix, r8_reg, rdx_reg));
+                self.state.out.emit_named_label(&skip_label);
+            }
             _ => {}
         }
         // Try cmpxchg: if [rcx] == rax (old), set [rcx] = rdx (new), else rax = [rcx]

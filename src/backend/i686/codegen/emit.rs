@@ -735,6 +735,82 @@ impl I686Codegen {
                 self.state.emit("    lock cmpxchg8b (%esi)");
                 emit!(self.state, "    jne {}", loop_label);
             }
+            AtomicRmwOp::Min => {
+                // Signed min via CAS loop: new = min(old, val) (64-bit)
+                let loop_label = format!(".Latomic_{}", self.state.next_label_id());
+                let skip_label = format!(".Latomic_skip_{}", self.state.next_label_id());
+                emit!(self.state, "{}:", loop_label);
+                self.state.emit("    movl %eax, %ebx");
+                self.state.emit("    movl %edx, %ecx");
+                // Compare old (edx:eax) with val (on stack): if old <= val, keep old
+                self.state.emit("    cmpl 4(%esp), %edx"); // compare high words
+                emit!(self.state, "    jl {}", skip_label);
+                emit!(self.state, "    jg .+8");
+                self.state.emit("    cmpl (%esp), %eax");  // compare low words if high equal
+                emit!(self.state, "    jbe {}", skip_label);
+                // old > val: new = val
+                self.state.emit("    movl (%esp), %ebx");
+                self.state.emit("    movl 4(%esp), %ecx");
+                emit!(self.state, "{}:", skip_label);
+                self.state.emit("    lock cmpxchg8b (%esi)");
+                emit!(self.state, "    jne {}", loop_label);
+            }
+            AtomicRmwOp::Max => {
+                // Signed max via CAS loop: new = max(old, val) (64-bit)
+                let loop_label = format!(".Latomic_{}", self.state.next_label_id());
+                let skip_label = format!(".Latomic_skip_{}", self.state.next_label_id());
+                emit!(self.state, "{}:", loop_label);
+                self.state.emit("    movl %eax, %ebx");
+                self.state.emit("    movl %edx, %ecx");
+                // Compare old (edx:eax) with val (on stack): if old >= val, keep old
+                self.state.emit("    cmpl 4(%esp), %edx");
+                emit!(self.state, "    jg {}", skip_label);
+                emit!(self.state, "    jl .+8");
+                self.state.emit("    cmpl (%esp), %eax");
+                emit!(self.state, "    jae {}", skip_label);
+                // old < val: new = val
+                self.state.emit("    movl (%esp), %ebx");
+                self.state.emit("    movl 4(%esp), %ecx");
+                emit!(self.state, "{}:", skip_label);
+                self.state.emit("    lock cmpxchg8b (%esi)");
+                emit!(self.state, "    jne {}", loop_label);
+            }
+            AtomicRmwOp::UMin => {
+                // Unsigned min via CAS loop (64-bit)
+                let loop_label = format!(".Latomic_{}", self.state.next_label_id());
+                let skip_label = format!(".Latomic_skip_{}", self.state.next_label_id());
+                emit!(self.state, "{}:", loop_label);
+                self.state.emit("    movl %eax, %ebx");
+                self.state.emit("    movl %edx, %ecx");
+                self.state.emit("    cmpl 4(%esp), %edx");
+                emit!(self.state, "    jb {}", skip_label);
+                emit!(self.state, "    ja .+8");
+                self.state.emit("    cmpl (%esp), %eax");
+                emit!(self.state, "    jbe {}", skip_label);
+                self.state.emit("    movl (%esp), %ebx");
+                self.state.emit("    movl 4(%esp), %ecx");
+                emit!(self.state, "{}:", skip_label);
+                self.state.emit("    lock cmpxchg8b (%esi)");
+                emit!(self.state, "    jne {}", loop_label);
+            }
+            AtomicRmwOp::UMax => {
+                // Unsigned max via CAS loop (64-bit)
+                let loop_label = format!(".Latomic_{}", self.state.next_label_id());
+                let skip_label = format!(".Latomic_skip_{}", self.state.next_label_id());
+                emit!(self.state, "{}:", loop_label);
+                self.state.emit("    movl %eax, %ebx");
+                self.state.emit("    movl %edx, %ecx");
+                self.state.emit("    cmpl 4(%esp), %edx");
+                emit!(self.state, "    ja {}", skip_label);
+                emit!(self.state, "    jb .+8");
+                self.state.emit("    cmpl (%esp), %eax");
+                emit!(self.state, "    jae {}", skip_label);
+                self.state.emit("    movl (%esp), %ebx");
+                self.state.emit("    movl 4(%esp), %ecx");
+                emit!(self.state, "{}:", skip_label);
+                self.state.emit("    lock cmpxchg8b (%esi)");
+                emit!(self.state, "    jne {}", loop_label);
+            }
         }
 
         // Clean up stack (remove 8-byte operand value)

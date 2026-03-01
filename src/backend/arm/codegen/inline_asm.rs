@@ -357,6 +357,26 @@ impl ArmCodegen {
                 // Handled separately in emit_atomic_rmw
                 state.emit_fmt(format_args!("    mov {}, {}", dest_reg, val_reg));
             }
+            AtomicRmwOp::Min => {
+                // Signed min: dest = min(old, val)
+                state.emit_fmt(format_args!("    cmp {}, {}", old_reg, val_reg));
+                state.emit_fmt(format_args!("    csel {}, {}, {}, le", dest_reg, old_reg, val_reg));
+            }
+            AtomicRmwOp::Max => {
+                // Signed max: dest = max(old, val)
+                state.emit_fmt(format_args!("    cmp {}, {}", old_reg, val_reg));
+                state.emit_fmt(format_args!("    csel {}, {}, {}, ge", dest_reg, old_reg, val_reg));
+            }
+            AtomicRmwOp::UMin => {
+                // Unsigned min: dest = umin(old, val)
+                state.emit_fmt(format_args!("    cmp {}, {}", old_reg, val_reg));
+                state.emit_fmt(format_args!("    csel {}, {}, {}, ls", dest_reg, old_reg, val_reg));
+            }
+            AtomicRmwOp::UMax => {
+                // Unsigned max: dest = umax(old, val)
+                state.emit_fmt(format_args!("    cmp {}, {}", old_reg, val_reg));
+                state.emit_fmt(format_args!("    csel {}, {}, {}, hs", dest_reg, old_reg, val_reg));
+            }
         }
     }
 }

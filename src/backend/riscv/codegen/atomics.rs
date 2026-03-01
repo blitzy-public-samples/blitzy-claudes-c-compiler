@@ -18,7 +18,7 @@ impl RiscvCodegen {
     pub(super) fn amo_ordering(ordering: AtomicOrdering) -> &'static str {
         match ordering {
             AtomicOrdering::Relaxed => "",
-            AtomicOrdering::Acquire => ".aq",
+            AtomicOrdering::Consume | AtomicOrdering::Acquire => ".aq",
             AtomicOrdering::Release => ".rl",
             AtomicOrdering::AcqRel => ".aqrl",
             AtomicOrdering::SeqCst => ".aqrl",
@@ -180,6 +180,55 @@ impl RiscvCodegen {
                 self.state.emit("    and t3, t3, a4"); // mask to field
                 self.state.emit("    and t4, t0, a5"); // clear old field
                 self.state.emit("    or t4, t4, t3");  // insert new value
+            }
+            AtomicRmwOp::Min => {
+                // Signed min: new_field = smin(old_field, val_field)
+                // Extract old field, sign-extend, compare, select min, re-insert
+                self.state.emit("    and t3, t0, a4"); // t3 = old field (shifted)
+                self.state.emit("    srl t3, t3, a3"); // shift to low bits
+                self.state.emit("    srl t5, t2, a3"); // t5 = val field in low bits
+                self.state.emit("    blt t3, t5, 8");  // if old < val (signed), skip
+                self.state.emit("    mv t3, t5");      // else t3 = val
+                self.state.emit("    sllw t3, t3, a3"); // shift back
+                self.state.emit("    and t3, t3, a4"); // mask to field
+                self.state.emit("    and t4, t0, a5"); // clear old field
+                self.state.emit("    or t4, t4, t3");  // insert new value
+            }
+            AtomicRmwOp::Max => {
+                // Signed max: new_field = smax(old_field, val_field)
+                self.state.emit("    and t3, t0, a4");
+                self.state.emit("    srl t3, t3, a3");
+                self.state.emit("    srl t5, t2, a3");
+                self.state.emit("    bgt t3, t5, 8");  // if old > val (signed), skip
+                self.state.emit("    mv t3, t5");
+                self.state.emit("    sllw t3, t3, a3");
+                self.state.emit("    and t3, t3, a4");
+                self.state.emit("    and t4, t0, a5");
+                self.state.emit("    or t4, t4, t3");
+            }
+            AtomicRmwOp::UMin => {
+                // Unsigned min: new_field = umin(old_field, val_field)
+                self.state.emit("    and t3, t0, a4");
+                self.state.emit("    srl t3, t3, a3");
+                self.state.emit("    srl t5, t2, a3");
+                self.state.emit("    bltu t3, t5, 8"); // if old < val (unsigned), skip
+                self.state.emit("    mv t3, t5");
+                self.state.emit("    sllw t3, t3, a3");
+                self.state.emit("    and t3, t3, a4");
+                self.state.emit("    and t4, t0, a5");
+                self.state.emit("    or t4, t4, t3");
+            }
+            AtomicRmwOp::UMax => {
+                // Unsigned max: new_field = umax(old_field, val_field)
+                self.state.emit("    and t3, t0, a4");
+                self.state.emit("    srl t3, t3, a3");
+                self.state.emit("    srl t5, t2, a3");
+                self.state.emit("    bgtu t3, t5, 8"); // if old > val (unsigned), skip
+                self.state.emit("    mv t3, t5");
+                self.state.emit("    sllw t3, t3, a3");
+                self.state.emit("    and t3, t3, a4");
+                self.state.emit("    and t4, t0, a5");
+                self.state.emit("    or t4, t4, t3");
             }
         }
 
@@ -475,6 +524,18 @@ impl RiscvCodegen {
                     self.state.emit("    li t2, 1");
                     self.state.emit_fmt(format_args!("    amoswap.{}{} t0, t2, (t1)", suffix, aq_rl));
                 }
+                AtomicRmwOp::Min => {
+                    self.state.emit_fmt(format_args!("    amomin.{}{} t0, t2, (t1)", suffix, aq_rl));
+                }
+                AtomicRmwOp::Max => {
+                    self.state.emit_fmt(format_args!("    amomax.{}{} t0, t2, (t1)", suffix, aq_rl));
+                }
+                AtomicRmwOp::UMin => {
+                    self.state.emit_fmt(format_args!("    amominu.{}{} t0, t2, (t1)", suffix, aq_rl));
+                }
+                AtomicRmwOp::UMax => {
+                    self.state.emit_fmt(format_args!("    amomaxu.{}{} t0, t2, (t1)", suffix, aq_rl));
+                }
             }
         }
         Self::sign_extend_riscv(&mut self.state, ty);
@@ -538,7 +599,7 @@ impl RiscvCodegen {
             let suffix = Self::amo_width_suffix(ty);
             let lr_suffix = match ordering {
                 AtomicOrdering::Relaxed | AtomicOrdering::Release => "",
-                AtomicOrdering::Acquire => ".aq",
+                AtomicOrdering::Consume | AtomicOrdering::Acquire => ".aq",
                 AtomicOrdering::AcqRel | AtomicOrdering::SeqCst => ".aqrl",
             };
             self.state.emit_fmt(format_args!("    lr.{}{} t0, (t0)", suffix, lr_suffix));
@@ -573,7 +634,7 @@ impl RiscvCodegen {
     pub(super) fn emit_fence_impl(&mut self, ordering: AtomicOrdering) {
         match ordering {
             AtomicOrdering::Relaxed => {}
-            AtomicOrdering::Acquire => self.state.emit("    fence r, rw"),
+            AtomicOrdering::Consume | AtomicOrdering::Acquire => self.state.emit("    fence r, rw"),
             AtomicOrdering::Release => self.state.emit("    fence rw, w"),
             AtomicOrdering::AcqRel | AtomicOrdering::SeqCst => self.state.emit("    fence rw, rw"),
         }

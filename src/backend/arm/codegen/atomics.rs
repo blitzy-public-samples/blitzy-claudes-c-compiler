@@ -138,7 +138,7 @@ impl ArmCodegen {
     pub(super) fn emit_fence_impl(&mut self, ordering: AtomicOrdering) {
         match ordering {
             AtomicOrdering::Relaxed => {}
-            AtomicOrdering::Acquire => self.state.emit("    dmb ishld"),
+            AtomicOrdering::Consume | AtomicOrdering::Acquire => self.state.emit("    dmb ishld"),
             AtomicOrdering::Release => self.state.emit("    dmb ishst"),
             AtomicOrdering::AcqRel | AtomicOrdering::SeqCst => self.state.emit("    dmb ish"),
         }

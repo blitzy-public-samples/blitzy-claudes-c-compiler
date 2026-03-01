@@ -72,6 +72,38 @@ impl I686Codegen {
                         emit!(self.state, "    and{} (%esp), {}", suffix, edx_reg);
                         emit!(self.state, "    not{} {}", suffix, edx_reg);
                     }
+                    AtomicRmwOp::Min => {
+                        // Signed min: if old <= val, keep old; else new = val
+                        let skip_label = format!(".Latomic_skip_{}", self.state.next_label_id());
+                        emit!(self.state, "    cmp{} (%esp), {}", suffix, edx_reg);
+                        emit!(self.state, "    jle {}", skip_label);
+                        emit!(self.state, "    mov{} (%esp), {}", suffix, edx_reg);
+                        emit!(self.state, "{}:", skip_label);
+                    }
+                    AtomicRmwOp::Max => {
+                        // Signed max: if old >= val, keep old; else new = val
+                        let skip_label = format!(".Latomic_skip_{}", self.state.next_label_id());
+                        emit!(self.state, "    cmp{} (%esp), {}", suffix, edx_reg);
+                        emit!(self.state, "    jge {}", skip_label);
+                        emit!(self.state, "    mov{} (%esp), {}", suffix, edx_reg);
+                        emit!(self.state, "{}:", skip_label);
+                    }
+                    AtomicRmwOp::UMin => {
+                        // Unsigned min: if old <= val (unsigned), keep old; else new = val
+                        let skip_label = format!(".Latomic_skip_{}", self.state.next_label_id());
+                        emit!(self.state, "    cmp{} (%esp), {}", suffix, edx_reg);
+                        emit!(self.state, "    jbe {}", skip_label);
+                        emit!(self.state, "    mov{} (%esp), {}", suffix, edx_reg);
+                        emit!(self.state, "{}:", skip_label);
+                    }
+                    AtomicRmwOp::UMax => {
+                        // Unsigned max: if old >= val (unsigned), keep old; else new = val
+                        let skip_label = format!(".Latomic_skip_{}", self.state.next_label_id());
+                        emit!(self.state, "    cmp{} (%esp), {}", suffix, edx_reg);
+                        emit!(self.state, "    jae {}", skip_label);
+                        emit!(self.state, "    mov{} (%esp), {}", suffix, edx_reg);
+                        emit!(self.state, "{}:", skip_label);
+                    }
                     _ => {}
                 }
                 emit!(self.state, "    lock cmpxchg{} {}, (%ecx)", suffix, edx_reg);
