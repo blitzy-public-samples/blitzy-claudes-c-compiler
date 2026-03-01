@@ -194,6 +194,7 @@ impl Lowerer {
                 success_ordering: AtomicOrdering::SeqCst,
                 failure_ordering: AtomicOrdering::SeqCst,
                 returns_bool,
+                weak: false,
             });
             return Some(Operand::Value(dest));
         }
@@ -334,6 +335,7 @@ impl Lowerer {
         self.emit(Instruction::AtomicCmpxchg {
             dest: old_val, ptr, expected: Operand::Value(expected), desired,
             ty, success_ordering, failure_ordering, returns_bool: false,
+            weak: false,
         });
         self.store_through_ptr(expected_ptr_op, Operand::Value(old_val), ty);
         let result = self.emit_cmp_val(IrCmpOp::Eq, Operand::Value(old_val), Operand::Value(expected), ty);

@@ -1607,7 +1607,7 @@ fn remap_instruction(inst: &Instruction, vo: u32, bo: u32) -> Instruction {
             ty: *ty,
             ordering: *ordering,
         },
-        Instruction::AtomicCmpxchg { dest, ptr, expected, desired, ty, success_ordering, failure_ordering, returns_bool } => Instruction::AtomicCmpxchg {
+        Instruction::AtomicCmpxchg { dest, ptr, expected, desired, ty, success_ordering, failure_ordering, returns_bool, weak } => Instruction::AtomicCmpxchg {
             dest: remap_value(*dest, vo),
             ptr: remap_operand(ptr, vo),
             expected: remap_operand(expected, vo),
@@ -1616,6 +1616,7 @@ fn remap_instruction(inst: &Instruction, vo: u32, bo: u32) -> Instruction {
             success_ordering: *success_ordering,
             failure_ordering: *failure_ordering,
             returns_bool: *returns_bool,
+            weak: *weak,
         },
         Instruction::AtomicLoad { dest, ptr, ty, ordering } => Instruction::AtomicLoad {
             dest: remap_value(*dest, vo),

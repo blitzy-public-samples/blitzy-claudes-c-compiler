@@ -1158,7 +1158,7 @@ fn generate_instruction(cg: &mut dyn ArchCodegen, inst: &Instruction, gep_fold_m
             cg.emit_atomic_rmw(dest, *op, ptr, val, *ty, *ordering);
             cg.state().reg_cache.invalidate_all();
         }
-        Instruction::AtomicCmpxchg { dest, ptr, expected, desired, ty, success_ordering, failure_ordering, returns_bool } => {
+        Instruction::AtomicCmpxchg { dest, ptr, expected, desired, ty, success_ordering, failure_ordering, returns_bool, .. } => {
             cg.emit_atomic_cmpxchg(dest, ptr, expected, desired, *ty, *success_ordering, *failure_ordering, *returns_bool);
             cg.state().reg_cache.invalidate_all();
         }
