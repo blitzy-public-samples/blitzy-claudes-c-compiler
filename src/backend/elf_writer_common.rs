@@ -15,12 +15,46 @@
 //! byte-sized symbol diffs (needed by the Linux kernel's alternatives
 //! framework). These are handled as optional extensions controlled by
 //! the `supports_deferred_skips()` trait method.
+//!
+//! ## Linker Script Section Metadata
+//!
+//! The ELF sections produced by this writer carry metadata that the linker
+//! uses when processing linker scripts (`-T script.ld`). The key metadata
+//! fields propagated to each output `ObjSection` are:
+//!
+//! - **Section name** (`name`): Used by `SECTIONS { }` directives for wildcard
+//!   matching (e.g., `*(.text)`, `*(.rodata*)`). Custom section names from
+//!   `.section .custom_name, "ax", @progbits` are preserved exactly.
+//! - **Section type** (`sh_type`): `SHT_PROGBITS`, `SHT_NOBITS`, `SHT_NOTE`,
+//!   `SHT_INIT_ARRAY`, `SHT_FINI_ARRAY`, etc. Determines how the linker
+//!   handles the section content (loadable data vs. uninitialized).
+//! - **Section flags** (`sh_flags`): `SHF_ALLOC`, `SHF_WRITE`, `SHF_EXECINSTR`,
+//!   `SHF_TLS`, `SHF_MERGE`, `SHF_STRINGS`, `SHF_GROUP`, etc. The linker
+//!   uses these to determine segment placement (text vs. data vs. BSS) and
+//!   to respect `MEMORY` region attributes.
+//! - **Section alignment** (`sh_addralign`): Minimum alignment requirement.
+//!   Linker scripts may override section addresses but must respect this
+//!   minimum alignment. Set by `.align`/`.balign` directives and default
+//!   section properties.
+//! - **COMDAT group** (`comdat_group`): Group signature for `SHF_GROUP`
+//!   sections. The linker deduplicates groups with matching signatures.
+//!   Relevant to `KEEP(...)` directives which override garbage collection
+//!   for specified sections.
+//!
+//! ## Supported Assembly Directives for Section Control
+//!
+//! - `.section name, "flags", @type` — Create/switch to a named section
+//! - `.pushsection` / `.popsection` — Nested section changes with stack
+//! - `.comm name, size, align` — Common symbols (BSS allocation)
+//! - `.globl` / `.local` / `.weak` — Symbol binding
+//! - `.hidden` / `.protected` / `.internal` — Symbol visibility
+//! - `.align N` / `.balign N` — Alignment with padding (updates `sh_addralign`)
 
 use std::collections::HashMap;
 use crate::backend::x86::assembler::parser::*;
 use crate::backend::elf::{self as elf_mod,
     SHT_PROGBITS,
-    SHF_ALLOC, SHF_EXECINSTR,
+    SHF_ALLOC, SHF_EXECINSTR, SHF_GROUP,
     STB_LOCAL, STB_GLOBAL, STB_WEAK,
     STT_NOTYPE, STT_OBJECT, STT_FUNC, STT_TLS,
     STV_DEFAULT, STV_INTERNAL, STV_HIDDEN, STV_PROTECTED,
@@ -149,15 +183,42 @@ enum AlignMarkerKind {
 }
 
 /// A section being built during assembly.
+///
+/// Each field maps to an ELF section header attribute and is propagated
+/// to the output `ObjSection` during `emit_elf()`. The linker consumes
+/// this metadata for section placement when processing linker scripts:
+///
+/// - `name`: Matched by `SECTIONS { }` wildcard patterns (e.g., `*(.text)`)
+/// - `section_type`: ELF `sh_type` — determines section semantics
+/// - `flags`: ELF `sh_flags` — determines segment placement and attributes
+/// - `alignment`: ELF `sh_addralign` — minimum alignment the linker must respect
+/// - `comdat_group`: Group signature for `SHF_GROUP` deduplication; also
+///   relevant to `KEEP(...)` directives in linker scripts
 struct Section {
+    /// Section name (e.g., ".text", ".rodata", ".data.my_custom"). Preserved
+    /// exactly for linker script wildcard matching.
     name: String,
+    /// ELF section type (SHT_PROGBITS, SHT_NOBITS, SHT_NOTE, etc.).
     section_type: u32,
+    /// ELF section flags (SHF_ALLOC, SHF_WRITE, SHF_EXECINSTR, SHF_TLS, etc.).
+    /// Used by the linker for segment placement and MEMORY region matching.
     flags: u64,
+    /// Accumulated section content bytes.
     data: Vec<u8>,
+    /// Minimum alignment requirement (power of two). Updated by `.align`/`.balign`
+    /// directives and initial section defaults. The linker must respect this
+    /// even when linker scripts override section addresses.
     alignment: u64,
+    /// Relocations targeting this section.
     relocations: Vec<ElfRelocation>,
+    /// Jump instructions eligible for relaxation (long -> short).
     jumps: Vec<JumpInfo>,
+    /// Alignment and .org markers for post-relaxation fixup.
     align_markers: Vec<AlignMarker>,
+    /// COMDAT group signature, if this section is part of a section group.
+    /// Sections in the same group are deduplicated by the linker. Relevant
+    /// to linker script `KEEP(...)` directives which can override GC for
+    /// grouped sections.
     comdat_group: Option<String>,
 }
 
@@ -336,8 +397,40 @@ impl<A: X86Arch> ElfWriterCore<A> {
         self.emit_elf()
     }
 
+    /// Get an existing section by name or create a new one with the given attributes.
+    ///
+    /// When a section already exists (re-entry via `.section` or `.pushsection`),
+    /// the following metadata merging is performed to ensure the linker receives
+    /// the most complete section metadata for linker script processing:
+    ///
+    /// - **Alignment**: Takes the maximum of the existing and requested alignment,
+    ///   ensuring the linker always sees the strictest alignment requirement.
+    /// - **COMDAT group**: If the existing section has no group but the new
+    ///   reference specifies one, the group is set. This handles the case where
+    ///   a section is first referenced without a group and later with one.
+    /// - **Flags**: `SHF_GROUP` is added if a COMDAT group is newly associated.
+    ///   Other flags are preserved from the initial creation (matching GNU as
+    ///   behavior where subsequent `.section` directives don't override flags).
+    ///
+    /// Section names, types, and flags are the primary attributes the linker uses
+    /// for `SECTIONS { }` wildcard matching and segment placement.
     fn get_or_create_section(&mut self, name: &str, section_type: u32, flags: u64, comdat_group: Option<String>) -> usize {
         if let Some(&idx) = self.section_map.get(name) {
+            // Merge alignment: linker scripts must respect the maximum alignment
+            // requirement across all references to this section.
+            let default_align = if flags & SHF_EXECINSTR != 0 && name != ".init" && name != ".fini" { 16 } else { 1 };
+            if default_align > self.sections[idx].alignment {
+                self.sections[idx].alignment = default_align;
+            }
+
+            // Merge COMDAT group: if the existing section has no group but the
+            // new reference specifies one, associate the group. This ensures
+            // the linker can apply KEEP(...) and group deduplication correctly.
+            if self.sections[idx].comdat_group.is_none() && comdat_group.is_some() {
+                self.sections[idx].comdat_group = comdat_group;
+                self.sections[idx].flags |= SHF_GROUP;
+            }
+
             return idx;
         }
         let idx = self.sections.len();
@@ -361,6 +454,18 @@ impl<A: X86Arch> ElfWriterCore<A> {
         Ok(&mut self.sections[idx])
     }
 
+    /// Switch to the section specified by a `.section` or `.pushsection` directive.
+    ///
+    /// Parses the directive's flags and type strings into ELF section attributes
+    /// via `parse_section_flags`, then creates or re-enters the named section.
+    /// The resulting section metadata (name, type, flags, alignment, COMDAT group)
+    /// is preserved through to the output `ObjSection`, where the linker can
+    /// consume it for linker script `SECTIONS { }` pattern matching and
+    /// segment placement.
+    ///
+    /// Custom section names (e.g., `.section .my_data, "aw", @progbits`) are
+    /// fully supported and will be matched by linker script wildcards like
+    /// `*(.my_data)`.
     fn switch_section(&mut self, dir: &SectionDirective) {
         let (section_type, flags) = parse_section_flags(&dir.name, dir.flags.as_deref(), dir.section_type.as_deref());
         let idx = self.get_or_create_section(&dir.name, section_type, flags, dir.comdat_group.clone());
@@ -374,10 +479,17 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 self.switch_section(dir);
             }
             AsmItem::PushSection(dir) => {
+                // .pushsection saves the current section context and switches to
+                // the specified section. This enables nested section changes commonly
+                // used in kernel assembly for placing data in specific sections
+                // (e.g., .altinstructions, .init.data) while returning to the
+                // original section afterward. Section metadata is preserved for
+                // linker script processing.
                 self.section_stack.push((self.current_section, self.previous_section));
                 self.switch_section(dir);
             }
             AsmItem::PopSection => {
+                // .popsection restores the section context saved by .pushsection.
                 if let Some((saved_current, saved_previous)) = self.section_stack.pop() {
                     self.current_section = saved_current;
                     self.previous_section = saved_previous;
@@ -388,6 +500,10 @@ impl<A: X86Arch> ElfWriterCore<A> {
                     std::mem::swap(&mut self.current_section, &mut self.previous_section);
                 }
             }
+            // Symbol binding and visibility directives. These attributes are
+            // propagated to the output ELF symbol table and are consumed by the
+            // linker for symbol resolution, including linker script ENTRY(symbol)
+            // and PROVIDE(symbol = expr) directives.
             AsmItem::Global(name) => {
                 self.pending_globals.push(name.clone());
             }
@@ -441,6 +557,10 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 if let Some(sec_idx) = self.current_section {
                     let section = &mut self.sections[sec_idx];
                     let align = *n as u64;
+                    // Update section alignment to the maximum seen. This alignment
+                    // value is propagated to ObjSection.sh_addralign and must be
+                    // respected by the linker even when linker scripts override
+                    // section placement addresses.
                     if align > section.alignment {
                         section.alignment = align;
                     }
@@ -503,6 +623,10 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 section.data.extend_from_slice(bytes);
             }
             AsmItem::Comm(name, size, align) => {
+                // Common symbols (.comm) create global BSS allocations.
+                // The linker resolves these during symbol resolution, which
+                // is relevant for linker script PROVIDE(symbol = expr) directives
+                // that may define symbols matching common symbol names.
                 let sym_idx = self.symbols.len();
                 self.symbols.push(SymbolInfo {
                     name: name.clone(),
@@ -1107,6 +1231,29 @@ impl<A: X86Arch> ElfWriterCore<A> {
 
     // ─── ELF emission ─────────────────────────────────────────────────
 
+    /// Finalize and emit the ELF relocatable object file.
+    ///
+    /// Performs jump relaxation, deferred expression resolution, and internal
+    /// relocation resolution, then converts the internal `Section` and
+    /// `SymbolInfo` representations into the shared `ObjSection`/`ObjSymbol`
+    /// format used by the ELF object writer.
+    ///
+    /// ## Linker Script Metadata Propagation
+    ///
+    /// Each output `ObjSection` preserves the following metadata for the linker:
+    /// - `name`: Section name for `SECTIONS { }` wildcard matching
+    /// - `sh_type`: Section type for semantic interpretation
+    /// - `sh_flags`: Section flags for segment placement (`SHF_ALLOC`,
+    ///   `SHF_WRITE`, `SHF_EXECINSTR`, `SHF_TLS`, `SHF_GROUP`, etc.)
+    /// - `sh_addralign`: Minimum alignment requirement that linker scripts
+    ///   must respect even when overriding section addresses
+    /// - `comdat_group`: COMDAT group signature for deduplication and
+    ///   `KEEP(...)` directive interaction
+    /// - `relocs`: Relocations that the linker resolves during final linking,
+    ///   including those affected by `PROVIDE(symbol = expr)` definitions
+    ///
+    /// Symbol metadata (binding, type, visibility, size) is also fully
+    /// propagated for `ENTRY(symbol)` and `PROVIDE(symbol)` resolution.
     fn emit_elf(mut self) -> Result<Vec<u8>, String> {
         // Relax long jumps to short form where possible.
         self.relax_jumps();
@@ -1120,7 +1267,10 @@ impl<A: X86Arch> ElfWriterCore<A> {
         // Resolve internal relocations
         self.resolve_internal_relocations();
 
-        // Convert to shared ObjSection/ObjSymbol format
+        // Convert to shared ObjSection/ObjSymbol format.
+        // All section metadata (name, type, flags, alignment, comdat_group) is
+        // propagated to ObjSection for consumption by the linker, including
+        // linker script SECTIONS/MEMORY/KEEP directives.
         let section_names: Vec<String> = self.sections.iter().map(|s| s.name.clone()).collect();
 
         let mut shared_sections: HashMap<String, ObjSection> = HashMap::new();
@@ -1170,6 +1320,12 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 }
             }
 
+            // Propagate all section metadata to ObjSection. The linker uses:
+            // - name: for SECTIONS { } wildcard matching (e.g., *(.text), *(.rodata*))
+            // - sh_type: for section semantics (PROGBITS vs NOBITS, etc.)
+            // - sh_flags: for segment placement and MEMORY region matching
+            // - sh_addralign: minimum alignment the linker must respect
+            // - comdat_group: for group deduplication and KEEP(...) interaction
             shared_sections.insert(sec.name.clone(), ObjSection {
                 name: sec.name.clone(),
                 sh_type: sec.section_type,
