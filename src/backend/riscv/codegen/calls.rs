@@ -2,7 +2,7 @@
 
 use crate::ir::reexports::{IrConst, Operand, Value};
 use crate::common::types::IrType;
-use crate::backend::call_abi::{CallAbiConfig, CallArgClass, compute_stack_arg_space};
+use crate::backend::call_abi::{CallAbiConfig, CallArgClass};
 use crate::backend::generation::is_i128_type;
 use super::emit::{RiscvCodegen, callee_saved_name, RISCV_ARG_REGS};
 
@@ -23,7 +23,43 @@ impl RiscvCodegen {
     }
 
     pub(super) fn emit_call_compute_stack_space_impl(&self, arg_classes: &[CallArgClass], _arg_types: &[IrType]) -> usize {
-        compute_stack_arg_space(arg_classes)
+        // RISC-V LP64D: The overflow stack area requires 16-byte alignment for
+        // F128, I128, and structs whose alignment exceeds the 8-byte slot size
+        // (i.e. structs containing `long double` or `__int128`).  The shared
+        // `compute_stack_arg_space` helper only handles F128Stack/I128Stack,
+        // so we compute locally, checking the cached `call_struct_arg_aligns`
+        // for the actual per-argument alignment requirement.
+        let mut total: usize = 0;
+        let mut arg_idx: usize = 0;
+        for cls in arg_classes {
+            let is_stack = cls.is_stack();
+            if is_stack {
+                match cls {
+                    CallArgClass::F128Stack | CallArgClass::I128Stack => {
+                        total = (total + 15) & !15;
+                    }
+                    CallArgClass::StructByValStack { .. } | CallArgClass::LargeStructStack { .. } => {
+                        // Use the actual struct alignment cached from
+                        // prepare_struct_stack_aligns.  Only apply 16-byte
+                        // alignment when the struct's natural alignment
+                        // exceeds the 8-byte slot size.
+                        let align = self.call_struct_arg_aligns
+                            .get(arg_idx)
+                            .copied()
+                            .flatten()
+                            .unwrap_or(8);
+                        if align > 8 {
+                            let mask = align - 1;
+                            total = (total + mask) & !mask;
+                        }
+                    }
+                    _ => {}
+                }
+                total += cls.stack_bytes();
+            }
+            arg_idx += 1;
+        }
+        (total + 15) & !15
     }
 
     pub(super) fn emit_call_f128_pre_convert_impl(&mut self, args: &[Operand], arg_classes: &[CallArgClass],
@@ -61,6 +97,21 @@ impl RiscvCodegen {
                 if !arg_classes[arg_i].is_stack() { continue; }
                 match arg_classes[arg_i] {
                     CallArgClass::StructByValStack { size } | CallArgClass::LargeStructStack { size } => {
+                        // RISC-V LP64D: align the struct on the stack
+                        // according to its natural alignment (cached from
+                        // prepare_struct_stack_aligns).  Structs whose
+                        // alignment exceeds 8 bytes (e.g. those containing
+                        // `long double` or `__int128`) need 16-byte padding
+                        // to match the callee-side va_arg alignment logic.
+                        let align = self.call_struct_arg_aligns
+                            .get(arg_i)
+                            .copied()
+                            .flatten()
+                            .unwrap_or(8);
+                        if align > 8 {
+                            let mask = align - 1;
+                            offset = (offset + mask) & !mask;
+                        }
                         let n_dwords = size.div_ceil(8);
                         match arg {
                             Operand::Value(v) => {

@@ -493,6 +493,11 @@ pub trait ArchCodegen {
             self.emit_call_spill_fptr(func_ptr.expect("indirect call requires func_ptr"));
         }
 
+        // Allow backends to cache per-argument struct alignment info before
+        // stack space computation and stack argument emission.  RISC-V uses this
+        // to apply 16-byte alignment for structs containing `long double` / `__int128`.
+        self.prepare_struct_stack_aligns(struct_arg_aligns);
+
         // Compute stack space needed for overflow args.
         let stack_arg_space = self.emit_call_compute_stack_space(&arg_classes, arg_types);
 
@@ -540,6 +545,20 @@ pub trait ArchCodegen {
 
     /// Return the ABI configuration for this architecture's function calls.
     fn call_abi_config(&self) -> super::call_abi::CallAbiConfig;
+
+    /// Prepare per-argument struct alignment info before stack space computation.
+    ///
+    /// Called by `emit_call` with the struct alignment data (`struct_arg_aligns`)
+    /// *before* `emit_call_compute_stack_space` and `emit_call_stack_args`. This
+    /// allows backends that need alignment information for struct stack arguments
+    /// to cache it for later use.
+    ///
+    /// RISC-V LP64D overrides this to ensure structs containing 16-byte-aligned
+    /// members (e.g. `long double` / `__int128`) receive proper alignment on
+    /// the overflow stack area. Other backends can safely ignore it.
+    ///
+    /// Default is a no-op.
+    fn prepare_struct_stack_aligns(&mut self, _struct_arg_aligns: &[Option<usize>]) { }
 
     /// Compute how much stack space to allocate for overflow arguments.
     /// x86 returns raw push bytes; ARM/RISC-V return pre-allocated SP space.

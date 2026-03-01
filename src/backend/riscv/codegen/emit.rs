@@ -165,6 +165,15 @@ pub struct RiscvCodegen {
     /// Stack slot offset (relative to s0) for saving sp before VLA allocations.
     /// `None` if the current function has no VLAs.
     pub(super) vla_save_slot: Option<i64>,
+    /// Cached per-argument struct alignment info from `prepare_struct_stack_aligns`.
+    ///
+    /// Set by `emit_call` (via the `ArchCodegen` trait) before stack space
+    /// computation and stack argument emission.  Indexed by argument position;
+    /// `Some(16)` means the struct at that position requires 16-byte alignment.
+    /// Used by `emit_call_compute_stack_space_impl` and
+    /// `emit_call_stack_args_impl` to apply correct alignment for structs
+    /// containing `long double` or `__int128` members.
+    pub(super) call_struct_arg_aligns: Vec<Option<usize>>,
 }
 
 impl RiscvCodegen {
@@ -183,6 +192,7 @@ impl RiscvCodegen {
             used_callee_saved: Vec::new(),
             no_relax: false,
             vla_save_slot: None,
+            call_struct_arg_aligns: Vec::new(),
         }
     }
 
@@ -537,6 +547,18 @@ impl ArchCodegen for RiscvCodegen {
     fn state(&mut self) -> &mut CodegenState { &mut self.state }
     fn state_ref(&self) -> &CodegenState { &self.state }
     fn ptr_directive(&self) -> PtrDirective { PtrDirective::Dword }
+
+    /// Cache per-argument struct alignment info for use during stack arg emission.
+    ///
+    /// RISC-V LP64D needs the actual struct alignment to decide whether to pad
+    /// a `StructByValStack` argument to a 16-byte boundary (required when the
+    /// struct contains `long double` or `__int128` members).  The alignment
+    /// data arrives in `emit_call` (from the IR lowering layer) but is not
+    /// forwarded to the individual `emit_call_*` sub-methods, so we cache it
+    /// here for later use.
+    fn prepare_struct_stack_aligns(&mut self, struct_arg_aligns: &[Option<usize>]) {
+        self.call_struct_arg_aligns = struct_arg_aligns.to_vec();
+    }
 
     fn get_phys_reg_for_value(&self, val_id: u32) -> Option<PhysReg> {
         self.reg_assignments.get(&val_id).copied()
