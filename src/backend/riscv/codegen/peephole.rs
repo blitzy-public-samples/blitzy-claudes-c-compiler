@@ -13,6 +13,9 @@
 //! **Global passes** (once): global store forwarding, register copy propagation,
 //! and global dead store elimination.
 //!
+//! **Tail call optimization** (once, post-global): converts
+//! `call FUNC; <epilogue>; ret` into `<epilogue>; tail FUNC` when safe.
+//!
 //! **Local cleanup** (up to 4 rounds): re-run local passes to clean up
 //! opportunities exposed by global passes.
 //!
@@ -41,6 +44,12 @@
 //!
 //! 8. **Global dead store elimination**: Removes stores to stack slots that
 //!    are never loaded anywhere in the function.
+//!
+//! 9. **Tail call optimization**: `call FUNC` followed by a pure epilogue
+//!    (callee-save restores, frame teardown, `ret`) is converted to
+//!    `tail FUNC`, eliminating the call/return overhead. Suppressed when
+//!    address-of-local (`addi reg, s0, off`) or dynamic alloca
+//!    (`sub sp, sp, reg`) is detected in the function.
 
 // ── Line classification types ────────────────────────────────────────────────
 
@@ -379,6 +388,9 @@ pub fn peephole_optimize(asm: String) -> String {
     global_changed |= propagate_register_copies(&mut lines, &mut kinds, n);
     global_changed |= eliminate_dead_reg_moves(&lines, &mut kinds, n);
     global_changed |= global_dead_store_elimination(&lines, &mut kinds, n);
+
+    // Phase 2.5: Tail call optimization (post-global, pre-cleanup)
+    global_changed |= optimize_tail_calls(&mut lines, &mut kinds, n);
 
     // Phase 3: Local cleanup after global passes (up to 4 rounds)
     if global_changed {
@@ -1037,6 +1049,253 @@ fn extract_s0_offset_from_line(line: &str) -> Option<i32> {
     None
 }
 
+// ── Tail call optimization ────────────────────────────────────────────────────
+//
+// Pattern: `call FUNC; <callee-save restores>; <epilogue>; ret`
+// → NOP the call, replace ret with `tail FUNC`.
+//
+// The RISC-V epilogue may use either SP-relative addressing (small frames)
+// or S0-relative addressing (large frames / DynAlloca). Both patterns are
+// accepted by the epilogue candidate checker.
+//
+// SAFETY: Suppressed when:
+// 1. The function takes the address of a local (`addi reg, s0, off` where
+//    reg is not s0 or sp). After frame teardown such pointers dangle.
+// 2. The function uses dynamic stack allocation (`sub sp, sp, reg`).
+//    Alloca'd memory below SP is clobbered by the tail-called function.
+
+/// Scan for tail call opportunities and convert them.
+/// Returns true if any changes were made.
+fn optimize_tail_calls(lines: &mut Vec<String>, kinds: &mut Vec<LineKind>, n: usize) -> bool {
+    let mut changed = false;
+    // Track whether the current function has unsafe stack usage that prevents
+    // tail calls (address-of-local or dynamic alloca).
+    let mut func_suppress_tailcall = false;
+
+    let mut i = 0;
+    while i < n {
+        if kinds[i] == LineKind::Nop {
+            i += 1;
+            continue;
+        }
+
+        // Detect function boundaries to reset the suppression flag.
+        match kinds[i] {
+            LineKind::Label => {
+                let trimmed = lines[i].trim();
+                // A non-.L label indicates a new function boundary.
+                if !trimmed.starts_with(".L") {
+                    func_suppress_tailcall = false;
+                }
+            }
+            LineKind::Directive => {
+                let trimmed = lines[i].trim();
+                if trimmed == ".cfi_startproc" {
+                    func_suppress_tailcall = false;
+                }
+            }
+            _ => {}
+        }
+
+        // Check for unsafe patterns that prevent tail call optimization.
+        if !func_suppress_tailcall {
+            if let LineKind::Alu = kinds[i] {
+                let trimmed = lines[i].trim();
+                // Address-of-local: `addi reg, s0, offset` where reg is not
+                // s0 or sp. This creates a pointer into the stack frame that
+                // would dangle after frame teardown in a tail call.
+                if trimmed.starts_with("addi ") && trimmed.contains(", s0,") {
+                    if let Some(dest) = parse_alu_dest(trimmed) {
+                        if dest != REG_S0 && dest != REG_SP {
+                            func_suppress_tailcall = true;
+                        }
+                    }
+                }
+                // Dynamic alloca: `sub sp, sp, reg`. Memory below SP would
+                // be clobbered by the tail-called function's frame.
+                if trimmed.starts_with("sub sp, sp,") {
+                    func_suppress_tailcall = true;
+                }
+            }
+        }
+
+        // Only process call instructions when not suppressed.
+        if kinds[i] != LineKind::Call || func_suppress_tailcall {
+            i += 1;
+            continue;
+        }
+
+        // Check if the instructions after this call form a pure epilogue
+        // (callee-save restores + frame teardown + ret).
+        if let Some(ret_idx) = is_riscv_epilogue_candidate(lines, kinds, i, n) {
+            let trimmed = lines[i].trim().to_string();
+            if let Some(tail_text) = convert_call_to_tail(&trimmed) {
+                // NOP the call instruction.
+                kinds[i] = LineKind::Nop;
+                // Replace `ret` with the tail call instruction.
+                lines[ret_idx] = format!("    {}", tail_text);
+                kinds[ret_idx] = classify_line(&lines[ret_idx]);
+                changed = true;
+            }
+        }
+
+        i += 1;
+    }
+
+    changed
+}
+
+/// Check if the instructions after a call at position `call_idx` form a pure
+/// RISC-V epilogue sequence ending in `ret`. Returns the index of the `ret`
+/// if a valid tail call candidate is found.
+///
+/// Valid epilogue sequence:
+/// 1. Zero or more callee-save restores: `ld sN, OFF(s0)` (LoadS0)
+/// 2. RA restore: `ld ra, OFF(sp)` or `ld ra, OFF(s0)` (Other or LoadS0)
+/// 3. FP restore: `ld s0, OFF(sp)` or `ld t0, -16(s0)` (Other or LoadS0)
+/// 4. SP restore: `addi sp, sp, N` or `mv sp, s0` or `addi sp, s0, N` (Alu or Move)
+/// 5. Optional final FP restore (large frame): `mv s0, t0` (Move)
+/// 6. `ret`
+///
+/// `.cfi_*` directives and Nop lines are allowed between any instructions.
+/// Any instruction that writes to `a0` (clobbers return value) causes rejection.
+fn is_riscv_epilogue_candidate(
+    lines: &[String],
+    kinds: &[LineKind],
+    call_idx: usize,
+    n: usize,
+) -> Option<usize> {
+    // Limit how far we scan forward to avoid unbounded searching.
+    let limit = (call_idx + 30).min(n);
+    let mut j = call_idx + 1;
+
+    while j < limit {
+        if kinds[j] == LineKind::Nop {
+            j += 1;
+            continue;
+        }
+
+        match kinds[j] {
+            // Assembler directives (.cfi_*, .size, etc.) are harmless — skip.
+            LineKind::Directive => {
+                j += 1;
+                continue;
+            }
+
+            // Load from S0 offset: callee-save restore pattern.
+            // This covers `ld sN, OFF(s0)`, `ld ra, OFF(s0)`, `ld t0, OFF(s0)`.
+            // Reject if destination is a0 (would clobber return value).
+            LineKind::LoadS0 { reg, .. } => {
+                if reg == REG_A0 {
+                    return None;
+                }
+                j += 1;
+                continue;
+            }
+
+            // Register move: accept specific epilogue patterns.
+            LineKind::Move { dst, src } => {
+                // `mv sp, s0` — stack pointer restore (large frame / DynAlloca).
+                if dst == REG_SP && src == REG_S0 {
+                    j += 1;
+                    continue;
+                }
+                // `mv s0, tN` — frame pointer restore (large frame path uses
+                // `ld t0, -16(s0)` then `mv s0, t0` to restore s0).
+                if dst == REG_S0 {
+                    j += 1;
+                    continue;
+                }
+                // Any other move is not part of the epilogue.
+                return None;
+            }
+
+            // ALU instruction: accept only stack pointer adjustments.
+            LineKind::Alu => {
+                let trimmed = lines[j].trim();
+                // `addi sp, sp, N` — stack deallocation (small frame).
+                if trimmed.starts_with("addi sp, sp,") {
+                    j += 1;
+                    continue;
+                }
+                // `addi sp, s0, N` — stack restore (variadic / DynAlloca).
+                if trimmed.starts_with("addi sp, s0,") {
+                    j += 1;
+                    continue;
+                }
+                // Any other ALU instruction is not part of the epilogue.
+                return None;
+            }
+
+            // Other instruction: check if it's an SP-relative epilogue load.
+            // Small-frame epilogues use SP-relative addressing which does not
+            // match the LoadS0 pattern (e.g. `ld ra, 8(sp)`, `ld s0, 0(sp)`).
+            LineKind::Other => {
+                let trimmed = lines[j].trim();
+                if is_epilogue_load_from_sp(trimmed) {
+                    // Reject if destination register is a0 (clobbers return value).
+                    if trimmed.starts_with("ld a0,") {
+                        return None;
+                    }
+                    j += 1;
+                    continue;
+                }
+                // Any unrecognized Other instruction breaks the epilogue.
+                return None;
+            }
+
+            // Found `ret` — valid epilogue.
+            LineKind::Ret => {
+                return Some(j);
+            }
+
+            // Any other kind (Label, Jump, Branch, Call, StoreS0, LoadImm,
+            // SextW, LoadAddr) breaks the epilogue pattern.
+            _ => return None,
+        }
+    }
+
+    // Hit scan limit without finding `ret`.
+    None
+}
+
+/// Check if a trimmed instruction line is an SP-relative load that appears
+/// in the small-frame epilogue pattern. These are `ld REG, OFF(sp)` where
+/// REG is typically `ra` or `s0`.
+fn is_epilogue_load_from_sp(trimmed: &str) -> bool {
+    trimmed.starts_with("ld ") && trimmed.contains("(sp)")
+}
+
+/// Convert a `call FUNC` instruction into a `tail FUNC` pseudo-instruction.
+/// Returns None if the call format is not recognized.
+///
+/// `tail FUNC` is a RISC-V assembler pseudo that expands to
+/// `auipc t1, %pcrel_hi(FUNC); jalr zero, %pcrel_lo(FUNC)(t1)`,
+/// performing an unconditional jump without linking the return address.
+fn convert_call_to_tail(trimmed_call: &str) -> Option<String> {
+    // Direct call: "call FUNC" or "call FUNC@plt"
+    if let Some(rest) = trimmed_call.strip_prefix("call ") {
+        let target = rest.trim();
+        if !target.is_empty() {
+            return Some(format!("tail {}", target));
+        }
+    }
+    // Alternate encoding: "jal ra, FUNC" → "j FUNC"
+    if let Some(rest) = trimmed_call.strip_prefix("jal ra, ") {
+        let target = rest.trim();
+        if !target.is_empty() {
+            return Some(format!("j {}", target));
+        }
+    }
+    if let Some(rest) = trimmed_call.strip_prefix("jal ra,") {
+        let target = rest.trim();
+        if !target.is_empty() {
+            return Some(format!("j {}", target));
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1305,5 +1564,269 @@ mod tests {
         let result = peephole_optimize(input.to_string());
         assert!(result.contains("mv t1, s1"), "Expected t1 = s1 via chain, got:\n{}", result);
         assert!(result.contains("add t2, s1,"), "Expected t1 propagated in add, got:\n{}", result);
+    }
+
+    // ── Tail call optimization tests ─────────────────────────────────────────
+
+    #[test]
+    fn test_tail_call_direct() {
+        // Basic tail call: `call target` followed by small-frame epilogue then
+        // `ret` should be converted to epilogue + `tail target`.
+        let input = "\
+func:\n\
+    .cfi_startproc\n\
+    addi sp, sp, -16\n\
+    sd ra, 8(sp)\n\
+    sd s0, 0(sp)\n\
+    addi s0, sp, 16\n\
+    call target\n\
+    ld ra, 8(sp)\n\
+    ld s0, 0(sp)\n\
+    addi sp, sp, 16\n\
+    ret\n";
+        let result = peephole_optimize(input.to_string());
+        assert!(!result.contains("call target"),
+            "call should be eliminated, got:\n{}", result);
+        assert!(result.contains("tail target"),
+            "ret should become tail, got:\n{}", result);
+        assert!(!result.lines().any(|l| l.trim() == "ret"),
+            "ret should be replaced, got:\n{}", result);
+    }
+
+    #[test]
+    fn test_tail_call_with_callee_saves() {
+        // Call followed by callee-save restores, then epilogue, then ret.
+        // The callee-save restores use s0-relative offsets (LoadS0).
+        let input = "\
+func:\n\
+    .cfi_startproc\n\
+    addi sp, sp, -48\n\
+    sd ra, 40(sp)\n\
+    sd s0, 32(sp)\n\
+    addi s0, sp, 48\n\
+    sd s1, -24(s0)\n\
+    sd s2, -32(s0)\n\
+    li a0, 42\n\
+    call target\n\
+    ld s1, -24(s0)\n\
+    ld s2, -32(s0)\n\
+    ld ra, 40(sp)\n\
+    ld s0, 32(sp)\n\
+    addi sp, sp, 48\n\
+    ret\n";
+        let result = peephole_optimize(input.to_string());
+        assert!(!result.contains("call target"),
+            "call should be eliminated, got:\n{}", result);
+        assert!(result.contains("tail target"),
+            "ret should become tail, got:\n{}", result);
+        // Callee-save restores should be preserved
+        assert!(result.contains("ld s1, -24(s0)"),
+            "callee-save restore should be preserved, got:\n{}", result);
+        assert!(result.contains("ld s2, -32(s0)"),
+            "callee-save restore should be preserved, got:\n{}", result);
+    }
+
+    #[test]
+    fn test_tail_call_large_frame() {
+        // Large-frame epilogue uses s0-relative addressing with t0 temp.
+        let input = "\
+func:\n\
+    .cfi_startproc\n\
+    li t0, 4096\n\
+    sub sp, sp, t0\n\
+    sd ra, -8(s0)\n\
+    sd s0, -16(s0)\n\
+    mv s0, t0\n\
+    call target\n\
+    ld ra, -8(s0)\n\
+    ld t0, -16(s0)\n\
+    mv sp, s0\n\
+    mv s0, t0\n\
+    ret\n";
+        let result = peephole_optimize(input.to_string());
+        // Large frame uses `sub sp, sp, t0` in prologue which triggers
+        // the dynamic alloca suppression. This is a conservative false positive
+        // that is acceptable for correctness.
+        // The test verifies the suppression works correctly.
+        assert!(result.contains("call target"),
+            "call should be preserved (suppressed by sub sp, sp), got:\n{}", result);
+    }
+
+    #[test]
+    fn test_no_tail_call_with_address_of_local() {
+        // `addi a0, s0, -24` takes address of a local — tail call must be
+        // suppressed because the pointer would dangle after frame teardown.
+        let input = "\
+func:\n\
+    .cfi_startproc\n\
+    addi sp, sp, -32\n\
+    sd ra, 24(sp)\n\
+    sd s0, 16(sp)\n\
+    addi s0, sp, 32\n\
+    addi a0, s0, -24\n\
+    call target\n\
+    ld ra, 24(sp)\n\
+    ld s0, 16(sp)\n\
+    addi sp, sp, 32\n\
+    ret\n";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("call target"),
+            "call must be preserved when address-of-local exists, got:\n{}", result);
+        assert!(result.lines().any(|l| l.trim() == "ret"),
+            "ret must be preserved, got:\n{}", result);
+    }
+
+    #[test]
+    fn test_no_tail_call_with_alloca() {
+        // `sub sp, sp, a0` is dynamic alloca — tail call must be suppressed.
+        let input = "\
+func:\n\
+    .cfi_startproc\n\
+    addi sp, sp, -32\n\
+    sd ra, 24(sp)\n\
+    sd s0, 16(sp)\n\
+    addi s0, sp, 32\n\
+    sub sp, sp, a0\n\
+    call target\n\
+    ld ra, -8(s0)\n\
+    ld t0, -16(s0)\n\
+    mv sp, s0\n\
+    mv s0, t0\n\
+    ret\n";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("call target"),
+            "call must be preserved when alloca exists, got:\n{}", result);
+        assert!(result.lines().any(|l| l.trim() == "ret"),
+            "ret must be preserved, got:\n{}", result);
+    }
+
+    #[test]
+    fn test_no_tail_call_when_a0_clobbered() {
+        // An instruction between call and ret writes to a0 (clobbers the
+        // return value) — this is not a valid tail call pattern.
+        let input = "\
+func:\n\
+    .cfi_startproc\n\
+    addi sp, sp, -16\n\
+    sd ra, 8(sp)\n\
+    sd s0, 0(sp)\n\
+    addi s0, sp, 16\n\
+    call target\n\
+    li a0, 42\n\
+    ld ra, 8(sp)\n\
+    ld s0, 0(sp)\n\
+    addi sp, sp, 16\n\
+    ret\n";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("call target"),
+            "call must be preserved when a0 is clobbered, got:\n{}", result);
+        assert!(result.lines().any(|l| l.trim() == "ret"),
+            "ret must be preserved, got:\n{}", result);
+    }
+
+    #[test]
+    fn test_tail_call_suppression_resets_at_new_function() {
+        // Suppression should reset at the next function boundary.
+        // Function 1 has address-of-local (suppressed), function 2 does not.
+        let input = "\
+func1:\n\
+    .cfi_startproc\n\
+    addi sp, sp, -16\n\
+    sd ra, 8(sp)\n\
+    sd s0, 0(sp)\n\
+    addi s0, sp, 16\n\
+    addi a0, s0, -8\n\
+    call target1\n\
+    ld ra, 8(sp)\n\
+    ld s0, 0(sp)\n\
+    addi sp, sp, 16\n\
+    ret\n\
+func2:\n\
+    .cfi_startproc\n\
+    addi sp, sp, -16\n\
+    sd ra, 8(sp)\n\
+    sd s0, 0(sp)\n\
+    addi s0, sp, 16\n\
+    call target2\n\
+    ld ra, 8(sp)\n\
+    ld s0, 0(sp)\n\
+    addi sp, sp, 16\n\
+    ret\n";
+        let result = peephole_optimize(input.to_string());
+        // func1's call should be preserved (suppressed)
+        assert!(result.contains("call target1"),
+            "func1 call must be preserved, got:\n{}", result);
+        // func2's call should be optimized (suppression reset at func2:)
+        assert!(!result.contains("call target2"),
+            "func2 call should be optimized, got:\n{}", result);
+        assert!(result.contains("tail target2"),
+            "func2 should have tail call, got:\n{}", result);
+    }
+
+    #[test]
+    fn test_tail_call_idempotent() {
+        // Running the optimizer twice should produce the same result.
+        let input = "\
+func:\n\
+    .cfi_startproc\n\
+    addi sp, sp, -16\n\
+    sd ra, 8(sp)\n\
+    sd s0, 0(sp)\n\
+    addi s0, sp, 16\n\
+    call target\n\
+    ld ra, 8(sp)\n\
+    ld s0, 0(sp)\n\
+    addi sp, sp, 16\n\
+    ret\n";
+        let result1 = peephole_optimize(input.to_string());
+        let result2 = peephole_optimize(result1.clone());
+        assert_eq!(result1, result2, "optimizer should be idempotent");
+    }
+
+    #[test]
+    fn test_tail_call_with_cfi_directives() {
+        // .cfi_* directives between call and ret should not prevent optimization.
+        let input = "\
+func:\n\
+    .cfi_startproc\n\
+    addi sp, sp, -16\n\
+    sd ra, 8(sp)\n\
+    sd s0, 0(sp)\n\
+    addi s0, sp, 16\n\
+    call target\n\
+    .cfi_remember_state\n\
+    ld ra, 8(sp)\n\
+    ld s0, 0(sp)\n\
+    .cfi_restore ra\n\
+    .cfi_restore s0\n\
+    addi sp, sp, 16\n\
+    ret\n";
+        let result = peephole_optimize(input.to_string());
+        assert!(!result.contains("call target"),
+            "call should be eliminated despite .cfi_* directives, got:\n{}", result);
+        assert!(result.contains("tail target"),
+            "ret should become tail, got:\n{}", result);
+    }
+
+    #[test]
+    fn test_tail_call_jal_ra_form() {
+        // The `jal ra, FUNC` form should also be convertible to `j FUNC`.
+        let input = "\
+func:\n\
+    .cfi_startproc\n\
+    addi sp, sp, -16\n\
+    sd ra, 8(sp)\n\
+    sd s0, 0(sp)\n\
+    addi s0, sp, 16\n\
+    jal ra, target\n\
+    ld ra, 8(sp)\n\
+    ld s0, 0(sp)\n\
+    addi sp, sp, 16\n\
+    ret\n";
+        let result = peephole_optimize(input.to_string());
+        assert!(!result.lines().any(|l| l.trim().starts_with("jal ")),
+            "jal should be eliminated, got:\n{}", result);
+        assert!(result.contains("j target"),
+            "ret should become j target, got:\n{}", result);
     }
 }
