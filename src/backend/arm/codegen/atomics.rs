@@ -132,7 +132,7 @@ impl ArmCodegen {
 
     pub(super) fn emit_atomic_load_impl(&mut self, dest: &Value, ptr: &Operand, ty: IrType, ordering: AtomicOrdering) {
         self.operand_to_x0(ptr);
-        let need_acquire = matches!(ordering, AtomicOrdering::Acquire | AtomicOrdering::AcqRel | AtomicOrdering::SeqCst);
+        let need_acquire = matches!(ordering, AtomicOrdering::Acquire | AtomicOrdering::AcqRel | AtomicOrdering::SeqCst | AtomicOrdering::Consume);
         let instr = match (ty, need_acquire) {
             (IrType::I8 | IrType::U8, true) => "ldarb",
             (IrType::I8 | IrType::U8, false) => "ldrb",
