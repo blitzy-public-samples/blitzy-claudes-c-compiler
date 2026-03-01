@@ -103,6 +103,20 @@ pub enum WarningKind {
     /// not return a value in all control paths.
     /// GCC flag: -Wreturn-type
     ReturnType,
+    /// An unknown or unrecognized `__attribute__` was encountered.
+    /// Enabled by default and part of `-Wall`.
+    /// GCC flag: -Wattributes
+    Attributes,
+    /// GNU extensions and non-standard C behavior detected.
+    /// NOT enabled by default — requires explicit `-pedantic` flag.
+    /// NOT part of `-Wall` or `-Wextra`.
+    /// GCC flag: -Wpedantic
+    Pedantic,
+    /// Return value of a function marked with `__attribute__((warn_unused_result))`
+    /// was discarded by the caller.
+    /// Enabled by default and part of `-Wall`.
+    /// GCC flag: -Wunused-result
+    UnusedResult,
     // Future categories (add as warnings are implemented):
     // UnusedVariable,         // -Wunused-variable
     // UnusedFunction,         // -Wunused-function
@@ -122,6 +136,9 @@ impl WarningKind {
             WarningKind::ImplicitFunctionDeclaration => "implicit-function-declaration",
             WarningKind::Cpp => "cpp",
             WarningKind::ReturnType => "return-type",
+            WarningKind::Attributes => "attributes",
+            WarningKind::Pedantic => "pedantic",
+            WarningKind::UnusedResult => "unused-result",
         }
     }
 
@@ -134,6 +151,9 @@ impl WarningKind {
             "implicit" => Some(WarningKind::ImplicitFunctionDeclaration),
             "cpp" => Some(WarningKind::Cpp),
             "return-type" => Some(WarningKind::ReturnType),
+            "attributes" => Some(WarningKind::Attributes),
+            "pedantic" => Some(WarningKind::Pedantic),
+            "unused-result" => Some(WarningKind::UnusedResult),
             _ => None,
         }
     }
@@ -144,7 +164,10 @@ impl WarningKind {
             WarningKind::ImplicitFunctionDeclaration,
             WarningKind::Cpp,
             WarningKind::ReturnType,
+            WarningKind::Attributes,
+            WarningKind::UnusedResult,
             // WarningKind::Undeclared is now a hard error, not a warning
+            // WarningKind::Pedantic requires explicit -pedantic flag, not part of -Wall
         ]
     }
 
@@ -161,6 +184,9 @@ impl WarningKind {
             WarningKind::ImplicitFunctionDeclaration,
             WarningKind::Cpp,
             WarningKind::ReturnType,
+            WarningKind::Attributes,
+            WarningKind::Pedantic,
+            WarningKind::UnusedResult,
         ]
     }
 }
@@ -457,6 +483,10 @@ pub struct DiagnosticEngine {
     /// Used to avoid repeating the same chain for consecutive errors in the
     /// same included file (matching GCC behavior).
     last_include_trace_file: Option<String>,
+    /// Whether `-pedantic` mode is enabled.
+    /// When true, GNU extensions and non-standard C behavior trigger
+    /// `WarningKind::Pedantic` warnings.
+    pedantic: bool,
 }
 
 impl DiagnosticEngine {
@@ -470,6 +500,7 @@ impl DiagnosticEngine {
             source_manager: None,
             use_color: ColorMode::Auto.use_color(),
             last_include_trace_file: None,
+            pedantic: false,
         }
     }
 
@@ -492,6 +523,25 @@ impl DiagnosticEngine {
     /// Resolves the mode immediately (e.g., checking isatty for Auto).
     pub fn set_color_mode(&mut self, mode: ColorMode) {
         self.use_color = mode.use_color();
+    }
+
+    /// Enable or disable `-pedantic` mode.
+    /// When enabled, GNU extensions and non-standard C behavior emit
+    /// `WarningKind::Pedantic` warnings. Enabling pedantic mode also
+    /// implicitly enables the `Pedantic` warning kind in the warning
+    /// configuration, so that pedantic warnings are not suppressed.
+    pub fn set_pedantic(&mut self, enabled: bool) {
+        self.pedantic = enabled;
+        if enabled {
+            // -pedantic implicitly enables the Pedantic warning kind
+            self.warning_config.enable(WarningKind::Pedantic);
+        }
+    }
+
+    /// Check if `-pedantic` mode is active.
+    /// Returns `true` if `set_pedantic(true)` was called.
+    pub fn is_pedantic(&self) -> bool {
+        self.pedantic
     }
 
     /// Emit a diagnostic: apply warning filtering/promotion, print to stderr,
