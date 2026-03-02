@@ -369,7 +369,20 @@ pub(super) fn emit_executable(
             sec.addr = 0;
         }
     }
-    let text_vaddr_base: u64 = text_script_base.unwrap_or(BASE_ADDR + text_page_offset);
+    // Compute the text segment virtual address base. When a linker script
+    // provides an address for .text, use it. However, ensure the text segment
+    // does not overlap with the read-only header segment (ELF header, PHDR,
+    // INTERP) which occupies BASE_ADDR .. BASE_ADDR + ro_header_end. If the
+    // script address falls within the first page (same as the header segment),
+    // bump it to the next page-aligned boundary to avoid creating two LOAD
+    // segments with the same virtual address, which would crash the dynamic
+    // linker with an assertion failure.
+    let default_text_vaddr = BASE_ADDR + text_page_offset;
+    let text_vaddr_base: u64 = match text_script_base {
+        Some(addr) if addr >= BASE_ADDR + PAGE_SIZE => addr,
+        Some(_) => default_text_vaddr, // script addr overlaps headers, use default
+        None => default_text_vaddr,
+    };
     let text_page_addr = text_vaddr_base;
 
     for sec in output_sections.iter_mut() {
@@ -717,14 +730,37 @@ pub(super) fn emit_executable(
         }
     }
 
-    // Resolve entry point: if a linker script provides ENTRY(symbol), use that
-    // symbol name; otherwise fall back to the conventional _start symbol. If
-    // neither is defined (e.g., freestanding embedded code), fall back to the
-    // text segment base address.
-    let entry_symbol = linker_script
-        .and_then(|ls| ls.entry.as_deref())
-        .unwrap_or("_start");
-    let entry_addr = globals.get(entry_symbol).map(|s| s.value).unwrap_or(text_page_addr);
+    // Resolve entry point for the ELF executable. For dynamically-linked
+    // executables the entry point MUST be `_start` (the CRT startup routine
+    // that initialises the C runtime and calls `main`). A linker script's
+    // `ENTRY(main)` is honoured only when linking a static/freestanding
+    // binary where `_start` is absent. This matches real-world behaviour:
+    // kernel linker scripts use `ENTRY(_start)` because the kernel is
+    // freestanding, while user-space dynamic binaries always need `_start`
+    // to set up argc/argv and invoke `__libc_start_main`.
+    let entry_addr = if !is_static {
+        // Dynamic executable: always prefer _start; fall back to ENTRY()
+        // symbol only if _start is not defined.
+        globals
+            .get("_start")
+            .map(|s| s.value)
+            .or_else(|| {
+                linker_script
+                    .and_then(|ls| ls.entry.as_deref())
+                    .and_then(|sym| globals.get(sym))
+                    .map(|s| s.value)
+            })
+            .unwrap_or(text_page_addr)
+    } else {
+        // Static/freestanding: honour ENTRY() if present, otherwise _start.
+        let entry_symbol = linker_script
+            .and_then(|ls| ls.entry.as_deref())
+            .unwrap_or("_start");
+        globals
+            .get(entry_symbol)
+            .map(|s| s.value)
+            .unwrap_or(text_page_addr)
+    };
 
     // === Build output buffer ===
     let file_size = offset as usize;

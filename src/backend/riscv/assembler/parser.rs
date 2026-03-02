@@ -63,6 +63,8 @@ pub enum SymbolType {
     Function,
     Object,
     TlsObject,
+    /// GNU indirect function (IFUNC) — symbol points to a resolver
+    GnuIndirectFunction,
     NoType,
 }
 
@@ -562,6 +564,7 @@ fn parse_type_directive(args: &str) -> Directive {
             "%function" | "@function" => SymbolType::Function,
             "%object" | "@object" => SymbolType::Object,
             "@tls_object" => SymbolType::TlsObject,
+            "@gnu_indirect_function" | "%gnu_indirect_function" | "STT_GNU_IFUNC" => SymbolType::GnuIndirectFunction,
             _ => SymbolType::NoType,
         };
         Directive::Type(sym, st)

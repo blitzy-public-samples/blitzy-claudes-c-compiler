@@ -15,7 +15,7 @@ use super::parser::{AsmStatement, AsmDirective, SymbolKind, SizeExpr, DataValue,
 use super::encoder::{encode_instruction, EncodeResult, RelocType};
 use crate::backend::elf::{
     self,
-    STT_NOTYPE, STT_OBJECT, STT_FUNC, STT_TLS,
+    STT_NOTYPE, STT_OBJECT, STT_FUNC, STT_TLS, STT_GNU_IFUNC,
     STV_HIDDEN, STV_PROTECTED, STV_INTERNAL,
     ELFCLASS64, EM_AARCH64,
     ElfWriterBase, ObjReloc,
@@ -333,7 +333,61 @@ impl ElfWriter {
     fn resolve_label_expr(&self, expr: &str) -> Option<i64> {
         let mut resolved = expr.to_string();
 
-        // Collect all label names, sorted longest first to avoid partial replacements
+        // First pass: resolve GNU numeric backward/forward label references
+        // (e.g., `0b` = backward ref to label "0", `1f` = forward ref to "1").
+        // These must be handled BEFORE general label replacement because the
+        // `b`/`f` suffix is part of the reference syntax, not the label name.
+        // We scan left-to-right, matching digit sequences followed by 'b' or 'f'
+        // that are not part of a larger identifier (e.g., not "0b1010" hex/binary).
+        let mut new_resolved = String::with_capacity(resolved.len());
+        let bytes = resolved.as_bytes();
+        let len = bytes.len();
+        let mut i = 0;
+        while i < len {
+            if bytes[i].is_ascii_digit() {
+                // Collect the full digit sequence
+                let start = i;
+                while i < len && bytes[i].is_ascii_digit() {
+                    i += 1;
+                }
+                let num_str = &resolved[start..i];
+                // Check for b/f suffix — must NOT be followed by another alnum
+                // (to avoid matching hex literals like 0b1010 or identifiers)
+                if i < len && (bytes[i] == b'b' || bytes[i] == b'f') {
+                    let is_backward = bytes[i] == b'b';
+                    let after_suffix = i + 1;
+                    let suffix_ok = after_suffix >= len
+                        || !bytes[after_suffix].is_ascii_alphanumeric();
+                    if suffix_ok {
+                        if is_backward {
+                            // Backward reference: look up label with this digit name
+                            if let Some((_section, offset)) = self.base.labels.get(num_str) {
+                                new_resolved.push_str(&offset.to_string());
+                                i = after_suffix; // skip past the 'b'
+                                continue;
+                            }
+                        }
+                        // Forward reference or label not found: fall through
+                    }
+                }
+                // Not a numeric label ref, output the digits as-is
+                new_resolved.push_str(num_str);
+            } else if bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' || bytes[i] == b'.' {
+                // Collect full identifier
+                let start = i;
+                while i < len && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' || bytes[i] == b'.') {
+                    i += 1;
+                }
+                new_resolved.push_str(&resolved[start..i]);
+            } else {
+                new_resolved.push(bytes[i] as char);
+                i += 1;
+            }
+        }
+        resolved = new_resolved;
+
+        // Second pass: resolve remaining named labels (sorted longest-first to
+        // prevent partial replacements, e.g. ".Lfoo" before ".Lfo").
         let mut label_names: Vec<&String> = self.base.labels.keys().collect();
         label_names.sort_by_key(|name| std::cmp::Reverse(name.len()));
 
@@ -473,6 +527,7 @@ impl ElfWriter {
                     SymbolKind::Function => STT_FUNC,
                     SymbolKind::Object => STT_OBJECT,
                     SymbolKind::TlsObject => STT_TLS,
+                    SymbolKind::GnuIndirectFunction => STT_GNU_IFUNC,
                     SymbolKind::NoType => STT_NOTYPE,
                 };
                 self.base.set_symbol_type(sym, st);

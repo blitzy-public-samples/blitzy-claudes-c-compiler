@@ -19,7 +19,7 @@ use crate::backend::elf::{
     self,
     SHF_ALLOC, SHF_EXECINSTR, SHF_WRITE,
     SHT_PROGBITS, SHT_NOBITS,
-    STT_NOTYPE, STT_OBJECT, STT_FUNC, STT_TLS,
+    STT_NOTYPE, STT_OBJECT, STT_FUNC, STT_TLS, STT_GNU_IFUNC,
     STV_HIDDEN, STV_PROTECTED, STV_INTERNAL,
     ELFCLASS64, EM_RISCV,
     ElfWriterBase, ObjReloc,
@@ -628,6 +628,7 @@ impl ElfWriter {
                     SymbolType::Function => STT_FUNC,
                     SymbolType::Object => STT_OBJECT,
                     SymbolType::TlsObject => STT_TLS,
+                    SymbolType::GnuIndirectFunction => STT_GNU_IFUNC,
                     SymbolType::NoType => STT_NOTYPE,
                 };
                 self.base.set_symbol_type(sym, elf_type);

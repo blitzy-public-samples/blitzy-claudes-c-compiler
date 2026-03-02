@@ -185,6 +185,19 @@ pub fn link_builtin(
 
     let (inputs, _archive_pool) = load_and_parse_objects(&all_objs, &defsym_defs)?;
 
+    // Phase 4b: Detect IFUNC symbols — i686 does not support GNU IFUNC dispatch.
+    for input in &inputs {
+        for sym in &input.symbols {
+            if sym.sym_type == STT_GNU_IFUNC {
+                return Err(format!(
+                    "IFUNC (indirect function) is not supported on i686 target: \
+                     symbol '{}' in '{}'",
+                    sym.name, input.filename
+                ));
+            }
+        }
+    }
+
     // Phase 5: Merge sections
     // When a linker script with SECTIONS directives is present, use
     // script-aware merging that respects section placement and KEEP patterns.
@@ -368,6 +381,19 @@ pub fn link_shared(
     // Parse all input objects
     let defsym_defs: Vec<(String, String)> = Vec::new();
     let (inputs, _archive_pool) = load_and_parse_objects(&all_objs, &defsym_defs)?;
+
+    // Detect IFUNC symbols — i686 does not support GNU IFUNC dispatch.
+    for input in &inputs {
+        for sym in &input.symbols {
+            if sym.sym_type == STT_GNU_IFUNC {
+                return Err(format!(
+                    "IFUNC (indirect function) is not supported on i686 target: \
+                     symbol '{}' in '{}'",
+                    sym.name, input.filename
+                ));
+            }
+        }
+    }
 
     // Merge sections — use linker-script-aware merging when a script is present.
     let (mut output_sections, section_name_to_idx, section_map) =

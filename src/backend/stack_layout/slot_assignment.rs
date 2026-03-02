@@ -388,29 +388,15 @@ fn classify_value(
         }
     }
 
-    // Detect small values (types that fit in 4 bytes on 64-bit targets).
-    // These values use 4-byte stack slots instead of 8-byte, reducing frame
-    // bloat for functions with many 32-bit locals (e.g., pcre2 compile_branch,
-    // PostgreSQL plpgsql). The backend's store/load paths must use movl/sw/str w-reg
-    // for values in small_slot_values to avoid clobbering adjacent slots.
-    //
-    // Sign-extension safety: when a small (e.g., I32) value is stored with movl
-    // and reloaded with movl, it zero-extends the upper 32 bits. This is safe
-    // because the backend treats small-slot values as 32-bit operands at every
-    // use site (movl, cmpl, etc.), and sign/zero extension to 64-bit is only
-    // applied when the IR explicitly contains a Cast instruction (Sext/Zext).
-    // The small_slot_values set lets codegen emit the correct width instructions.
-    let is_small = !crate::common::types::target_is_32bit() && matches!(
-        inst.result_type(),
-        Some(IrType::I8) | Some(IrType::U8) |
-        Some(IrType::I16) | Some(IrType::U16) |
-        Some(IrType::I32) | Some(IrType::U32) |
-        Some(IrType::F32)
-    );
+    // NOTE: 4-byte stack slots for small values are DISABLED because no backend
+    // codegen currently emits narrow (32-bit) store/load instructions for SSA
+    // values — all backends use full-width stores (movq on x86-64, str x-reg on
+    // AArch64, sd on RISC-V) which write 8 bytes and clobber the adjacent 4-byte
+    // slot. Re-enable this once all four backends' store_rax_to / store_x0_to /
+    // spill paths are updated to check is_small_slot and emit narrow instructions.
+    let is_small = false;
     let slot_size: i64 = if is_i128 || is_f128 {
         16
-    } else if is_small {
-        4
     } else {
         8
     };

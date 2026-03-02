@@ -146,6 +146,18 @@ impl Lowerer {
                 CType::Array(elem, _) => return self.resolve_ctype_size(elem).max(1),
                 CType::Pointer(pointee, _) => return self.resolve_ctype_size(pointee).max(1),
                 CType::Vector(elem, _) => return self.resolve_ctype_size(elem).max(1),
+                CType::Vla(elem) => {
+                    // For VLA subscript, the element type determines the size.
+                    // If the element is itself a VLA, its compile-time size is 0
+                    // (runtime sizeof handled by get_vla_sizeof / try_sizeof_expr_runtime).
+                    let elem_size = self.resolve_ctype_size(elem);
+                    if elem_size > 0 {
+                        return elem_size;
+                    }
+                    // Element is also a VLA — runtime sizeof will handle this;
+                    // return 0 as a sentinel for runtime computation.
+                    return 0;
+                }
                 _ => {}
             }
         }

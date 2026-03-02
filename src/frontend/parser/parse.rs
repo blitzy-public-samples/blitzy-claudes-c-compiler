@@ -925,6 +925,12 @@ impl Parser {
             "malloc" | "__malloc__" => {
                 self.attrs.set_malloc(true);
                 self.advance();
+                // GCC 11+ extended form: __attribute__((malloc(deallocator, argindex)))
+                // e.g., glibc 2.39+ uses __attribute__((__malloc__(fclose, 1)))
+                // Accept and ignore optional parenthesized arguments.
+                if matches!(self.peek(), TokenKind::LParen) {
+                    self.skip_balanced_parens();
+                }
             }
             "pure" | "__pure__" => {
                 self.attrs.set_pure(true);

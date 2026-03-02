@@ -77,6 +77,9 @@ pub enum SymbolKind {
     Function,
     Object,
     TlsObject,
+    /// GNU indirect function (IFUNC) — the symbol points to a resolver function
+    /// that the dynamic linker calls at startup to determine the actual implementation.
+    GnuIndirectFunction,
     NoType,
 }
 
@@ -1308,6 +1311,7 @@ fn split_on_semicolons(line: &str) -> Vec<&str> {
                     && !after.starts_with("nobits")
                     && !after.starts_with("tls_object")
                     && !after.starts_with("note")
+                    && !after.starts_with("gnu_indirect_function")
                 {
                     break;
                 }
@@ -1361,6 +1365,7 @@ fn strip_comment(line: &str) -> &str {
                 && !after.starts_with("nobits")
                 && !after.starts_with("tls_object")
                 && !after.starts_with("note")
+                && !after.starts_with("gnu_indirect_function")
             {
                 return &line[..i];
             }
@@ -2360,6 +2365,7 @@ fn parse_type_directive(args: &str) -> Result<AsmDirective, String> {
         "%function" | "@function" | "STT_FUNC" => SymbolKind::Function,
         "%object" | "@object" | "STT_OBJECT" => SymbolKind::Object,
         "@tls_object" => SymbolKind::TlsObject,
+        "@gnu_indirect_function" | "%gnu_indirect_function" | "STT_GNU_IFUNC" => SymbolKind::GnuIndirectFunction,
         _ => SymbolKind::NoType,
     };
     Ok(AsmDirective::SymbolType(sym.to_string(), kind))

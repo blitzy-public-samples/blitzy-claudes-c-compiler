@@ -940,15 +940,15 @@ fn execute_unroll(
                     Terminator::Branch(all_block_maps[k + 1][&header_label])
                 }
             } else if is_cond {
-                if is_last {
-                    Terminator::Branch(exit.exit_target)
-                } else {
-                    // Always continue — skip exit check.
-                    Terminator::Branch(remap_block_id(
-                        &exit.continue_target,
-                        block_map,
-                    ))
-                }
+                // Condition-only block (header, separate from latch/body).
+                // For ALL iterations (including the last), the condition is
+                // known to pass, so always branch to the body/continue
+                // target. The LATCH will handle branching to exit for the
+                // last iteration.
+                Terminator::Branch(remap_block_id(
+                    &exit.continue_target,
+                    block_map,
+                ))
             } else if is_latch {
                 if is_last {
                     // Last iteration latch: if cond_block differs, the exit
@@ -997,6 +997,58 @@ fn execute_unroll(
                 incoming.extend(extra);
             }
         }
+    }
+
+    // ── Remap uses of loop-defined values in blocks OUTSIDE the loop ──
+    // After unrolling, the original loop blocks become dead (unreachable).
+    // However, blocks outside the loop may directly reference values that
+    // were defined inside the loop body (without a phi). These references
+    // are now stale because the original loop body is dead. We must remap
+    // all such uses to point to the last unrolled iteration's definitions.
+    //
+    // CRITICAL: For header phi values, the exit-time value is the LATCH
+    // value from the last iteration (the output of the last body), not the
+    // header copy value (the input to the last body). We build an "exit
+    // value map" that overrides last_vm for header phi destinations.
+    let loop_defined_values: FxHashSet<u32> = {
+        let mut s = FxHashSet::default();
+        for &bi in &loop_blocks {
+            for inst in &func.blocks[bi].instructions {
+                if let Some(dest) = inst.dest() {
+                    s.insert(dest.0);
+                }
+            }
+        }
+        s
+    };
+    let loop_block_set: FxHashSet<usize> = natural_loop.body.clone();
+    let last_vm = &all_value_maps[tc - 1];
+
+    // Build exit value map: start with last_vm, then override header phi
+    // destinations to point to the latch value from the last iteration.
+    let mut exit_vm: FxHashMap<u32, u32> = last_vm.clone();
+    for phi in &header_phis {
+        // For each header phi: when the loop exits, the phi value equals
+        // the latch operand from the last completed body iteration.
+        // Remap the latch operand through last_vm to get the correct ID.
+        let remapped_latch = remap_operand(&phi.latch_val, last_vm);
+        if let Operand::Value(v) = remapped_latch {
+            exit_vm.insert(phi.dest.0, v.0);
+        }
+        // If latch_val is a constant, no remapping needed for the phi
+        // dest — it won't appear as a Value operand in escape uses.
+    }
+
+    for (bi, block) in func.blocks.iter_mut().enumerate() {
+        if loop_block_set.contains(&bi) {
+            continue; // Skip original loop blocks (they are dead)
+        }
+        // Remap operands in instructions
+        for inst in &mut block.instructions {
+            remap_loop_escape_uses(inst, &loop_defined_values, &exit_vm);
+        }
+        // Remap operands in the terminator
+        remap_terminator_escape_uses(&mut block.terminator, &loop_defined_values, &exit_vm);
     }
 
     // ── Finalize ──
@@ -1377,6 +1429,66 @@ fn make_iv_const(val: i64, ty: IrType) -> IrConst {
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
+
+// ─── Loop-escape value remapping ─────────────────────────────────────────────
+
+/// Remap any uses of loop-defined values in an instruction that lives
+/// OUTSIDE the loop. This handles the case where a value defined inside
+/// the (now-dead) original loop body is used directly in a non-loop block
+/// without a phi node intermediary.
+///
+/// Reuses `remap_instruction_in_place` with a value map that only includes
+/// loop-defined values (so values defined outside the loop are left alone),
+/// and an empty block map (block references in non-loop blocks don't need
+/// remapping).
+///
+/// In well-formed SSA, the dest of a non-loop instruction is never in
+/// loop_defined, so the restricted_vm will not remap it — only operands
+/// (uses) of loop-defined values will be updated.
+fn remap_loop_escape_uses(
+    inst: &mut Instruction,
+    loop_defined: &FxHashSet<u32>,
+    last_vm: &FxHashMap<u32, u32>,
+) {
+    // Build a restricted value map: only remap values that were defined in
+    // the original loop body AND that appear in the last iteration's map.
+    let restricted_vm: FxHashMap<u32, u32> = last_vm
+        .iter()
+        .filter(|(k, _)| loop_defined.contains(k))
+        .map(|(&k, &v)| (k, v))
+        .collect();
+    if restricted_vm.is_empty() {
+        return;
+    }
+    let empty_bm: FxHashMap<BlockId, BlockId> = FxHashMap::default();
+    remap_instruction_in_place(inst, &restricted_vm, &empty_bm);
+}
+
+/// Remap loop-defined value uses in a terminator instruction.
+fn remap_terminator_escape_uses(
+    term: &mut Terminator,
+    loop_defined: &FxHashSet<u32>,
+    last_vm: &FxHashMap<u32, u32>,
+) {
+    let remap_escape_op = |op: &mut Operand| {
+        if let Operand::Value(ref mut v) = op {
+            if loop_defined.contains(&v.0) {
+                if let Some(&new_id) = last_vm.get(&v.0) {
+                    *v = Value(new_id);
+                }
+            }
+        }
+    };
+    match term {
+        Terminator::Return(Some(ref mut op)) => { remap_escape_op(op); }
+        Terminator::CondBranch { ref mut cond, .. } => { remap_escape_op(cond); }
+        Terminator::Switch { ref mut val, .. } => { remap_escape_op(val); }
+        Terminator::IndirectBranch { ref mut target, .. } => { remap_escape_op(target); }
+        Terminator::Return(None)
+        | Terminator::Branch(_)
+        | Terminator::Unreachable => {}
+    }
+}
 
 #[cfg(test)]
 mod tests {

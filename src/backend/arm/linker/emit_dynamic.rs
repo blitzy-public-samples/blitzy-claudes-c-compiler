@@ -26,10 +26,20 @@ pub(super) fn emit_dynamic_executable(
     let mut dynstr = DynStrTab::new();
     for lib in needed_sonames { dynstr.add(lib); }
 
-    // Build dynamic symbol name list
+    // Build dynamic symbol name list — skip locally-defined IFUNC symbols
+    // since they use IRELATIVE relocations (sym_idx=0, addend=resolver_addr)
+    // rather than JUMP_SLOT entries that reference a dynamic symbol index.
     let mut dyn_sym_names: Vec<String> = Vec::new();
     for name in plt_names {
-        if !dyn_sym_names.contains(name) { dyn_sym_names.push(name.clone()); }
+        if !dyn_sym_names.contains(name) {
+            // Skip locally-defined IFUNC symbols — they don't need dynsym entries
+            let is_local_ifunc = globals.get(name).map(|g|
+                (g.info & 0xf) == STT_GNU_IFUNC && g.defined_in.is_some()
+            ).unwrap_or(false);
+            if !is_local_ifunc {
+                dyn_sym_names.push(name.clone());
+            }
+        }
     }
     for (name, is_plt) in got_entries {
         if !name.is_empty() && !*is_plt && !dyn_sym_names.contains(name) {
@@ -365,6 +375,27 @@ pub(super) fn emit_dynamic_executable(
         }
     }
 
+    // For locally-defined IFUNC symbols, the current value is the resolver function address.
+    // We save it before redirecting the symbol to its PLT stub, so the IRELATIVE relocation
+    // addend can use the resolver address while call sites go through the PLT.
+    let mut ifunc_resolver_addrs: HashMap<String, u64> = HashMap::new();
+    for (name, gsym) in globals.iter() {
+        if (gsym.info & 0xf) == STT_GNU_IFUNC && gsym.defined_in.is_some() {
+            ifunc_resolver_addrs.insert(name.clone(), gsym.value);
+        }
+    }
+    // Redirect IFUNC symbol value to its PLT stub address, and change type to STT_FUNC
+    // so that call sites resolve through the PLT for lazy/eager resolution
+    for (name, gsym) in globals.iter_mut() {
+        if (gsym.info & 0xf) == STT_GNU_IFUNC && gsym.defined_in.is_some() {
+            if let Some(pi) = gsym.plt_idx {
+                gsym.value = plt_addr + 32 + pi as u64 * 16;
+            }
+            // Change type from STT_GNU_IFUNC to STT_FUNC, preserving binding
+            gsym.info = (gsym.info & 0xf0) | STT_FUNC;
+        }
+    }
+
     // Define linker-provided symbols
     let text_seg_end = text_page_addr + text_total_size;
     let linker_addrs = LinkerSymbolAddresses {
@@ -524,14 +555,25 @@ pub(super) fn emit_dynamic_executable(
         }
     }
 
-    // .rela.plt (R_AARCH64_JUMP_SLOT = 1026)
+    // .rela.plt — R_AARCH64_JUMP_SLOT for dynamic symbols,
+    //              R_AARCH64_IRELATIVE for locally-defined IFUNC symbols
     const R_AARCH64_JUMP_SLOT: u64 = 1026;
+    const R_AARCH64_IRELATIVE: u64 = 1032;
     let mut rp = rela_plt_offset as usize;
     let gpb = got_plt_addr + 24;
     for (i, name) in plt_names.iter().enumerate() {
         let gea = gpb + i as u64 * 8;
-        let si = dyn_sym_names.iter().position(|n| n == name).map(|j| j+1).unwrap_or(0) as u64;
-        w64(&mut out, rp, gea); w64(&mut out, rp+8, (si << 32) | R_AARCH64_JUMP_SLOT); w64(&mut out, rp+16, 0);
+        let is_local_ifunc = ifunc_resolver_addrs.contains_key(name);
+        if is_local_ifunc {
+            // IRELATIVE: sym_idx=0, addend=resolver address (saved before PLT redirection)
+            let resolver_addr = ifunc_resolver_addrs.get(name).copied().unwrap_or(0);
+            w64(&mut out, rp, gea);
+            w64(&mut out, rp+8, R_AARCH64_IRELATIVE);
+            w64(&mut out, rp+16, resolver_addr);
+        } else {
+            let si = dyn_sym_names.iter().position(|n| n == name).map(|j| j+1).unwrap_or(0) as u64;
+            w64(&mut out, rp, gea); w64(&mut out, rp+8, (si << 32) | R_AARCH64_JUMP_SLOT); w64(&mut out, rp+16, 0);
+        }
         rp += 24;
     }
 

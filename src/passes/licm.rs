@@ -97,6 +97,11 @@ fn is_hoistable(inst: &Instruction) -> bool {
 struct AllocaAnalysis {
     /// Set of value IDs that are alloca destinations.
     alloca_values: FxHashSet<u32>,
+    /// Set of value IDs produced by DynAlloca instructions (VLA allocations).
+    /// GEP chains derived from these values should not be hoisted by LICM
+    /// because the increased register pressure from live VLA-derived pointers
+    /// can cause spill slot conflicts in the register allocator.
+    dyn_alloca_values: FxHashSet<u32>,
     /// Set of alloca value IDs that are "address-taken" — used by anything
     /// other than direct Load/Store (e.g., passed to a call, used in GEP
     /// as a non-base, stored as a value, etc.). Loads from address-taken
@@ -117,6 +122,7 @@ struct AllocaAnalysis {
 /// Load/Store, so we can reason precisely about which stores modify them.
 fn analyze_allocas(func: &IrFunction) -> AllocaAnalysis {
     let mut alloca_values = FxHashSet::default();
+    let mut dyn_alloca_values = FxHashSet::default();
     let mut address_taken = FxHashSet::default();
 
     // Collect all alloca values from every block. After inlining, allocas
@@ -128,11 +134,14 @@ fn analyze_allocas(func: &IrFunction) -> AllocaAnalysis {
             if let Instruction::Alloca { dest, .. } = inst {
                 alloca_values.insert(dest.0);
             }
+            if let Instruction::DynAlloca { dest, .. } = inst {
+                dyn_alloca_values.insert(dest.0);
+            }
         }
     }
 
     if alloca_values.is_empty() {
-        return AllocaAnalysis { alloca_values, address_taken };
+        return AllocaAnalysis { alloca_values, dyn_alloca_values, address_taken };
     }
 
     // Scan all instructions to find address-taken allocas.
@@ -176,7 +185,7 @@ fn analyze_allocas(func: &IrFunction) -> AllocaAnalysis {
         });
     }
 
-    AllocaAnalysis { alloca_values, address_taken }
+    AllocaAnalysis { alloca_values, dyn_alloca_values, address_taken }
 }
 
 /// Visit each Value ID used as operands by any instruction (for address-taken analysis).
@@ -388,6 +397,62 @@ fn build_value_to_base_alloca(func: &IrFunction, alloca_info: &AllocaAnalysis) -
         }
     }
     map
+}
+
+/// Build a set of value IDs that derive from DynAlloca results (VLA base
+/// pointers). The chain is: DynAlloca → stored into alloca → loaded back →
+/// used as GEP base → GEP result. Any GEP whose base is in this set should
+/// not be hoisted by LICM to avoid register pressure spikes that cause
+/// spill slot conflicts in functions with multiple VLAs.
+fn build_dyn_alloca_derived_set(func: &IrFunction, alloca_info: &AllocaAnalysis) -> FxHashSet<u32> {
+    let mut derived = FxHashSet::default();
+
+    // Seed: DynAlloca results themselves.
+    for &da in &alloca_info.dyn_alloca_values {
+        derived.insert(da);
+    }
+
+    // Find allocas that store DynAlloca results (VLA pointer variables).
+    let mut vla_ptr_allocas = FxHashSet::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Instruction::Store { val: Operand::Value(v), ptr, .. } = inst {
+                if derived.contains(&v.0) && alloca_info.alloca_values.contains(&ptr.0) {
+                    vla_ptr_allocas.insert(ptr.0);
+                }
+            }
+        }
+    }
+
+    // Propagate: loads from VLA pointer allocas, and GEP chains from those.
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                match inst {
+                    Instruction::Load { dest, ptr, .. } => {
+                        if vla_ptr_allocas.contains(&ptr.0) && derived.insert(dest.0) {
+                            changed = true;
+                        }
+                    }
+                    Instruction::GetElementPtr { dest, base, .. } => {
+                        if derived.contains(&base.0) && derived.insert(dest.0) {
+                            changed = true;
+                        }
+                    }
+                    Instruction::Copy { dest, src: Operand::Value(v) } => {
+                        if derived.contains(&v.0) && derived.insert(dest.0) {
+                            changed = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    derived
 }
 
 /// Identify restrict-qualified pointers accessible within the loop.
@@ -693,6 +758,18 @@ fn hoist_loop_invariants(
     // Build a mapping from values to their base alloca (following GEP chains).
     let value_to_base_alloca = build_value_to_base_alloca(func, alloca_info);
 
+    // Build a set of values that derive from DynAlloca results (VLA pointers).
+    // When a DynAlloca result is stored into an alloca and then loaded back,
+    // the loaded value and any GEPs based on it are "VLA-derived". Hoisting
+    // GEP instructions over VLA-derived pointers can increase register
+    // pressure beyond what the allocator handles correctly, causing spill
+    // slot conflicts. We track these to prevent GEP hoisting for VLA code.
+    let dyn_alloca_derived = if !alloca_info.dyn_alloca_values.is_empty() {
+        build_dyn_alloca_derived_set(func, alloca_info)
+    } else {
+        FxHashSet::default()
+    };
+
     // Analyze loop memory for load hoisting.
     let loop_mem = analyze_loop_memory(func, &natural_loop.body, alloca_info, &global_addr_values, &value_to_base_alloca);
 
@@ -725,7 +802,23 @@ fn hoist_loop_invariants(
                 }
 
                 // Determine if this instruction can be hoisted
-                let can_hoist = if is_hoistable(inst) {
+                //
+                // Suppress hoisting of GEP instructions whose base derives
+                // from a DynAlloca (VLA). Hoisting VLA-derived GEPs increases
+                // the number of live pointer values spanning loop bodies, which
+                // can push register pressure beyond the allocator's ability to
+                // correctly assign distinct spill slots. This prevents a class
+                // of miscompilations in functions with multiple VLAs and nested
+                // loops where the allocator incorrectly shares spill slots
+                // between two simultaneously-live values.
+                let suppress_vla_gep = if let Instruction::GetElementPtr { base, .. } = inst {
+                    dyn_alloca_derived.contains(&base.0)
+                } else {
+                    false
+                };
+                let can_hoist = if suppress_vla_gep {
+                    false
+                } else if is_hoistable(inst) {
                     // Pure instruction: check all operands are loop-invariant
                     // Use callback to avoid Vec allocation in this hot loop
                     let mut all_invariant = true;
