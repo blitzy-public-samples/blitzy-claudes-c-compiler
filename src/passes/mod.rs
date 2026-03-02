@@ -318,15 +318,34 @@ pub(crate) fn run_passes(module: &mut IrModule, opt_level: OptLevel, target: cra
     // -O1: Minimal optimization — mem2reg + constfold + copyprop + dce.
     // No inlining, no GVN/LICM, no simplify, no CFG simplification.
     if opt_level == OptLevel::O1 {
-        crate::ir::mem2reg::promote_allocas_with_params(module);
-        constant_fold::run(module);
-        copy_prop::run(module);
-        // Run DCE on each non-declaration function
-        for func in &mut module.functions {
-            if !func.is_declaration {
-                dce::eliminate_dead_code(func);
-            }
+        let time_passes = std::env::var("CCC_TIME_PASSES").is_ok();
+
+        // Timing macro for the O1 early-return path, matching the format used by
+        // the O2+ iterative loop. O1 runs a single non-iterative pass sequence,
+        // so we omit the `iter=` field and change counts (module-level pass
+        // wrappers do not return per-function change counts).
+        macro_rules! timed_o1 {
+            ($name:expr, $body:expr) => {{
+                if time_passes {
+                    let t0 = std::time::Instant::now();
+                    $body;
+                    eprintln!("[PASS] {}: {:.4}s", $name, t0.elapsed().as_secs_f64());
+                } else {
+                    $body;
+                }
+            }};
         }
+
+        timed_o1!("mem2reg", crate::ir::mem2reg::promote_allocas_with_params(module));
+        timed_o1!("constant_fold", constant_fold::run(module));
+        timed_o1!("copy_prop", copy_prop::run(module));
+        timed_o1!("dce", {
+            for func in &mut module.functions {
+                if !func.is_declaration {
+                    dce::eliminate_dead_code(func);
+                }
+            }
+        });
         return;
     }
 
