@@ -165,6 +165,7 @@ impl Parser {
         lhs
     }
 
+    // grammar: logical-or-expression through multiplicative-expression (precedence climbing)
     /// Parse the next tighter precedence level.
     fn parse_next_tighter(&mut self, level: PrecedenceLevel) -> Expr {
         match level {

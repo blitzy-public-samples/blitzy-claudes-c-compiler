@@ -355,9 +355,11 @@ impl Parser {
             // doesn't leak to the enclosing function declaration.
             let saved_noreturn = self.attrs.parsing_noreturn();
             self.skip_gcc_extensions();
-            // Save and reset parsing_const to detect if this parameter's base type is const.
+            // Save and reset parsing_const and parsing_restrict to detect per-parameter qualifiers.
             let saved_const = self.attrs.parsing_const();
+            let saved_restrict = self.attrs.is_restrict();
             self.attrs.set_const(false);
+            self.attrs.set_restrict(false);
             self.attrs.set_noreturn(saved_noreturn);
             if let Some(mut type_spec) = self.parse_type_specifier() {
                 // Capture whether the base type (before pointer declarators) was const.
@@ -399,11 +401,14 @@ impl Parser {
                     type_spec = TypeSpecifier::Pointer(Box::new(type_spec), AddressSpace::Default);
                 }
 
+                let param_is_restrict = self.attrs.is_restrict();
                 self.attrs.set_const(saved_const);
+                self.attrs.set_restrict(saved_restrict);
                 self.attrs.set_noreturn(saved_noreturn);
-                params.push(ParamDecl { type_spec, name, fptr_params: fptr_param_decls, is_const: param_is_const, vla_size_exprs, fptr_inner_ptr_depth: inner_ptr_depth });
+                params.push(ParamDecl { type_spec, name, fptr_params: fptr_param_decls, is_const: param_is_const, is_restrict: param_is_restrict, vla_size_exprs, fptr_inner_ptr_depth: inner_ptr_depth });
             } else {
                 self.attrs.set_const(saved_const);
+                self.attrs.set_restrict(saved_restrict);
                 self.attrs.set_noreturn(saved_noreturn);
                 break;
             }
@@ -429,6 +434,7 @@ impl Parser {
                 name: Some(n),
                 fptr_params: None,
                 is_const: false,
+                is_restrict: false,
                 vla_size_exprs: Vec::new(),
                 fptr_inner_ptr_depth: 0,
             });

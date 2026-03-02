@@ -130,6 +130,7 @@ impl Parser {
             d.set_typedef(self.attrs.parsing_typedef());
             d.set_const(self.attrs.parsing_const());
             d.set_volatile(self.attrs.parsing_volatile());
+            d.set_restrict(self.attrs.is_restrict());
             d.set_thread_local(self.attrs.parsing_thread_local());
             return Some(ExternalDecl::Declaration(d));
         }
@@ -677,6 +678,7 @@ impl Parser {
         d.set_typedef(is_typedef);
         d.set_const(self.attrs.parsing_const());
         d.set_volatile(self.attrs.parsing_volatile());
+        d.set_restrict(self.attrs.is_restrict());
         d.set_common(ctx.is_common);
         d.set_thread_local(self.attrs.parsing_thread_local());
         d.set_transparent_union(is_transparent_union);
@@ -699,6 +701,7 @@ impl Parser {
         self.attrs.set_inline(false);
         self.attrs.set_const(false);
         self.attrs.set_volatile(false);
+        self.attrs.set_restrict(false);
         self.attrs.parsing_address_space = AddressSpace::Default;
         let type_spec = self.parse_type_specifier()?;
 
@@ -726,6 +729,7 @@ impl Parser {
             d.set_typedef(self.attrs.parsing_typedef());
             d.set_const(self.attrs.parsing_const());
             d.set_volatile(self.attrs.parsing_volatile());
+            d.set_restrict(self.attrs.is_restrict());
             d.set_thread_local(self.attrs.parsing_thread_local());
             return Some(d);
         }
@@ -863,6 +867,7 @@ impl Parser {
         d.set_typedef(is_typedef);
         d.set_const(self.attrs.parsing_const());
         d.set_volatile(self.attrs.parsing_volatile());
+        d.set_restrict(self.attrs.is_restrict());
         d.set_thread_local(self.attrs.parsing_thread_local());
         d.set_transparent_union(is_transparent_union);
         Some(d)
@@ -1198,8 +1203,8 @@ impl Parser {
                 TokenKind::Extern => { self.advance(); self.attrs.set_extern(true); }
                 TokenKind::Const => { self.advance(); self.attrs.set_const(true); }
                 TokenKind::Volatile => { self.advance(); self.attrs.set_volatile(true); }
-                TokenKind::Restrict
-                | TokenKind::Inline | TokenKind::Register | TokenKind::Auto => { self.advance(); }
+                TokenKind::Restrict => { self.advance(); self.attrs.set_restrict(true); }
+                TokenKind::Inline | TokenKind::Register | TokenKind::Auto => { self.advance(); }
                 TokenKind::SegGs => { self.advance(); self.attrs.parsing_address_space = AddressSpace::SegGs; }
                 TokenKind::SegFs => { self.advance(); self.attrs.parsing_address_space = AddressSpace::SegFs; }
                 TokenKind::Alignas => {

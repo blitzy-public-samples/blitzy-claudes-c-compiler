@@ -469,39 +469,30 @@ impl SemanticAnalyzer {
             // Check if this is a function declaration (prototype)
             if let CType::Function(ref ft) = full_type {
                 let is_noreturn = init_decl.attrs.is_noreturn();
-                // If redeclared with noreturn, update existing entry
-                if is_noreturn {
-                    if let Some(existing) = self.result.functions.get_mut(&init_decl.name) {
+                let is_deprecated = init_decl.attrs.is_deprecated();
+
+                if let Some(existing) = self.result.functions.get_mut(&init_decl.name) {
+                    // Redeclaration: propagate _Noreturn and deprecated attributes
+                    // regardless of each other's presence. A function can be redeclared
+                    // with just _Noreturn, just deprecated, or both independently.
+                    if is_noreturn {
                         existing.is_noreturn = true;
-                        // Propagate deprecated from redeclaration
-                        if init_decl.attrs.is_deprecated() {
-                            existing.is_deprecated = true;
-                            if existing.deprecated_msg.is_none() {
-                                existing.deprecated_msg = init_decl.attrs.deprecated_msg.clone();
-                            }
-                        }
-                    } else {
-                        let func_info = FunctionInfo {
-                            return_type: ft.return_type.clone(),
-                            params: ft.params.clone(),
-                            variadic: ft.variadic,
-                            is_defined: false,
-                            is_noreturn: true,
-                            is_deprecated: init_decl.attrs.is_deprecated(),
-                            deprecated_msg: init_decl.attrs.deprecated_msg.clone(),
-                            is_warn_unused_result: false,
-                            format_attr: None,
-                        };
-                        self.result.functions.insert(init_decl.name.clone(), func_info);
                     }
-                } else if !self.result.functions.contains_key(&init_decl.name) {
+                    if is_deprecated {
+                        existing.is_deprecated = true;
+                        if existing.deprecated_msg.is_none() {
+                            existing.deprecated_msg = init_decl.attrs.deprecated_msg.clone();
+                        }
+                    }
+                } else {
+                    // First declaration: create new entry with all attributes
                     let func_info = FunctionInfo {
                         return_type: ft.return_type.clone(),
                         params: ft.params.clone(),
                         variadic: ft.variadic,
                         is_defined: false,
-                        is_noreturn: false,
-                        is_deprecated: init_decl.attrs.is_deprecated(),
+                        is_noreturn,
+                        is_deprecated,
                         deprecated_msg: init_decl.attrs.deprecated_msg.clone(),
                         is_warn_unused_result: false,
                         format_attr: None,
@@ -959,7 +950,15 @@ impl SemanticAnalyzer {
                 self.analyze_expr(expr);
                 self.analyze_stmt(body);
             }
-            Stmt::CaseRange(low, high, body, _) => {
+            Stmt::CaseRange(low, high, body, span) => {
+                // GNU extension: case ranges (case low ... high:)
+                if self.diagnostics.borrow().is_pedantic() {
+                    self.diagnostics.borrow_mut().warning_with_kind(
+                        "range expressions in switch statements are a GNU extension",
+                        *span,
+                        WarningKind::Pedantic,
+                    );
+                }
                 self.analyze_expr(low);
                 self.analyze_expr(high);
                 self.analyze_stmt(body);
@@ -1537,7 +1536,15 @@ impl SemanticAnalyzer {
                 self.analyze_expr(then_expr);
                 self.analyze_expr(else_expr);
             }
-            Expr::GnuConditional(cond, else_expr, _) => {
+            Expr::GnuConditional(cond, else_expr, span) => {
+                // GNU extension: conditional with omitted middle operand (a ?: b)
+                if self.diagnostics.borrow().is_pedantic() {
+                    self.diagnostics.borrow_mut().warning_with_kind(
+                        "conditional expression with omitted middle operand is a GNU extension",
+                        *span,
+                        WarningKind::Pedantic,
+                    );
+                }
                 self.analyze_expr(cond);
                 self.analyze_expr(else_expr);
             }
@@ -1587,7 +1594,15 @@ impl SemanticAnalyzer {
             Expr::CompoundLiteral(_, init, _) => {
                 self.analyze_initializer(init);
             }
-            Expr::StmtExpr(compound, _) => {
+            Expr::StmtExpr(compound, span) => {
+                // GNU extension: statement expressions ({...})
+                if self.diagnostics.borrow().is_pedantic() {
+                    self.diagnostics.borrow_mut().warning_with_kind(
+                        "use of GNU statement expression extension",
+                        *span,
+                        WarningKind::Pedantic,
+                    );
+                }
                 self.analyze_compound_stmt(compound);
             }
             Expr::VaArg(ap_expr, _, _) => {
@@ -2038,8 +2053,10 @@ impl SemanticAnalyzer {
         // Unwrap casts: (void)func() should NOT trigger the warning (explicit discard)
         // Only check bare function calls in expression-statement position.
         if let Expr::FunctionCall(callee, _, span) = expr {
-            if let Expr::Identifier(name, _) = callee.as_ref() {
-                if let Some(func_info) = self.result.functions.get(name) {
+            // Extract the function name from the callee expression.
+            // Handles direct identifiers and parenthesized expressions like (func)(...).
+            if let Some(name) = Self::extract_callee_name(callee.as_ref()) {
+                if let Some(func_info) = self.result.functions.get(&name) {
                     if func_info.is_warn_unused_result {
                         self.diagnostics.borrow_mut().warning_with_kind(
                             format!(
@@ -2052,6 +2069,19 @@ impl SemanticAnalyzer {
                     }
                 }
             }
+        }
+    }
+
+    /// Recursively extract a function name from a callee expression.
+    /// Returns `Some(name)` for direct identifiers and dereferences of function
+    /// pointers (`(*fp)()`). Parenthesized callees are already unwrapped by the
+    /// parser before reaching the AST.
+    fn extract_callee_name(expr: &Expr) -> Option<String> {
+        match expr {
+            Expr::Identifier(name, _) => Some(name.clone()),
+            // Handle explicit dereference: (*func_ptr)(args)
+            Expr::Deref(inner, _) => Self::extract_callee_name(inner),
+            _ => None,
         }
     }
 

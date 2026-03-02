@@ -294,11 +294,13 @@ representation. The concrete Rust types flowing between phases are:
   configuration. The `-O0` tier skips all passes and mem2reg for fastest
   compilation, while `-O3` adds loop unrolling and aggressive inlining.
 
-- **C11 conformance**: Full C11 language feature support including `_Atomic`
+- **C11 conformance**: C11 language feature support including `_Atomic`
   qualifier tracked through the type system with architecture-native atomic
-  instructions, `_Generic` compile-time selection, VLA dynamic stack
-  allocation, `_Complex` Annex G arithmetic, and `restrict` qualifier alias
-  analysis.
+  instructions (load, store, compound assignment, increment/decrement),
+  `_Generic` compile-time selection, VLA dynamic stack allocation with
+  runtime `sizeof`, `_Complex` Annex G arithmetic, `restrict` qualifier
+  propagation through the type system and into GVN/LICM alias analysis,
+  and C99/GNU `inline` linkage semantics.
 
 ---
 

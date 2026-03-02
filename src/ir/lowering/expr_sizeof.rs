@@ -596,9 +596,17 @@ impl Lowerer {
 
                 if let Some((elem_size, strides)) = stride_info {
                     // Generate runtime multiplication: elem_size * stride1 * stride2 * ...
-                    // Use IrType::I64 for 64-bit targets (pointer-width size_t values).
-                    let result_ty = IrType::I64;
-                    let elem_const = Operand::Const(IrConst::I64(elem_size as i64));
+                    // Use pointer-width type for size_t: I32 on i686, I64 on 64-bit targets.
+                    let result_ty = if crate::common::types::target_is_32bit() {
+                        IrType::I32
+                    } else {
+                        IrType::I64
+                    };
+                    let elem_const = if crate::common::types::target_is_32bit() {
+                        Operand::Const(IrConst::I32(elem_size as i32))
+                    } else {
+                        Operand::Const(IrConst::I64(elem_size as i64))
+                    };
                     let first_stride = strides[0];
 
                     // First multiplication: elem_size * first_stride

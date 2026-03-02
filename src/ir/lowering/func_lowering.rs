@@ -574,22 +574,22 @@ impl Lowerer {
         // This handles cases like jq's tsd_dtoa_context_get() where the header declares
         // the function without `inline` and the .c file defines it with `inline`.
         let is_gnu_inline_no_extern_def = self.is_gnu_inline_no_extern_def(&func.attrs);
-        // C99 6.7.4p7: A plain `inline` definition (without `extern`) does not
-        // provide an external definition ONLY if ALL file-scope declarations include
-        // `inline`. If any declaration lacks `inline`, this is an external definition.
-        // Note: in GNU89 mode, `inline` without `extern` provides an external def,
-        // so this rule does not apply.
-        let is_c99_inline_def = !self.gnu89_inline
-            && func.attrs.is_inline() && !func.attrs.is_extern()
-            && !func.attrs.is_static() && !func.attrs.is_gnu_inline()
-            && !self.has_non_inline_decl.contains(&func.name);
-        // C99 inline-only definitions (inline without extern/static, all declarations
-        // have inline) don't provide an external definition per C99 6.7.4p7.
-        // We lower them as static so their bodies are available for inlining.
-        // If all call sites are inlined, dead code elimination removes them.
-        // If not inlined, they're emitted as local symbols (safe fallback).
+        // Use the centralized inline linkage determination (C11 §6.7.4p7).
+        // This replaces the inline C99/GNU89 logic with a single decision point
+        // that correctly handles all combinations of inline/extern/static/gnu_inline.
+        let has_non_inline_decl = self.has_non_inline_decl.contains(&func.name);
+        let inline_linkage = super::definitions::determine_inline_linkage(
+            func.attrs.is_inline(),
+            func.attrs.is_extern(),
+            func.attrs.is_static(),
+            func.attrs.is_gnu_inline(),
+            self.gnu89_inline,
+            has_non_inline_decl,
+        );
+        // Map InlineLinkage to is_static: InlineOnly and StaticDef emit as local symbols.
+        // Also respect explicit static_functions set (from earlier declarations).
         let is_static = func.attrs.is_static() || self.static_functions.contains(&func.name)
-            || is_gnu_inline_no_extern_def || is_c99_inline_def;
+            || is_gnu_inline_no_extern_def || inline_linkage.is_local_linkage();
         let next_val = self.func_mut().next_value;
         let param_alloca_vals = std::mem::take(&mut self.func_mut().param_alloca_values);
         let global_init_labels = std::mem::take(&mut self.func_mut().global_init_label_blocks);

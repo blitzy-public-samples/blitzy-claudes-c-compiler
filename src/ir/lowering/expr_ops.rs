@@ -185,8 +185,17 @@ impl Lowerer {
                     self.store_complex_parts(result, Operand::Value(new_re), Operand::Value(new_im), &result_ct);
                     return Operand::Value(result);
                 }
-                // real / complex: falls through to existing full complex division path
-                // which is correct per Annex G (conjugate-based optimization deferred).
+                BinOp::Div if !lhs_is_complex && rhs_is_complex => {
+                    // Annex G: real / complex uses conjugate method:
+                    //   r / (c + di) = (r·c)/(c²+d²) + (-(r·d)/(c²+d²))i
+                    // This avoids the general complex division formula overhead
+                    // and produces better precision for this specific case.
+                    let lhs_val = self.lower_expr(lhs);
+                    let rhs_val = self.lower_expr(rhs);
+                    let rhs_converted = self.convert_to_complex(rhs_val, rhs_ct, &result_ct);
+                    let rhs_ptr = self.operand_to_value(rhs_converted);
+                    return self.lower_real_div_complex(lhs_val, lhs_ct, rhs_ptr, &result_ct);
+                }
                 // Add/Sub: falls through — Sub has special -0.0 handling below,
                 // Add is already componentwise and handles mixed operands correctly.
                 _ => {}
@@ -860,6 +869,31 @@ impl Lowerer {
     fn lower_inc_dec_impl(&mut self, inner: &Expr, is_inc: bool, return_new: bool) -> Operand {
         if let Some(result) = self.try_lower_bitfield_inc_dec(inner, is_inc, return_new) {
             return result;
+        }
+
+        // C11 §6.5.2.4, §6.5.3.1: ++/-- on _Atomic variables perform atomic fetch-add/sub.
+        let inner_ct = self.expr_ctype(inner);
+        if inner_ct.is_atomic() && !inner_ct.is_complex() {
+            let ty = self.get_expr_type(inner);
+            if let Some(lv) = self.lower_lvalue(inner) {
+                let addr = self.lvalue_addr(&lv);
+                let old_val = self.emit_atomic_inc_dec(
+                    Operand::Value(addr),
+                    is_inc,
+                    ty,
+                    crate::ir::reexports::AtomicOrdering::SeqCst,
+                );
+                if return_new {
+                    // Pre-increment/decrement: return old_val ± 1
+                    let ir_op = if is_inc { IrBinOp::Add } else { IrBinOp::Sub };
+                    let one = Operand::Const(IrConst::from_i64(1, ty));
+                    let new_val = self.emit_binop_val(ir_op, Operand::Value(old_val), one, ty);
+                    return Operand::Value(new_val);
+                } else {
+                    // Post-increment/decrement: return old value
+                    return Operand::Value(old_val);
+                }
+            }
         }
 
         let ty = self.get_expr_type(inner);

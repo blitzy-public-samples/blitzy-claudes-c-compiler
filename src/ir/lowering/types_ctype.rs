@@ -54,6 +54,7 @@ impl Lowerer {
                             name: name.clone(),
                             fptr_params: None,
                             is_const: false,
+                            is_restrict: false,
                             vla_size_exprs: Vec::new(),
                             fptr_inner_ptr_depth: 0,
                         }
@@ -101,6 +102,7 @@ impl Lowerer {
                         name: name.clone(),
                         fptr_params: None,
                         is_const: false,
+                        is_restrict: false,
                         vla_size_exprs: Vec::new(),
                         fptr_inner_ptr_depth: 0,
                     }

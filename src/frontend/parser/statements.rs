@@ -406,6 +406,7 @@ impl Parser {
         Stmt::InlineAsm { template, outputs, inputs, clobbers, goto_labels }
     }
 
+    // grammar: asm-string-literal
     fn parse_asm_string(&mut self) -> String {
         let mut result = String::new();
         while let TokenKind::StringLiteral(ref s) = self.peek() {
@@ -415,6 +416,7 @@ impl Parser {
         result
     }
 
+    // grammar: asm-operands
     fn parse_asm_operands(&mut self) -> Vec<AsmOperand> {
         let mut operands = Vec::new();
         if matches!(self.peek(), TokenKind::Colon | TokenKind::RParen) {
@@ -430,6 +432,7 @@ impl Parser {
         operands
     }
 
+    // grammar: asm-operand
     fn parse_one_asm_operand(&mut self) -> AsmOperand {
         // Optional [name]
         let name = if matches!(self.peek(), TokenKind::LBracket) {
@@ -470,6 +473,7 @@ impl Parser {
         AsmOperand { name, constraint, expr }
     }
 
+    // grammar: asm-clobbers
     fn parse_asm_clobbers(&mut self) -> Vec<String> {
         let mut clobbers = Vec::new();
         if matches!(self.peek(), TokenKind::Colon | TokenKind::RParen) {
@@ -485,6 +489,7 @@ impl Parser {
         clobbers
     }
 
+    // grammar: asm-goto-labels
     /// Parse the goto labels section (fourth colon) of an asm goto statement.
     /// Labels are comma-separated identifiers: `asm goto("..." : : : : label1, label2)`
     fn parse_asm_goto_labels(&mut self) -> Vec<String> {

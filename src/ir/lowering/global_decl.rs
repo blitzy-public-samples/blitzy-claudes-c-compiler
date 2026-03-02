@@ -91,6 +91,10 @@ impl Lowerer {
                 continue;
             }
             let mut resolved_ctype = self.build_full_ctype(&decl.type_spec, &declarator.derived);
+            // Apply restrict qualifier when declared (e.g., `int * restrict p`).
+            if decl.is_restrict() && matches!(resolved_ctype, CType::Pointer(_, _)) {
+                resolved_ctype = resolved_ctype.with_restrict();
+            }
             if let Some(vs) = decl.resolve_vector_size(resolved_ctype.size()) {
                 resolved_ctype = CType::Vector(Box::new(resolved_ctype), vs);
             }

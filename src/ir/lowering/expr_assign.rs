@@ -9,6 +9,8 @@
 
 use crate::frontend::parser::ast::{BinOp, Expr};
 use crate::ir::reexports::{
+    AtomicOrdering,
+    AtomicRmwOp,
     Instruction,
     IrBinOp,
     IrConst,
@@ -74,7 +76,19 @@ impl Lowerer {
         };
 
         if let Some(lv) = lv {
-            self.store_lvalue_typed(&lv, rhs_val, lhs_ty);
+            // C11 §6.5.16.1: Assignment to an _Atomic-qualified variable performs
+            // an atomic store with sequential consistency ordering.
+            if lhs_ct.is_atomic() {
+                let addr = self.lvalue_addr(&lv);
+                self.emit_atomic_store(
+                    Operand::Value(addr),
+                    rhs_val,
+                    lhs_ty,
+                    crate::ir::reexports::AtomicOrdering::SeqCst,
+                );
+            } else {
+                self.store_lvalue_typed(&lv, rhs_val, lhs_ty);
+            }
             return rhs_val;
         }
         rhs_val
@@ -426,8 +440,35 @@ impl Lowerer {
     // -----------------------------------------------------------------------
 
     pub(super) fn lower_compound_assign(&mut self, op: &BinOp, lhs: &Expr, rhs: &Expr) -> Operand {
-        // Vector compound assignment (element-wise)
+        // C11 §6.5.16.2: Compound assignment on _Atomic-qualified scalar variables
+        // is performed as an atomic read-modify-write operation. This must be checked
+        // before other dispatch paths to ensure atomic semantics are used.
         let lhs_ct = self.expr_ctype(lhs);
+        if lhs_ct.is_atomic() && !lhs_ct.is_complex() && !lhs_ct.is_vector() {
+            if let Some(rmw_op) = Self::binop_to_atomic_rmw(op) {
+                let lhs_ty = self.get_expr_type(lhs);
+                let rhs_val = self.lower_expr(rhs);
+                let rhs_ty = self.get_expr_type(rhs);
+                let rhs_cast = self.emit_implicit_cast(rhs_val, rhs_ty, lhs_ty);
+                if let Some(lv) = self.lower_lvalue(lhs) {
+                    let addr = self.lvalue_addr(&lv);
+                    let old_val = self.emit_atomic_compound_assign(
+                        Operand::Value(addr),
+                        rhs_cast,
+                        rmw_op,
+                        lhs_ty,
+                        AtomicOrdering::SeqCst,
+                    );
+                    // Compound assignment expression yields the NEW value (old + rhs).
+                    let ir_op = Self::binop_to_ir(*op, lhs_ct.strip_atomic().is_unsigned());
+                    let new_val = self.emit_binop_val(ir_op, Operand::Value(old_val), rhs_cast, lhs_ty);
+                    return Operand::Value(new_val);
+                }
+                return rhs_cast;
+            }
+        }
+
+        // Vector compound assignment (element-wise)
         if lhs_ct.is_vector() {
             return self.lower_vector_compound_assign(op, lhs, rhs, &lhs_ct);
         }
@@ -450,6 +491,20 @@ impl Lowerer {
 
         // Standard scalar compound assignment
         self.lower_scalar_compound_assign(op, lhs, rhs)
+    }
+
+    /// Map a C binary operator to the corresponding `AtomicRmwOp`, if applicable.
+    /// Returns `None` for operators that don't map to atomic RMW operations
+    /// (e.g., multiplication, division — these require CAS loops, not single RMW).
+    fn binop_to_atomic_rmw(op: &BinOp) -> Option<AtomicRmwOp> {
+        match op {
+            BinOp::Add => Some(AtomicRmwOp::Add),
+            BinOp::Sub => Some(AtomicRmwOp::Sub),
+            BinOp::BitAnd => Some(AtomicRmwOp::And),
+            BinOp::BitOr => Some(AtomicRmwOp::Or),
+            BinOp::BitXor => Some(AtomicRmwOp::Xor),
+            _ => None, // Mul, Div, Mod, Shl, Shr require CAS loops
+        }
     }
 
     /// Complex compound assignment (z += w, z -= w, z *= w, z /= w).

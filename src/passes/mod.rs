@@ -299,6 +299,22 @@ pub(crate) fn run_passes(module: &mut IrModule, opt_level: OptLevel, target: cra
         return;
     }
 
+    // _Noreturn dead code elimination: run before other passes at O1+ tiers.
+    // Removes unreachable instructions after calls to _Noreturn functions
+    // (exit, abort, _exit, __builtin_abort, __builtin_unreachable, longjmp, etc.).
+    // This reduces work for subsequent passes and ensures DCE doesn't miss
+    // code that is statically unreachable due to _Noreturn semantics.
+    {
+        let noreturn_funcs = collect_noreturn_functions(module);
+        if !noreturn_funcs.is_empty() {
+            for func in &mut module.functions {
+                if !func.is_declaration {
+                    dce::eliminate_noreturn_dead_code(func, &noreturn_funcs);
+                }
+            }
+        }
+    }
+
     // -O1: Minimal optimization — mem2reg + constfold + copyprop + dce.
     // No inlining, no GVN/LICM, no simplify, no CFG simplification.
     if opt_level == OptLevel::O1 {
@@ -608,4 +624,49 @@ pub(crate) fn run_passes(module: &mut IrModule, opt_level: OptLevel, target: cra
     // (e.g., kernel's `___siphash_aligned` calling `__siphash_aligned` which doesn't
     // exist on x86 where CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS is set).
     dead_statics::eliminate_dead_static_functions(module);
+}
+
+/// Collect the set of function names known to be `_Noreturn` (C11) or `__attribute__((noreturn))`.
+///
+/// This includes:
+/// - Well-known C library functions that never return (exit, abort, _exit, etc.)
+/// - Functions in the module whose blocks end with `Terminator::Unreachable` after a call,
+///   indicating the lowering phase marked them as noreturn.
+///
+/// The returned set is used by `eliminate_noreturn_dead_code` to remove dead instructions
+/// after calls to these functions.
+fn collect_noreturn_functions(module: &IrModule) -> std::collections::HashSet<String> {
+    let mut noreturn_funcs = std::collections::HashSet::new();
+
+    // Well-known C library noreturn functions
+    for name in &[
+        "exit", "_exit", "_Exit", "abort", "__builtin_abort",
+        "__builtin_unreachable", "longjmp", "__longjmp", "siglongjmp",
+        "__assert_fail", "__assert_rtn", "__stack_chk_fail",
+        "pthread_exit", "thrd_exit", "__cxa_throw",
+        "err", "errx", "verr", "verrx",
+    ] {
+        noreturn_funcs.insert(name.to_string());
+    }
+
+    // Scan module functions: if a function's only block has Unreachable terminator
+    // and is a declaration (extern), it's likely a noreturn function.
+    // Also detect functions whose all paths end with Unreachable.
+    // Scan module functions: if a non-declaration function has no Return terminators
+    // and at least one Unreachable terminator, it's a noreturn function.
+    for func in &module.functions {
+        if func.is_declaration || func.blocks.is_empty() {
+            continue;
+        }
+        let has_any_return = func.blocks.iter().any(|b| {
+            matches!(b.terminator, crate::ir::reexports::Terminator::Return(_))
+        });
+        if !has_any_return && func.blocks.iter().any(|b| {
+            matches!(b.terminator, crate::ir::reexports::Terminator::Unreachable)
+        }) {
+            noreturn_funcs.insert(func.name.clone());
+        }
+    }
+
+    noreturn_funcs
 }

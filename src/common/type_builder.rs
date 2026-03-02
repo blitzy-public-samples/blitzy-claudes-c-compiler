@@ -186,7 +186,12 @@ fn convert_param_decls_to_ctypes(
     params
         .iter()
         .map(|p| {
-            let ty = ctx.resolve_type_spec_to_ctype(&p.type_spec);
+            let mut ty = ctx.resolve_type_spec_to_ctype(&p.type_spec);
+            // Apply restrict qualifier to pointer-typed parameters when declared
+            // with the `restrict` keyword (e.g., `void foo(int * restrict p)`).
+            if p.is_restrict && matches!(ty, CType::Pointer(_, _)) {
+                ty = ty.with_restrict();
+            }
             (ty, p.name.clone())
         })
         .collect()

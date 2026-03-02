@@ -114,6 +114,8 @@ pub(super) mod parsed_attr_flag {
     pub const COLD: u32              = 1 << 25;
     /// `__attribute__((hot))` encountered — function is likely to be called frequently.
     pub const HOT: u32               = 1 << 26;
+    /// `restrict` type qualifier encountered on a pointer declarator.
+    pub const RESTRICT: u32          = 1 << 27;
 }
 
 /// Accumulated storage-class specifiers, type qualifiers, and GCC attributes
@@ -232,6 +234,9 @@ impl ParsedDeclAttrs {
     #[inline] pub fn set_const_attr(&mut self, v: bool)      { self.set_flag(parsed_attr_flag::CONST_ATTR, v) }
     #[inline] pub fn set_cold(&mut self, v: bool)            { self.set_flag(parsed_attr_flag::COLD, v) }
     #[inline] pub fn set_hot(&mut self, v: bool)             { self.set_flag(parsed_attr_flag::HOT, v) }
+    #[inline] pub fn set_restrict(&mut self, v: bool)        { self.set_flag(parsed_attr_flag::RESTRICT, v) }
+
+    #[inline] pub fn is_restrict(&self) -> bool              { self.flags & parsed_attr_flag::RESTRICT != 0 }
 
     #[inline]
     fn set_flag(&mut self, mask: u32, v: bool) {
@@ -459,8 +464,15 @@ impl Parser {
                 if !matches!(self.peek(), TokenKind::Semicolon | TokenKind::Eof) {
                     let span = self.peek_span();
                     self.emit_error(format!("expected declaration before {}", self.peek()), span);
+                    // Use synchronization-based error recovery to skip past the
+                    // malformed tokens and resume parsing at the next plausible
+                    // declaration or statement boundary. This enables multi-error
+                    // reporting (up to MAX_ERRORS diagnostics per translation unit)
+                    // instead of aborting on the first error.
+                    self.synchronize();
+                } else {
+                    self.advance();
                 }
-                self.advance();
             }
         }
         TranslationUnit { decls }
@@ -669,8 +681,12 @@ impl Parser {
     pub(super) fn skip_cv_qualifiers(&mut self) {
         loop {
             match self.peek() {
-                TokenKind::Const | TokenKind::Restrict => {
+                TokenKind::Const => {
                     self.advance();
+                }
+                TokenKind::Restrict => {
+                    self.advance();
+                    self.attrs.set_restrict(true);
                 }
                 TokenKind::Volatile => {
                     self.advance();
@@ -944,6 +960,7 @@ impl Parser {
         }
     }
 
+    // grammar: attribute-arguments (string-literal variant)
     /// Parse a parenthesized string argument: ("string1" "string2"...).
     /// Returns Some(concatenated) if non-empty, None otherwise.
     fn parse_string_attr_arg(&mut self) -> Option<String> {
@@ -958,6 +975,7 @@ impl Parser {
         if result.is_empty() { None } else { Some(result) }
     }
 
+    // grammar: attribute — format(archetype, string_index, first_to_check)
     /// Parse `format(archetype, string_index, first_to_check)` attribute arguments.
     /// Archetype is an identifier like "printf", "scanf", "strftime", "strfmon",
     /// or their double-underscore-wrapped forms (e.g., "__printf__").
@@ -997,24 +1015,52 @@ impl Parser {
         self.attrs.parsing_format = Some((archetype, string_index, first_to_check));
     }
 
+    // grammar: attribute-arguments (integer constant sub-parse for format attribute)
     /// Parse an integer argument from a format attribute parameter position.
     /// Handles `IntLiteral`, `UIntLiteral`, and `LongLiteral` token kinds.
+    /// Returns 0 if the value is negative or exceeds `u32::MAX`, emitting a
+    /// warning for out-of-range values.
     fn parse_format_int_arg(&mut self) -> u32 {
+        let span = self.peek_span();
         match self.peek() {
             TokenKind::IntLiteral(v) => {
-                let val = *v as u32;
+                let v64 = *v;
                 self.advance();
-                val
+                if v64 < 0 || v64 > u32::MAX as i64 {
+                    self.diagnostics.warning_with_kind(
+                        "format attribute argument out of range",
+                        span,
+                        WarningKind::Attributes,
+                    );
+                    return 0;
+                }
+                v64 as u32
             }
             TokenKind::UIntLiteral(v) => {
-                let val = *v as u32;
+                let v64 = *v;
                 self.advance();
-                val
+                if v64 > u32::MAX as u64 {
+                    self.diagnostics.warning_with_kind(
+                        "format attribute argument out of range",
+                        span,
+                        WarningKind::Attributes,
+                    );
+                    return 0;
+                }
+                v64 as u32
             }
             TokenKind::LongLiteral(v) => {
-                let val = *v as u32;
+                let v64 = *v;
                 self.advance();
-                val
+                if v64 < 0 || v64 > u32::MAX as i64 {
+                    self.diagnostics.warning_with_kind(
+                        "format attribute argument out of range",
+                        span,
+                        WarningKind::Attributes,
+                    );
+                    return 0;
+                }
+                v64 as u32
             }
             _ => 0,
         }
@@ -1030,6 +1076,7 @@ impl Parser {
         if matches!(self.peek(), TokenKind::RParen) { self.advance(); }
     }
 
+    // grammar: attribute — cleanup(function-name)
     /// Parse cleanup(func_name) attribute.
     fn parse_cleanup_attr(&mut self) {
         if !matches!(self.peek(), TokenKind::LParen) { return; }
@@ -1041,6 +1088,7 @@ impl Parser {
         if matches!(self.peek(), TokenKind::RParen) { self.advance(); }
     }
 
+    // grammar: attribute — mode(mode-name)
     /// Parse mode(QI|HI|SI|DI|TI|word|pointer) attribute.
     fn parse_mode_attr(&mut self, mode_kind: &mut Option<ModeKind>) {
         if !matches!(self.peek(), TokenKind::LParen) { return; }
@@ -1070,6 +1118,7 @@ impl Parser {
         if matches!(self.peek(), TokenKind::RParen) { self.advance(); }
     }
 
+    // grammar: attribute — vector_size(constant-expression)
     /// Parse vector_size(expr) attribute.
     fn parse_vector_size_attr(&mut self) {
         if !matches!(self.peek(), TokenKind::LParen) { return; }
@@ -1083,6 +1132,7 @@ impl Parser {
         if matches!(self.peek(), TokenKind::RParen) { self.advance(); }
     }
 
+    // grammar: attribute — ext_vector_type(constant-expression)
     /// Parse ext_vector_type(N) attribute (Clang-style vector type).
     /// Stores the element count N; the total size is computed in lowering as N * sizeof(elem).
     fn parse_ext_vector_type_attr(&mut self) {
@@ -1097,6 +1147,7 @@ impl Parser {
         if matches!(self.peek(), TokenKind::RParen) { self.advance(); }
     }
 
+    // grammar: attribute — address_space(address-space-name)
     /// Parse address_space(__seg_gs|__seg_fs) attribute.
     fn parse_address_space_attr(&mut self) {
         if !matches!(self.peek(), TokenKind::LParen) { return; }
@@ -1116,6 +1167,7 @@ impl Parser {
         (mk, aligned, asm_reg)
     }
 
+    // grammar: gcc-attribute-specifier / top-level-asm (post-declarator position)
     /// Parse __asm__("..."), __attribute__(...), and __extension__ after declarators.
     /// Returns (is_constructor, is_destructor, mode_kind, is_common, aligned_value, asm_register).
     /// The asm_register captures the register name from `register var __asm__("regname")`.
@@ -1324,6 +1376,7 @@ impl Parser {
     }
 
     /// Parse the parenthesized argument of `aligned(expr)` in __attribute__.
+    // grammar: alignment-specifier (aligned attribute constant-expression variant)
     /// Expects the opening `(` to be the current token (not yet consumed).
     /// Parses and evaluates a constant expression, consuming through the closing `)`.
     /// Returns Some(alignment) on success, None on failure.

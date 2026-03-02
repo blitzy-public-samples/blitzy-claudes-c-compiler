@@ -234,6 +234,9 @@ pub struct ParamDecl {
     /// Whether this parameter's base type has a `const` qualifier.
     /// Used by _Generic matching to distinguish e.g. `const int *` from `int *`.
     pub is_const: bool,
+    /// Whether this parameter has a `restrict` qualifier on its pointer type.
+    /// Used for alias analysis optimizations in GVN and LICM passes.
+    pub is_restrict: bool,
     /// VLA size expressions from the outermost array dimension that was decayed to pointer.
     /// E.g., for `void foo(int a, int b[a++])`, the expression `a++` is stored here
     /// so its side effects can be evaluated at function entry during IR lowering.
@@ -271,6 +274,8 @@ pub mod decl_flag {
     /// Used to implement C99 6.7.4p7: a function provides an external definition
     /// only if not ALL file-scope declarations include `inline`.
     pub const INLINE: u16            = 1 << 8;
+    /// `restrict` type qualifier on a pointer declaration.
+    pub const RESTRICT: u16          = 1 << 9;
 }
 
 /// A variable/type declaration.
@@ -320,6 +325,7 @@ impl Declaration {
     #[inline] pub fn is_thread_local(&self) -> bool       { self.flags & decl_flag::THREAD_LOCAL != 0 }
     #[inline] pub fn is_transparent_union(&self) -> bool  { self.flags & decl_flag::TRANSPARENT_UNION != 0 }
     #[inline] pub fn is_inline(&self) -> bool              { self.flags & decl_flag::INLINE != 0 }
+    #[inline] pub fn is_restrict(&self) -> bool            { self.flags & decl_flag::RESTRICT != 0 }
 
     // --- flag setters ---
 
@@ -332,6 +338,7 @@ impl Declaration {
     #[inline] pub fn set_thread_local(&mut self, v: bool)       { self.set_flag(decl_flag::THREAD_LOCAL, v) }
     #[inline] pub fn set_transparent_union(&mut self, v: bool)  { self.set_flag(decl_flag::TRANSPARENT_UNION, v) }
     #[inline] pub fn set_inline(&mut self, v: bool)             { self.set_flag(decl_flag::INLINE, v) }
+    #[inline] pub fn set_restrict(&mut self, v: bool)          { self.set_flag(decl_flag::RESTRICT, v) }
 
     #[inline]
     fn set_flag(&mut self, mask: u16, v: bool) {

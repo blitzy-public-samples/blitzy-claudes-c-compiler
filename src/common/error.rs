@@ -884,8 +884,10 @@ impl DiagnosticEngine {
             None => return,
         };
 
-        let source_line = match sm.get_source_line(span) {
-            Some(line) => line,
+        // Use get_source_line_and_column to retrieve both the source text and
+        // column position for caret diagnostics in a single call.
+        let (source_line, col_u32) = match sm.get_source_line_and_column(span) {
+            Some(pair) => pair,
             None => return,
         };
 
@@ -894,9 +896,7 @@ impl DiagnosticEngine {
             return;
         }
 
-        // Resolve the column for caret positioning
-        let loc = sm.resolve_span(span);
-        let col = loc.column as usize;
+        let col = col_u32 as usize;
 
         // Print the source line with indentation
         eprintln!(" {}", source_line);

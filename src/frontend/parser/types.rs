@@ -70,6 +70,7 @@ impl Parser {
                 }
                 TokenKind::Restrict => {
                     self.advance();
+                    self.attrs.set_restrict(true);
                 }
                 TokenKind::Register
                 | TokenKind::Auto => {
@@ -689,6 +690,7 @@ impl Parser {
         fields
     }
 
+    // grammar: struct-declarator-list
     /// Parse one or more declarators for a struct field using the general
     /// declarator parser. This correctly handles complex declarators like
     /// function pointers returning function pointers (e.g.,

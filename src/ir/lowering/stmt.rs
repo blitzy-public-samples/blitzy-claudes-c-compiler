@@ -206,6 +206,10 @@ impl Lowerer {
                 self.types.func_ptr_typedef_info.insert(declarator.name.clone(), fti);
             }
             let mut resolved_ctype = self.build_full_ctype(type_spec, &declarator.derived);
+            // Apply restrict qualifier when declared (e.g., `int * restrict p`).
+            if decl.is_restrict() && matches!(resolved_ctype, CType::Pointer(_, _)) {
+                resolved_ctype = resolved_ctype.with_restrict();
+            }
             if let Some(vs) = decl.resolve_vector_size(resolved_ctype.size()) {
                 resolved_ctype = CType::Vector(Box::new(resolved_ctype), vs);
             }
@@ -318,6 +322,18 @@ impl Lowerer {
         local_info.var.address_space = decl.address_space;
         if explicit_align > 0 {
             local_info.var.explicit_alignment = Some(explicit_align);
+        }
+        // When the declaration has a runtime VLA size, wrap the CType with
+        // CType::Vla to enable runtime sizeof evaluation and type-level VLA
+        // detection by downstream passes (GVN, LICM).
+        if vla_size.is_some() {
+            if let Some(ref ctype) = local_info.var.c_type {
+                let elem_ty = match ctype {
+                    CType::Array(elem, _) => (**elem).clone(),
+                    other => other.clone(),
+                };
+                local_info.var.c_type = Some(CType::Vla(Box::new(elem_ty)));
+            }
         }
         local_info.vla_size = vla_size;
         if vla_size.is_some() {

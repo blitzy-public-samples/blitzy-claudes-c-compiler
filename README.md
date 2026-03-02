@@ -161,8 +161,9 @@ The compiler implements the following C11 language features and enhancements:
 
 **C11 Language Features:**
 
-- **`_Atomic` qualifier**: Full type-system tracking with atomic
-  load/store/exchange/compare\_exchange/fetch\_add on all four architectures
+- **`_Atomic` qualifier**: Type-system tracking with atomic
+  load, store, compound assignment (fetch\_add/sub/and/or/xor), and
+  increment/decrement on all four architectures
   (x86-64: LOCK CMPXCHG/XADD/XCHG; AArch64: LDXR/STXR/CASP; RISC-V:
   LR/SC/AMO; i686: LOCK CMPXCHG8B)
 - **`_Generic` selection**: Compile-time type matching with exact type, compatible
