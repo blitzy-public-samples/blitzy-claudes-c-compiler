@@ -18,7 +18,7 @@ use crate::frontend::parser::Parser;
 use crate::frontend::sema::SemanticAnalyzer;
 use crate::ir::lowering::Lowerer;
 use crate::ir::mem2reg::{promote_allocas, eliminate_phis};
-use crate::passes::run_passes;
+use crate::passes::{run_passes, OptLevel};
 
 /// Compilation mode - determines where in the pipeline to stop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1108,22 +1108,27 @@ impl Driver {
 
         // Run optimization passes
         let t5 = std::time::Instant::now();
-        // Compute effective optimization tier for pass dispatch:
-        // -O0 → 0, -O1 → 1, -O2 → 2, -O3 → 3, -Os → 4, -Oz → 5
-        let effective_opt_tier = if self.optimize_size {
-            if self.size_opt_aggressive { 5u32 } else { 4u32 }
+        // Map driver state to the OptLevel enum for tiered pass dispatch:
+        // -O0 → O0, -O1 → O1, -O2 → O2, -O3 → O3, -Os → Os, -Oz → Oz
+        let opt = if self.optimize_size {
+            if self.size_opt_aggressive { OptLevel::Oz } else { OptLevel::Os }
         } else {
-            self.opt_level
+            match self.opt_level {
+                0 => OptLevel::O0,
+                1 => OptLevel::O1,
+                3 => OptLevel::O3,
+                _ => OptLevel::O2,
+            }
         };
         // Run mem2reg to promote stack allocas to SSA registers.
         // Skip at -O0 for fastest compile (no optimization passes at all).
-        if effective_opt_tier > 0 {
+        if opt != OptLevel::O0 {
             promote_allocas(&mut module);
         }
         if time_phases { eprintln!("[TIME] mem2reg: {:.3}s", t5.elapsed().as_secs_f64()); }
 
         let t6 = std::time::Instant::now();
-        run_passes(&mut module, effective_opt_tier, self.target);
+        run_passes(&mut module, opt, self.target);
         if time_phases { eprintln!("[TIME] opt passes: {:.3}s", t6.elapsed().as_secs_f64()); }
 
         // Lower SSA phi nodes to copies before codegen

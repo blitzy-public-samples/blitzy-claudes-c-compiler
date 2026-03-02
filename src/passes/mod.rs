@@ -1,13 +1,14 @@
 //! Optimization passes for the IR.
 //!
 //! This module contains various optimization passes that transform the IR
-//! to produce better code.
+//! to produce better code. The optimization pipeline supports six tiers:
 //!
-//! All optimization levels (-O0 through -O3, -Os, -Oz) run the same full set
-//! of passes. While the compiler is still maturing, having separate tiers
-//! creates hard-to-find bugs where code works at one level but breaks at
-//! another. We always run all passes to maximize test coverage of the
-//! optimizer and catch issues early.
+//! - `-O0`: No optimization. Skips ALL passes including mem2reg.
+//! - `-O1`: Basic optimization. Runs mem2reg, constant_fold, copy_prop, dce.
+//! - `-O2`: Full optimization (default). Complete pass pipeline.
+//! - `-O3`: Aggressive optimization. Full pipeline + loop unrolling + raised inlining.
+//! - `-Os`: Size-optimized. Full pipeline minus loop unrolling, 50% inlining budget.
+//! - `-Oz`: Minimal size. Full pipeline minus loop unrolling, inlining disabled.
 
 pub(crate) mod cfg_simplify;
 pub(crate) mod constant_fold;
@@ -29,6 +30,28 @@ pub(crate) mod simplify;
 
 use crate::ir::analysis::CfgAnalysis;
 use crate::ir::reexports::{IrFunction, IrModule};
+
+/// Optimization level controlling which passes run and how aggressively.
+///
+/// Each tier defines a distinct pass configuration. The `O2` tier preserves
+/// the historical full-pipeline behavior; other tiers are strictly additive
+/// (O3) or reductive (O0, O1, Os, Oz) relative to O2.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum OptLevel {
+    /// -O0: No optimization. Skips ALL passes including mem2reg.
+    /// `CCC_TIME_PASSES` reports zero passes executed.
+    O0,
+    /// -O1: Basic optimization. Runs mem2reg + constant_fold + copy_prop + dce only.
+    O1,
+    /// -O2: Full optimization (default). Runs the complete pass pipeline.
+    O2,
+    /// -O3: Aggressive optimization. Full pipeline + loop unrolling + raised inlining (150%).
+    O3,
+    /// -Os: Size-optimized. Full pipeline minus loop unrolling, reduced inlining (50%).
+    Os,
+    /// -Oz: Minimal size. Full pipeline minus loop unrolling, inlining disabled.
+    Oz,
+}
 
 /// Run a per-function pass only on functions in the visit set.
 ///
@@ -212,18 +235,28 @@ impl DisabledPasses {
 }
 
 /// Run Phase 0: function inlining and post-inline optimization passes.
-fn run_inline_phase(module: &mut IrModule, disabled: &str) {
-    if disabled.contains("inline") {
-        return;
+///
+/// `inline_config` controls inlining thresholds (budget scaling per opt level).
+/// `skip_inline` disables the inlining pass entirely (used at -Oz), but the
+/// post-inline cleanup passes still run to handle gnu_inline conversion and
+/// basic optimization of the unoptimized IR.
+fn run_inline_phase(
+    module: &mut IrModule,
+    disabled: &str,
+    inline_config: inline::InlineConfig,
+    skip_inline: bool,
+) {
+    if !disabled.contains("inline") && !skip_inline {
+        inline::run(module, inline_config);
     }
-    inline::run(module, inline::InlineConfig::default_o2());
 
-    // After inlining, convert extern inline gnu_inline functions to declarations.
-    // These function bodies were only needed for inlining; they must not be emitted
-    // as standalone definitions because their internal calls (e.g., `call btowc`)
-    // would resolve to the local definition instead of the external library symbol,
-    // causing infinite recursion. Converting to declarations ensures any remaining
-    // (non-inlined) calls resolve to the external symbol at link time.
+    // Always convert extern inline gnu_inline functions to declarations, even if
+    // inlining was skipped. These function bodies were only needed for inlining;
+    // they must not be emitted as standalone definitions because their internal
+    // calls (e.g., `call btowc`) would resolve to the local definition instead
+    // of the external library symbol, causing infinite recursion. Converting to
+    // declarations ensures any remaining (non-inlined) calls resolve to the
+    // external symbol at link time.
     for func in &mut module.functions {
         if func.is_gnu_inline_def && !func.is_declaration {
             func.is_declaration = true;
@@ -240,40 +273,56 @@ fn run_inline_phase(module: &mut IrModule, disabled: &str) {
     resolve_asm::resolve_inline_asm_symbols(module);
 }
 
-/// All optimization levels run the same pipeline with the same number of
-/// iterations. The `opt_level` parameter is accepted for API compatibility
-/// but currently ignored -- all levels behave identically.
+/// Run the optimization pass pipeline at the specified optimization level.
 ///
-/// **Why single-level optimization matters for this project:**
-///
-/// Having multiple optimization tiers (e.g., -O0 doing minimal work, -O1 doing
-/// partial work, -O2 doing full work) is exponentially harder to test. Each tier
-/// is a separate code path through the optimizer, and bugs that only appear at
-/// one level are extremely difficult to reproduce and diagnose. For a compiler
-/// that is still maturing and being validated against hundreds of real-world
-/// projects (Linux kernel, PostgreSQL, Redis, etc.), a single optimization level
-/// ensures that:
-///
-/// 1. Every test run exercises every optimization pass. A bug in GVN or LICM
-///    will be caught even when testing with `-O0`, rather than hiding until a
-///    user happens to compile with `-O2`.
-/// 2. The number of configurations to validate stays linear (N architectures)
-///    rather than quadratic (N architectures × M optimization levels).
-/// 3. Build system interactions are predictable — the same code is always
-///    generated regardless of which `-O` flag a project's Makefile passes.
+/// The `opt_level` parameter controls which passes run and how aggressively:
+/// - `O0`: Returns immediately — no passes, no mem2reg. `CCC_TIME_PASSES` reports zero.
+/// - `O1`: Runs mem2reg, constant_fold, copy_prop, and dce. No inlining or advanced passes.
+/// - `O2`: Full pipeline (default). Equivalent to the previous single-level behavior.
+/// - `O3`: Full pipeline + loop unrolling + raised inlining thresholds (150%).
+/// - `Os`: Full pipeline minus loop unrolling, inlining thresholds at 50%.
+/// - `Oz`: Full pipeline minus loop unrolling, inlining entirely disabled.
 ///
 /// The `optimize` and `optimize_size` booleans on the Driver still control the
 /// `__OPTIMIZE__` and `__OPTIMIZE_SIZE__` predefined macros, which build systems
 /// like the Linux kernel depend on (e.g., `BUILD_BUG()` uses `__OPTIMIZE__` to
-/// select between a noreturn function call and a no-op). The actual pass pipeline
-/// is unaffected by these flags.
-pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::backend::Target) {
+/// select between a noreturn function call and a no-op).
+pub(crate) fn run_passes(module: &mut IrModule, opt_level: OptLevel, target: crate::backend::Target) {
     let disabled = std::env::var("CCC_DISABLE_PASSES").unwrap_or_default();
     if disabled.contains("all") {
         return;
     }
 
-    run_inline_phase(module, &disabled);
+    // -O0: Skip ALL optimization passes. Return immediately.
+    // CCC_TIME_PASSES will report nothing because no passes execute.
+    if opt_level == OptLevel::O0 {
+        return;
+    }
+
+    // -O1: Minimal optimization — mem2reg + constfold + copyprop + dce.
+    // No inlining, no GVN/LICM, no simplify, no CFG simplification.
+    if opt_level == OptLevel::O1 {
+        crate::ir::mem2reg::promote_allocas_with_params(module);
+        constant_fold::run(module);
+        copy_prop::run(module);
+        // Run DCE on each non-declaration function
+        for func in &mut module.functions {
+            if !func.is_declaration {
+                dce::eliminate_dead_code(func);
+            }
+        }
+        return;
+    }
+
+    // Phase 0: Inlining and post-inline cleanup.
+    // At -Oz, inlining is disabled but post-inline cleanup still runs.
+    let skip_inline = opt_level == OptLevel::Oz;
+    let inline_config = match opt_level {
+        OptLevel::O3 => inline::InlineConfig::aggressive_o3(),
+        OptLevel::Os => inline::InlineConfig::size_optimized_os(),
+        _ => inline::InlineConfig::default_o2(),
+    };
+    run_inline_phase(module, &disabled, inline_config, skip_inline);
     constant_fold::resolve_remaining_is_constant(module);
 
     let iterations = 3;
@@ -427,6 +476,16 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
                 total_changes += ivsr_n;
                 total_changes_excl_dce += ivsr_n;
             }
+        }
+
+        // Phase 6b: Loop unrolling (only at -O3).
+        // Unrolls constant-bound loops with ≤32 iterations and ≤256 post-unroll
+        // instructions. Runs after LICM (which may hoist invariants out of loop
+        // bodies, reducing body size) and before if_convert.
+        if opt_level == OptLevel::O3 && !disabled.contains("loop_unroll") {
+            let n = timed_pass!("loop_unroll", run_on_visited(module, &dirty, &mut changed, loop_unroll::unroll_loops));
+            total_changes += n;
+            total_changes_excl_dce += n;
         }
 
         // Phase 7: If-conversion
