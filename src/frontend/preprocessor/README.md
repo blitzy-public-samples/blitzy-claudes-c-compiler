@@ -418,6 +418,9 @@ data or synthetic tokens injected into the output for the parser.
 Unrecognized pragmas (including `#pragma GCC diagnostic ...`) are silently
 ignored.
 
+The C99/C11 `_Pragma("...")` operator is fully supported: it is desugared to
+an equivalent `#pragma` directive per C11 §6.10.9 during macro expansion.
+
 ---
 
 ## Predefined Macros
@@ -665,8 +668,6 @@ the preprocessor.
   difference between 80-bit extended precision and IEEE binary128.
 - **`__has_feature` and `__has_extension` always return `0`** -- no Clang
   feature set is modeled.
-- **`_Pragma("...")` is fully supported** -- the C99/C11 `_Pragma` operator is
-  desugared to an equivalent `#pragma` directive per C11 §6.10.9 during macro expansion.
 - **No `#embed` support** -- the C23 `#embed` directive is not implemented.
 - **Trigraph support behind `-trigraphs` flag** -- trigraphs (`??=`, `??/`, etc.)
   are translated in the preprocessor phase when `-trigraphs` is passed. Digraphs

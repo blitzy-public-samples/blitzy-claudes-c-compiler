@@ -293,7 +293,7 @@ declarator = [ pointer ] direct-declarator
 
 (* The direct-declarator handles identifiers, parenthesized declarators,     *)
 (* array dimensions, and function parameter lists. C declarators follow the  *)
-(* "inside-out" rule: int (*fp)(int) means fp is a pointer to a function.    *)
+(* "inside-out" rule: int [*fp](int) means fp is a pointer to a function.   *)
 direct-declarator = identifier
                   | "(" { gcc-attribute-specifier } declarator ")"
                   | direct-declarator "[" [ array-size ] "]"

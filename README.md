@@ -256,7 +256,7 @@ and comparing stdout and the exit code against the expected files.
 src/                Compiler source code (Rust)
   frontend/         C source -> typed AST (preprocessor, lexer, parser, sema)
   ir/               Target-independent SSA IR (lowering, mem2reg)
-  passes/           SSA optimization passes (15 passes + shared loop analysis)
+  passes/           SSA optimization passes (16 passes + shared loop analysis)
   backend/          IR -> assembly -> machine code -> ELF (4 architectures)
   common/           Shared types, symbol table, diagnostics
   driver/           CLI parsing, pipeline orchestration
