@@ -284,6 +284,20 @@ pub fn link_builtin(
         section_order(&ms.name, ms.sh_flags)
     });
 
+    // ── Apply linker script section addresses to merged sections ────────
+    // When a linker script specifies SECTIONS { . = 0xADDR; .name : { } },
+    // set the vaddr of the corresponding merged section so the emitter uses
+    // the script-specified address instead of the default sequential layout.
+    if let Some(ref s) = script {
+        for sec_def in &s.sections {
+            if let Some(addr) = sec_def.address {
+                if let Some(&si) = merged_map.get(&sec_def.name) {
+                    merged_sections[si].vaddr = addr;
+                }
+            }
+        }
+    }
+
     // ── Phase 4+: Emit executable ───────────────────────────────────────
 
     super::emit_exec::emit_executable(

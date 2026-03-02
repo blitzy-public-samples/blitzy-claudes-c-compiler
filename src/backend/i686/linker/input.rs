@@ -19,8 +19,13 @@ pub(super) fn parse_user_args(user_args: &[String]) -> (Vec<String>, Vec<String>
     let mut extra_lib_paths = Vec::new();
     let mut extra_objects = Vec::new();
     let mut defsym_defs: Vec<(String, String)> = Vec::new();
+    let mut skip_next = false;
 
     for arg in user_args {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
         if arg == "-nostdlib" || arg == "-shared" || arg == "-static" || arg == "-r" {
             continue;
         } else if let Some(libarg) = arg.strip_prefix("-l") {
@@ -62,6 +67,12 @@ pub(super) fn parse_user_args(user_args: &[String]) -> (Vec<String>, Vec<String>
                 }
                 j += 1;
             }
+        } else if arg == "-T" {
+            // Skip -T and its next argument (linker script path).
+            // Handled by extract_linker_script_path in link.rs.
+            skip_next = true;
+        } else if arg.starts_with("-T") {
+            // -Tpath form: skip entirely.
         } else if !arg.starts_with('-') && Path::new(arg.as_str()).exists() {
             extra_objects.push(arg.clone());
         }

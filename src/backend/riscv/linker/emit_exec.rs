@@ -120,9 +120,26 @@ pub fn emit_executable(
     let phdr_size = num_phdrs * 56u64;
     let headers_size = 64 + phdr_size;
 
+    // Pre-scan for linker script text address: if any executable section
+    // has a script-assigned vaddr, use it as the effective base address
+    // for the entire executable. This prevents a vaddr gap between the
+    // headers and the code sections that would create invalid non-writable
+    // BSS in the RX LOAD segment.
+    let effective_base: u64 = {
+        let mut min_addr: Option<u64> = None;
+        for ms in merged_sections.iter() {
+            if ms.vaddr != 0 && ms.sh_flags & SHF_ALLOC != 0 && ms.sh_flags & SHF_WRITE == 0 {
+                if min_addr.is_none() || ms.vaddr < min_addr.unwrap() {
+                    min_addr = Some(ms.vaddr);
+                }
+            }
+        }
+        min_addr.unwrap_or(BASE_ADDR)
+    };
+
     // Start laying out the RX segment
     let mut file_offset = headers_size;
-    let mut vaddr = BASE_ADDR + headers_size;
+    let mut vaddr = effective_base + headers_size;
 
     // Dynamic linking section addresses (only used when !is_static)
     let mut interp_offset = 0u64;
@@ -273,6 +290,25 @@ pub fn emit_executable(
     let mut section_vaddrs: Vec<u64> = vec![0; merged_sections.len()];
     let mut section_offsets: Vec<u64> = vec![0; merged_sections.len()];
 
+    // Linker script text address adjustment: if any RX section has a
+    // script-assigned virtual address (ms.vaddr != 0), use it as the
+    // effective base for the entire executable. This avoids creating a
+    // gap between BASE_ADDR and the script address in the RX LOAD
+    // segment (which would cause QEMU to reject the ELF due to
+    // non-writable BSS in the memsz > filesz region).
+    let text_script_base: Option<u64> = {
+        let mut min_addr: Option<u64> = None;
+        for &si in sec_indices {
+            let ms = &merged_sections[si];
+            if ms.vaddr != 0 && ms.sh_flags & SHF_ALLOC != 0 && ms.sh_flags & SHF_WRITE == 0 {
+                if min_addr.is_none() || ms.vaddr < min_addr.unwrap() {
+                    min_addr = Some(ms.vaddr);
+                }
+            }
+        }
+        min_addr
+    };
+
     for &si in sec_indices {
         let ms = &merged_sections[si];
         if ms.sh_flags & SHF_ALLOC == 0 { continue; }
@@ -297,6 +333,25 @@ pub fn emit_executable(
     vaddr = align_up(vaddr, PAGE_SIZE);
     if (vaddr % PAGE_SIZE) != (file_offset % PAGE_SIZE) {
         vaddr = align_up(vaddr, PAGE_SIZE) + (file_offset % PAGE_SIZE);
+    }
+
+    // Linker script RW address adjustment: if any writable data section has
+    // a script-assigned address (ms.vaddr != 0), shift the RW segment's
+    // virtual address to start at that address.
+    let rw_script_base: Option<u64> = {
+        let mut min_addr: Option<u64> = None;
+        for &si in sec_indices {
+            let ms = &merged_sections[si];
+            if ms.vaddr != 0 && ms.sh_flags & SHF_ALLOC != 0 && ms.sh_flags & SHF_WRITE != 0 {
+                if min_addr.is_none() || ms.vaddr < min_addr.unwrap() {
+                    min_addr = Some(ms.vaddr);
+                }
+            }
+        }
+        min_addr
+    };
+    if let Some(rw_base) = rw_script_base {
+        vaddr = rw_base;
     }
 
     let rw_segment_start_vaddr = vaddr;
@@ -526,7 +581,7 @@ pub fn emit_executable(
     let preinit_end = init_array_vaddrs.get(".preinit_array").map(|&(v, s)| v + s).unwrap_or(0);
 
     let linker_addrs = LinkerSymbolAddresses {
-        base_addr: BASE_ADDR,
+        base_addr: effective_base,
         got_addr: got_plt_vaddr,
         dynamic_addr: dynamic_vaddr,
         bss_addr: bss_vaddr,
@@ -795,7 +850,7 @@ pub fn emit_executable(
     } else if let Some(gs) = global_syms.get("main") {
         gs.value
     } else {
-        merged_map.get(".text").map(|&i| section_vaddrs[i]).unwrap_or(BASE_ADDR)
+        merged_map.get(".text").map(|&i| section_vaddrs[i]).unwrap_or(effective_base)
     };
 
     // ── Phase 13: .riscv.attributes data ────────────────────────────────
@@ -823,15 +878,15 @@ pub fn emit_executable(
     assert_eq!(elf.len(), 64);
 
     let rx_filesz = rx_segment_end_offset;
-    let rx_memsz = rx_segment_end_vaddr - BASE_ADDR;
+    let rx_memsz = rx_segment_end_vaddr - effective_base;
 
     if !is_static {
-        write_phdr(&mut elf, 6 /* PT_PHDR */, PF_R, 64, BASE_ADDR + 64, BASE_ADDR + 64, phdr_size, phdr_size, 8);
+        write_phdr(&mut elf, 6 /* PT_PHDR */, PF_R, 64, effective_base + 64, effective_base + 64, phdr_size, phdr_size, 8);
         write_phdr(&mut elf, PT_INTERP, PF_R, interp_offset, interp_vaddr, interp_vaddr, interp_size, interp_size, 1);
     }
 
     write_phdr(&mut elf, PT_RISCV_ATTRIBUTES, PF_R, riscv_attr_offset, 0, 0, riscv_attr_size, riscv_attr_size, 1);
-    write_phdr(&mut elf, PT_LOAD, PF_R | PF_X, 0, BASE_ADDR, BASE_ADDR, rx_filesz, rx_memsz, PAGE_SIZE);
+    write_phdr(&mut elf, PT_LOAD, PF_R | PF_X, 0, effective_base, effective_base, rx_filesz, rx_memsz, PAGE_SIZE);
     write_phdr(&mut elf, PT_LOAD, PF_R | PF_W, rw_segment_start_offset, rw_segment_start_vaddr, rw_segment_start_vaddr, rw_segment_filesz, rw_segment_memsz, PAGE_SIZE);
 
     if !is_static {

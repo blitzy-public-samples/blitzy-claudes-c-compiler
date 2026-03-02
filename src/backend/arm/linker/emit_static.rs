@@ -36,26 +36,81 @@ pub(super) fn emit_executable(
 
     // === Layout: RX segment (starts at file offset 0, vaddr BASE_ADDR) ===
     let mut offset = 64 + phdr_total_size; // After ELF header + phdrs
+    let text_page_offset = offset;
+
+    // Linker script text address adjustment: if a linker script assigned an
+    // explicit virtual address to any executable section, shift the entire
+    // text segment's virtual addresses to start at that address.
+    let text_script_base: Option<u64> = {
+        let mut min_addr: Option<u64> = None;
+        for sec in output_sections.iter() {
+            if sec.addr != 0 && sec.flags & SHF_EXECINSTR != 0 && sec.flags & SHF_ALLOC != 0 {
+                if min_addr.is_none() || sec.addr < min_addr.unwrap() {
+                    min_addr = Some(sec.addr);
+                }
+            }
+        }
+        min_addr
+    };
+    // Clear script-assigned addresses so the sequential layout below works.
+    for sec in output_sections.iter_mut() {
+        if sec.flags & SHF_EXECINSTR != 0 && sec.flags & SHF_ALLOC != 0 {
+            sec.addr = 0;
+        }
+    }
+    let default_text_vaddr = BASE_ADDR + text_page_offset;
+    let text_vaddr_base: u64 = match text_script_base {
+        Some(addr) if addr >= BASE_ADDR + PAGE_SIZE => addr,
+        Some(_) => default_text_vaddr,
+        None => default_text_vaddr,
+    };
 
     // Text sections (executable)
     for sec in output_sections.iter_mut() {
         if sec.flags & SHF_EXECINSTR != 0 && sec.flags & SHF_ALLOC != 0 {
             let a = sec.alignment.max(4);
             offset = (offset + a - 1) & !(a - 1);
-            sec.addr = BASE_ADDR + offset;
+            sec.addr = text_vaddr_base + (offset - text_page_offset);
             sec.file_offset = offset;
             offset += sec.mem_size;
         }
     }
 
     // Rodata sections (read-only, in same RX segment)
+    // Linker script rodata address adjustment: check for script-assigned addresses.
+    let rodata_script_base: Option<u64> = {
+        let mut min_addr: Option<u64> = None;
+        for sec in output_sections.iter() {
+            if sec.addr != 0 && sec.flags & SHF_ALLOC != 0
+                && sec.flags & SHF_EXECINSTR == 0
+                && sec.flags & SHF_WRITE == 0
+                && sec.sh_type != SHT_NOBITS
+                && sec.flags & SHF_TLS == 0
+            {
+                if min_addr.is_none() || sec.addr < min_addr.unwrap() {
+                    min_addr = Some(sec.addr);
+                }
+            }
+        }
+        min_addr
+    };
+    for sec in output_sections.iter_mut() {
+        if sec.flags & SHF_ALLOC != 0 && sec.flags & SHF_EXECINSTR == 0 &&
+           sec.flags & SHF_WRITE == 0 && sec.sh_type != SHT_NOBITS &&
+           sec.flags & SHF_TLS == 0 {
+            sec.addr = 0;
+        }
+    }
+    let rodata_vaddr_base: u64 = rodata_script_base.unwrap_or(text_vaddr_base + (offset - text_page_offset));
+    let rodata_start_offset = offset;
+
     for sec in output_sections.iter_mut() {
         if sec.flags & SHF_ALLOC != 0 && sec.flags & SHF_EXECINSTR == 0 &&
            sec.flags & SHF_WRITE == 0 && sec.sh_type != SHT_NOBITS &&
            sec.flags & SHF_TLS == 0 {
             let a = sec.alignment.max(1);
             offset = (offset + a - 1) & !(a - 1);
-            sec.addr = BASE_ADDR + offset;
+            sec.addr = rodata_vaddr_base + (offset - rodata_start_offset);
             sec.file_offset = offset;
             if debug_layout {
                 eprintln!("  LAYOUT RO: {} addr=0x{:x} foff=0x{:x} sz=0x{:x} flags=0x{:x}",
@@ -93,7 +148,7 @@ pub(super) fn emit_executable(
         // Align to 4 bytes
         offset = (offset + 3) & !3;
         eh_frame_hdr_offset = offset;
-        eh_frame_hdr_vaddr = BASE_ADDR + offset;
+        eh_frame_hdr_vaddr = text_vaddr_base + (offset - text_page_offset);
         offset += eh_frame_hdr_size;
         if debug_layout {
             eprintln!("  LAYOUT EH_FRAME_HDR: addr=0x{:x} foff=0x{:x} sz=0x{:x} fde_count={}",
@@ -125,7 +180,29 @@ pub(super) fn emit_executable(
     // === Layout: RW segment (page-aligned) ===
     offset = (offset + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
     let rw_page_offset = offset;
-    let rw_page_addr = BASE_ADDR + offset;
+
+    // Linker script RW address adjustment: if a linker script assigned an
+    // explicit virtual address to any writable data section, use it as the
+    // base for the RW segment.
+    let rw_script_base: Option<u64> = {
+        let mut min_addr: Option<u64> = None;
+        for sec in output_sections.iter() {
+            if sec.addr != 0 && sec.flags & SHF_ALLOC != 0 && sec.flags & SHF_WRITE != 0 {
+                if min_addr.is_none() || sec.addr < min_addr.unwrap() {
+                    min_addr = Some(sec.addr);
+                }
+            }
+        }
+        min_addr
+    };
+    // Clear script addresses so sequential layout works.
+    for sec in output_sections.iter_mut() {
+        if sec.flags & SHF_ALLOC != 0 && sec.flags & SHF_WRITE != 0 {
+            sec.addr = 0;
+        }
+    }
+    let rw_vaddr_base: u64 = rw_script_base.unwrap_or(BASE_ADDR + rw_page_offset);
+    let rw_page_addr = rw_vaddr_base;
 
     // TLS data (.tdata) first in RW
     let mut tls_addr = 0u64;
@@ -137,7 +214,7 @@ pub(super) fn emit_executable(
         if sec.flags & SHF_TLS != 0 && sec.flags & SHF_ALLOC != 0 && sec.sh_type != SHT_NOBITS {
             let a = sec.alignment.max(1);
             offset = (offset + a - 1) & !(a - 1);
-            sec.addr = BASE_ADDR + offset;
+            sec.addr = rw_vaddr_base + (offset - rw_page_offset);
             sec.file_offset = offset;
             if tls_addr == 0 { tls_addr = sec.addr; tls_file_offset = offset; tls_align = a; }
             tls_file_size += sec.mem_size;
@@ -152,7 +229,7 @@ pub(super) fn emit_executable(
     // If only .tbss (NOBITS TLS) exists with no .tdata, we still need a TLS segment.
     // Set tls_addr/tls_file_offset to the current position so TPOFF calculations work.
     if tls_addr == 0 && has_tls {
-        tls_addr = BASE_ADDR + offset;
+        tls_addr = rw_vaddr_base + (offset - rw_page_offset);
         tls_file_offset = offset;
     }
     // TLS BSS (.tbss) - doesn't consume file space
@@ -179,7 +256,7 @@ pub(super) fn emit_executable(
         if sec.name == ".init_array" {
             let a = sec.alignment.max(8);
             offset = (offset + a - 1) & !(a - 1);
-            sec.addr = BASE_ADDR + offset;
+            sec.addr = rw_vaddr_base + (offset - rw_page_offset);
             sec.file_offset = offset;
             offset += sec.mem_size;
             break;
@@ -190,7 +267,7 @@ pub(super) fn emit_executable(
         if sec.name == ".fini_array" {
             let a = sec.alignment.max(8);
             offset = (offset + a - 1) & !(a - 1);
-            sec.addr = BASE_ADDR + offset;
+            sec.addr = rw_vaddr_base + (offset - rw_page_offset);
             sec.file_offset = offset;
             offset += sec.mem_size;
             break;
@@ -202,7 +279,7 @@ pub(super) fn emit_executable(
         if sec.name == ".data.rel.ro" {
             let a = sec.alignment.max(1);
             offset = (offset + a - 1) & !(a - 1);
-            sec.addr = BASE_ADDR + offset;
+            sec.addr = rw_vaddr_base + (offset - rw_page_offset);
             sec.file_offset = offset;
             if debug_layout {
                 eprintln!("  LAYOUT RW: {} addr=0x{:x} foff=0x{:x} sz=0x{:x} flags=0x{:x}",
@@ -219,7 +296,7 @@ pub(super) fn emit_executable(
            sec.name != ".data.rel.ro" {
             let a = sec.alignment.max(1);
             offset = (offset + a - 1) & !(a - 1);
-            sec.addr = BASE_ADDR + offset;
+            sec.addr = rw_vaddr_base + (offset - rw_page_offset);
             sec.file_offset = offset;
             if debug_layout {
                 eprintln!("  LAYOUT RW: {} addr=0x{:x} foff=0x{:x} sz=0x{:x} flags=0x{:x}",
@@ -235,7 +312,7 @@ pub(super) fn emit_executable(
     let got_size = got_syms.len() as u64 * 8;
     offset = (offset + 7) & !7; // 8-byte align
     let got_offset = offset;
-    let got_addr = BASE_ADDR + offset;
+    let got_addr = rw_vaddr_base + (offset - rw_page_offset);
     let mut got_entries = HashMap::new();
     for (idx, (key, _kind)) in got_syms.iter().enumerate() {
         got_entries.insert(key.clone(), idx);
@@ -257,7 +334,7 @@ pub(super) fn emit_executable(
     let iplt_got_size = iplt_got_count as u64 * 8;
     offset = (offset + 7) & !7;
     let iplt_got_offset = offset;
-    let iplt_got_addr = BASE_ADDR + offset;
+    let iplt_got_addr = rw_vaddr_base + (offset - rw_page_offset);
     offset += iplt_got_size;
 
     // IRELATIVE relocation entries (.rela.iplt) in the RW segment
@@ -265,14 +342,14 @@ pub(super) fn emit_executable(
     let rela_iplt_size = iplt_got_count as u64 * 24;
     offset = (offset + 7) & !7;
     let rela_iplt_offset = offset;
-    let rela_iplt_addr = BASE_ADDR + offset;
+    let rela_iplt_addr = rw_vaddr_base + (offset - rw_page_offset);
     let rela_iplt_end_addr = rela_iplt_addr + rela_iplt_size;
     offset += rela_iplt_size;
 
     let rw_filesz = offset - rw_page_offset;
 
     // BSS (nobits, non-TLS)
-    let bss_addr = BASE_ADDR + offset;
+    let bss_addr = rw_vaddr_base + (offset - rw_page_offset);
     let mut bss_size = 0u64;
     for sec in output_sections.iter_mut() {
         if sec.sh_type == SHT_NOBITS && sec.flags & SHF_ALLOC != 0 && sec.flags & SHF_TLS == 0 {
@@ -289,7 +366,7 @@ pub(super) fn emit_executable(
     // Each stub: 16 bytes (ADRP + LDR + BR + NOP)
     let iplt_stub_size = iplt_got_count as u64 * 16;
     let iplt_stub_file_off = (rx_filesz + 15) & !15; // 16-byte aligned
-    let iplt_stub_addr = BASE_ADDR + iplt_stub_file_off;
+    let iplt_stub_addr = text_vaddr_base + (iplt_stub_file_off - text_page_offset);
     if iplt_stub_size > 0 && iplt_stub_file_off + iplt_stub_size > rw_page_offset {
         return Err(format!("IPLT stubs ({} bytes) don't fit in RX padding (gap={})",
             iplt_stub_size, rw_page_offset - iplt_stub_file_off));
@@ -384,9 +461,9 @@ pub(super) fn emit_executable(
 
     // Define linker-provided symbols using shared infrastructure (consistent
     // with x86-64/i686/RISC-V via get_standard_linker_symbols)
-    let text_seg_end = BASE_ADDR + rx_filesz;
+    let text_seg_end = text_vaddr_base + (rx_filesz - text_page_offset);
     let linker_addrs = LinkerSymbolAddresses {
-        base_addr: BASE_ADDR,
+        base_addr: text_vaddr_base,
         got_addr,
         dynamic_addr: 0, // No .dynamic in static mode (dynamic executables use emit_dynamic_executable)
         bss_addr,
