@@ -8,7 +8,7 @@
 //! - Parameter storage from stack/registers to SSA alloca slots
 //! - Fastcall and regparm calling convention parameter handling
 
-use crate::ir::reexports::{Instruction, IrFunction, Value};
+use crate::ir::reexports::{Instruction, IrFunction, Operand, Value};
 use crate::common::types::IrType;
 use crate::backend::generation::{
     is_i128_type, calculate_stack_space_common, run_regalloc_and_merge_clobbers,
@@ -686,6 +686,49 @@ impl I686Codegen {
         } else {
             self.state.emit("    ret");
         }
+    }
+
+    // ---- VLA dynamic stack management ----
+
+    /// Save the current stack pointer to `save_slot` before VLA allocation.
+    ///
+    /// On i686, esp is the stack pointer. We move it to eax (the accumulator),
+    /// then store to the designated IR value slot. The frame pointer (ebp)
+    /// remains stable for fixed-offset locals while esp moves dynamically
+    /// during VLA allocations.
+    pub(super) fn emit_vla_save_sp_impl(&mut self, save_slot: &Value) {
+        self.state.emit("    movl %esp, %eax");
+        self.store_eax_to(save_slot);
+    }
+
+    /// Restore the stack pointer from a previously saved value at VLA scope
+    /// exit. This deallocates all VLA stack space allocated since the
+    /// corresponding `emit_vla_save_sp` call.
+    pub(super) fn emit_vla_restore_sp_impl(&mut self, save_slot: &Value) {
+        self.operand_to_eax(&Operand::Value(*save_slot));
+        self.state.emit("    movl %eax, %esp");
+        self.state.reg_cache.invalidate_all();
+    }
+
+    /// Emit dynamic stack allocation for a VLA (variable-length array).
+    ///
+    /// The `size` operand contains the runtime byte count to allocate.
+    /// The result is stored in `dest` as a pointer to the beginning of
+    /// the allocated region. The allocation maintains i686's 16-byte
+    /// stack alignment by rounding up the size.
+    ///
+    /// On i686 the stack grows downward, so we subtract the rounded-up
+    /// size from esp and return the new esp value as the allocation pointer.
+    pub(super) fn emit_vla_alloc_impl(&mut self, dest: &Value, size: &Operand) {
+        self.operand_to_eax(size);
+        // Round up to 16-byte alignment: (size + 15) & ~15
+        self.state.emit("    addl $15, %eax");
+        self.state.emit("    andl $-16, %eax");
+        // Subtract from stack pointer to allocate.
+        self.state.emit("    subl %eax, %esp");
+        // The allocated region starts at the new esp.
+        self.state.emit("    movl %esp, %eax");
+        self.store_eax_to(dest);
     }
 
     // ---- store/load instr for type ----

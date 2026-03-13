@@ -581,27 +581,41 @@ impl<'a> ExprTypeChecker<'a> {
 
     /// Resolve a _Generic selection based on the controlling expression's type.
     fn infer_generic_selection_ctype(&self, controlling: &Expr, associations: &[GenericAssociation]) -> Option<CType> {
-        let controlling_ct = self.infer_expr_ctype(controlling);
-        let mut default_expr: Option<&Expr> = None;
+        let controlling_ct = self.infer_expr_ctype(controlling)?;
 
-        for assoc in associations {
+        // Build the association list for the shared eval_generic_selection utility.
+        // Each entry is (CType, Option<index>) where the index maps back to the
+        // original association list position.
+        let mut typed_assocs: Vec<(CType, Option<usize>)> = Vec::new();
+        let mut default_idx: Option<usize> = None;
+
+        for (i, assoc) in associations.iter().enumerate() {
             match &assoc.type_spec {
-                None => { default_expr = Some(&assoc.expr); }
+                None => { default_idx = Some(i); }
                 Some(type_spec) => {
                     let assoc_ct = self.resolve_type_spec(type_spec);
-                    if let Some(ref ctrl_ct) = controlling_ct {
-                        if self.ctype_matches_generic(ctrl_ct, &assoc_ct) {
-                            return self.infer_expr_ctype(&assoc.expr);
-                        }
-                    }
+                    typed_assocs.push((assoc_ct, Some(i)));
                 }
             }
         }
 
-        if let Some(def) = default_expr {
-            return self.infer_expr_ctype(def);
+        // Use the shared selection algorithm from common::const_eval.
+        let compat_fn = |ctrl: &CType, assoc: &CType| -> bool {
+            self.ctype_matches_generic(ctrl, assoc)
+        };
+        let selected = crate::common::const_eval::eval_generic_selection(
+            &controlling_ct,
+            &typed_assocs,
+            default_idx,
+            &compat_fn,
+        );
+
+        // Resolve the selected association's expression type.
+        if let Some(idx) = selected {
+            self.infer_expr_ctype(&associations[idx].expr)
+        } else {
+            None
         }
-        None
     }
 
     /// Check if two CTypes match for _Generic selection purposes.

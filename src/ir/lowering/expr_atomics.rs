@@ -280,12 +280,18 @@ impl Lowerer {
             "__atomic_fetch_or"  => Some((AtomicRmwOp::Or, false)),
             "__atomic_fetch_xor" => Some((AtomicRmwOp::Xor, false)),
             "__atomic_fetch_nand" => Some((AtomicRmwOp::Nand, false)),
+            "__atomic_fetch_min"  => Some((AtomicRmwOp::Min, false)),
+            "__atomic_fetch_max"  => Some((AtomicRmwOp::Max, false)),
             "__sync_fetch_and_add" => Some((AtomicRmwOp::Add, true)),
             "__sync_fetch_and_sub" => Some((AtomicRmwOp::Sub, true)),
             "__sync_fetch_and_and" => Some((AtomicRmwOp::And, true)),
             "__sync_fetch_and_or"  => Some((AtomicRmwOp::Or, true)),
             "__sync_fetch_and_xor" => Some((AtomicRmwOp::Xor, true)),
             "__sync_fetch_and_nand" => Some((AtomicRmwOp::Nand, true)),
+            "__sync_fetch_and_min" => Some((AtomicRmwOp::Min, true)),
+            "__sync_fetch_and_max" => Some((AtomicRmwOp::Max, true)),
+            "__sync_fetch_and_umin" => Some((AtomicRmwOp::UMin, true)),
+            "__sync_fetch_and_umax" => Some((AtomicRmwOp::UMax, true)),
             _ => None,
         }
     }

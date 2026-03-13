@@ -413,6 +413,15 @@ pub fn link_shared(
         if !provide_pairs.is_empty() {
             apply_provide_symbols(&mut global_symbols, &provide_pairs);
         }
+        // Apply PROVIDE_HIDDEN semantics: set STV_HIDDEN visibility for
+        // symbols that were declared with PROVIDE_HIDDEN in the script.
+        for p in &s.provide_symbols {
+            if p.hidden {
+                if let Some(sym) = global_symbols.get_mut(&p.name) {
+                    sym.visibility = crate::backend::elf::STV_HIDDEN;
+                }
+            }
+        }
     }
 
     // Load -l libraries (resolve into archives and load them)

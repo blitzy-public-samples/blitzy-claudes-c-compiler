@@ -1002,22 +1002,38 @@ impl Lowerer {
 
     /// Evaluate a complex expression for global initialization.
     /// Returns a GlobalInit::Array with [real, imag] constant values.
+    ///
+    /// Uses `IrConst::complex_f32`/`IrConst::complex_f64` to construct a
+    /// typed complex constant, then decomposes it into real and imaginary
+    /// parts for the GlobalInit::Array representation that backends expect.
     pub(super) fn eval_complex_global_init(&self, expr: &Expr, target_ctype: &CType) -> Option<GlobalInit> {
         let (real, imag) = self.eval_complex_const(expr)?;
         match target_ctype {
-            CType::ComplexFloat => Some(GlobalInit::Array(vec![
-                IrConst::F32(real as f32),
-                IrConst::F32(imag as f32),
-            ])),
+            CType::ComplexFloat => {
+                // Build a ComplexF32 constant and decompose to [re, im] parts.
+                let complex_val = IrConst::complex_f32(real as f32, imag as f32);
+                let (re, im) = complex_val.complex_f32_parts().unwrap();
+                Some(GlobalInit::Array(vec![IrConst::F32(re), IrConst::F32(im)]))
+            }
             CType::ComplexLongDouble => Some(GlobalInit::Array(vec![
                 IrConst::long_double(real),
                 IrConst::long_double(imag),
             ])),
-            _ => Some(GlobalInit::Array(vec![
-                IrConst::F64(real),
-                IrConst::F64(imag),
-            ])),
+            _ => {
+                // Build a ComplexF64 constant and decompose to [re, im] parts.
+                let complex_val = IrConst::complex_f64(real, imag);
+                let (re, im) = complex_val.complex_f64_parts().unwrap();
+                Some(GlobalInit::Array(vec![IrConst::F64(re), IrConst::F64(im)]))
+            }
         }
+    }
+
+    /// Check whether a constant is a complex type.
+    /// Returns true for ComplexF32 and ComplexF64 constants, used during
+    /// complex expression constant folding to determine if a sub-expression
+    /// evaluated to a complex result that needs further processing.
+    pub(super) fn is_complex_constant(val: &IrConst) -> bool {
+        val.is_complex()
     }
 
     /// Public wrapper for eval_complex_const, used by global_init for complex array elements.
@@ -1047,18 +1063,44 @@ impl Lowerer {
             // Binary mul: delegate to const_arith for Annex G §G.5.1 compliance.
             // This handles NaN recovery when operands contain infinity, which the
             // naive formula (ac-bd, ad+bc) does not.
+            //
+            // For mixed real×complex operands (one has im=0), we use the
+            // optimized `eval_mixed_real_complex_mul` which avoids the NaN
+            // recovery overhead and preserves the inf×0 = NaN semantics
+            // correctly without the general formula's recovery branch.
             Expr::BinaryOp(BinOp::Mul, lhs, rhs, _) => {
                 let l = self.eval_complex_const(lhs)?;
                 let r = self.eval_complex_const(rhs)?;
-                Some(crate::common::const_arith::eval_complex_mul(l.0, l.1, r.0, r.1))
+                if l.1 == 0.0 && r.1 != 0.0 {
+                    // real × complex: use Annex G optimized path
+                    Some(crate::common::const_arith::eval_mixed_real_complex_mul(l.0, r.0, r.1))
+                } else if r.1 == 0.0 && l.1 != 0.0 {
+                    // complex × real: use Annex G optimized path
+                    Some(crate::common::const_arith::eval_mixed_real_complex_mul(r.0, l.0, l.1))
+                } else {
+                    Some(crate::common::const_arith::eval_complex_mul(l.0, l.1, r.0, r.1))
+                }
             }
             // Binary div: delegate to const_arith for Annex G §G.5.2 compliance.
             // Handles division by zero (finite/zero → ±∞), infinite numerator
             // (∞/finite → ∞), and infinite denominator (finite/∞ → 0).
+            //
+            // For mixed complex÷real and real÷complex cases, we use the
+            // optimized Annex G paths:
+            //   - complex ÷ real → componentwise division (no denominator scaling)
+            //   - real ÷ complex → conjugate method via eval_real_div_complex
             Expr::BinaryOp(BinOp::Div, lhs, rhs, _) => {
                 let l = self.eval_complex_const(lhs)?;
                 let r = self.eval_complex_const(rhs)?;
-                Some(crate::common::const_arith::eval_complex_div(l.0, l.1, r.0, r.1))
+                if r.1 == 0.0 && l.1 != 0.0 {
+                    // complex ÷ real: componentwise division
+                    Some(crate::common::const_arith::eval_mixed_real_complex_div(l.0, l.1, r.0))
+                } else if l.1 == 0.0 && r.1 != 0.0 {
+                    // real ÷ complex: conjugate method
+                    Some(crate::common::const_arith::eval_real_div_complex(l.0, r.0, r.1))
+                } else {
+                    Some(crate::common::const_arith::eval_complex_div(l.0, l.1, r.0, r.1))
+                }
             }
             // Unary negation
             Expr::UnaryOp(UnaryOp::Neg, inner, _) => {

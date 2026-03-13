@@ -456,21 +456,97 @@ fn build_dyn_alloca_derived_set(func: &IrFunction, alloca_info: &AllocaAnalysis)
 }
 
 /// Identify restrict-qualified pointers accessible within the loop.
-/// This collects Value IDs of parameters and locals that carry the
-/// restrict qualifier, as propagated by the IR lowering phase.
 ///
-/// Note: Until the lowering phase propagates restrict information to
-/// the IR level, this returns an empty set. The infrastructure is
-/// ready for when restrict qualifier tracking is added to CType and
-/// propagated through lowering.
+/// Performs two-level analysis mirroring the GVN restrict detection:
+///
+/// **Level 1:** Identifies loads from parameter allocas. The lowering phase stores
+/// restrict-qualified function parameters into allocas listed in `param_alloca_values`.
+/// Values loaded from these allocas are restrict-qualified pointer bases.
+///
+/// **Level 2:** Propagates restrict through GetElementPtr (struct member access),
+/// Copy, and Cast instructions. A GEP from a restrict base produces a pointer that
+/// inherits the restrict guarantee, enabling safe load hoisting for struct member
+/// accesses through restrict-qualified struct pointers:
+/// ```c
+/// void f(struct S * restrict a, struct S * restrict b) {
+///     for (int i = 0; i < n; i++)
+///         a->data[i] = b->data[i];  // b->data load can be hoisted
+/// }
+/// ```
+///
+/// The analysis scans ALL function blocks (not just loop body) because restrict
+/// pointer definitions typically occur in the entry block before the loop.
 fn find_loop_restrict_ptrs(
-    _func: &IrFunction,
+    func: &IrFunction,
     _loop_body: &FxHashSet<usize>,
 ) -> FxHashSet<u32> {
-    // Future: scan function parameters for restrict-qualified pointer types
-    // Future: scan alloca instructions for restrict-qualified types
-    // The lowering phase (src/ir/lowering/) will attach restrict info to IR values
-    FxHashSet::default()
+    let mut restrict_set = FxHashSet::default();
+
+    // Collect parameter alloca Value IDs for quick lookup.
+    let param_alloca_set: FxHashSet<u32> = func.param_alloca_values
+        .iter()
+        .map(|v| v.0)
+        .collect();
+
+    if param_alloca_set.is_empty() {
+        return restrict_set;
+    }
+
+    // Level 1: Find loads from parameter allocas (restrict pointer bases).
+    let mut restrict_bases: FxHashSet<u32> = FxHashSet::default();
+
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Instruction::Load { dest, ptr, .. } = inst {
+                if param_alloca_set.contains(&ptr.0) {
+                    restrict_set.insert(dest.0);
+                    restrict_bases.insert(dest.0);
+                }
+                if restrict_set.contains(&ptr.0) {
+                    restrict_set.insert(dest.0);
+                    restrict_bases.insert(dest.0);
+                }
+            }
+        }
+    }
+
+    // Level 2: Propagate restrict through GEP, Copy, and Cast (fixed-point).
+    let mut changed = true;
+    let mut iteration = 0;
+    while changed && iteration < 3 {
+        changed = false;
+        iteration += 1;
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                match inst {
+                    Instruction::GetElementPtr { dest, base, .. } => {
+                        if restrict_bases.contains(&base.0) && !restrict_set.contains(&dest.0) {
+                            restrict_set.insert(dest.0);
+                            restrict_bases.insert(dest.0);
+                            changed = true;
+                        }
+                    }
+                    Instruction::Copy { dest, src: Operand::Value(src_v), .. } => {
+                        if restrict_bases.contains(&src_v.0) && !restrict_set.contains(&dest.0) {
+                            restrict_set.insert(dest.0);
+                            restrict_bases.insert(dest.0);
+                            changed = true;
+                        }
+                    }
+                    Instruction::Cast { dest, src: Operand::Value(src_v), .. } => {
+                        if restrict_bases.contains(&src_v.0) && !restrict_set.contains(&dest.0) {
+                            restrict_set.insert(dest.0);
+                            restrict_bases.insert(dest.0);
+                            changed = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    restrict_set
 }
 
 /// Scan a loop body to determine which allocas are modified and what

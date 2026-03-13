@@ -41,6 +41,13 @@ impl Lowerer {
             self.local_label_scopes.push(scope);
         }
 
+        // If the parser flagged this block as containing VLA declarations,
+        // mark the function-level VLA flag early so that prologue generation
+        // uses frame-pointer-relative addressing (SP is dynamic in VLA scopes).
+        if compound.has_vla && !self.func().has_vla {
+            self.func_mut().has_vla = true;
+        }
+
         // Check if this block contains any declarations. If not, we can skip
         // scope tracking entirely since statements don't introduce new bindings.
         let has_declarations = compound.items.iter().any(|item| matches!(item, BlockItem::Declaration(_)));
@@ -125,6 +132,10 @@ impl Lowerer {
                 // This handles cases where the VLA information comes through the
                 // CType system (e.g., typedef'd VLAs) rather than through
                 // DerivedDeclarator::Array entries.
+                self.compute_vla_runtime_size(type_spec, &declarator.derived)
+            } else if self.is_type_vla(type_spec) {
+                // TypeSpecifier resolves to a VLA through typedef resolution.
+                // This catches VLA typedefs that are not yet reflected in CType.
                 self.compute_vla_runtime_size(type_spec, &declarator.derived)
             } else {
                 None

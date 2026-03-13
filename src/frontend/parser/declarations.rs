@@ -10,6 +10,7 @@
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::source::Span;
 use crate::common::types::AddressSpace;
+use crate::common::const_eval as shared_const_eval;
 use crate::frontend::lexer::token::TokenKind;
 use super::ast::*;
 use super::parse::{ModeKind, ParsedDeclAttrs, Parser};
@@ -155,8 +156,9 @@ impl Parser {
         if has_c11_alignas {
             if let Some(alignas_val) = merged_alignment {
                 // C11 §6.7.5: _Alignas(N) requires N to be a power of 2.
-                if alignas_val > 0 && (alignas_val & (alignas_val - 1)) != 0 {
-                    self.emit_error("requested alignment is not a power of 2", start);
+                // Use shared validate_alignas utility for consistent validation.
+                if let Err(msg) = crate::common::type_builder::validate_alignas(alignas_val) {
+                    self.emit_error(format!("_Alignas: {}", msg), start);
                 }
                 // C11 §6.7.5: _Alignas cannot reduce alignment below the natural
                 // alignment of the declared type.
@@ -210,6 +212,7 @@ impl Parser {
         decl_attrs.set_used(is_used);
         decl_attrs.set_fastcall(is_fastcall);
         decl_attrs.set_naked(is_naked);
+        decl_attrs.set_deprecated(self.attrs.parsing_deprecated());
         decl_attrs.alias_target = alias_target;
         decl_attrs.ifunc_resolver = ifunc_resolver;
         decl_attrs.visibility = visibility;
@@ -275,6 +278,15 @@ impl Parser {
         let is_gnu_inline = self.attrs.parsing_gnu_inline();
         let is_always_inline = self.attrs.parsing_always_inline();
         let is_noinline = self.attrs.parsing_noinline();
+        // Capture extended function attributes before parse_compound_stmt
+        // resets attr state. These flags flow from ParsedDeclAttrs to the
+        // FunctionAttributes on the AST FunctionDef node.
+        let is_warn_unused_result = self.attrs.parsing_warn_unused_result();
+        let is_malloc = self.attrs.parsing_malloc();
+        let is_pure = self.attrs.parsing_pure();
+        let is_const_attr = self.attrs.parsing_const_attr();
+        let is_cold = self.attrs.parsing_cold();
+        let is_hot = self.attrs.parsing_hot();
 
         // Build return type from derived declarators
         let return_type = self.build_return_type(type_spec, &derived);
@@ -316,6 +328,13 @@ impl Parser {
                 attrs.set_fastcall(decl_attrs.is_fastcall());
                 attrs.set_naked(decl_attrs.is_naked());
                 attrs.set_noreturn(decl_attrs.is_noreturn());
+                attrs.set_warn_unused_result(is_warn_unused_result);
+                attrs.set_malloc(is_malloc);
+                attrs.set_pure(is_pure);
+                attrs.set_const_attr(is_const_attr);
+                attrs.set_cold(is_cold);
+                attrs.set_hot(is_hot);
+                attrs.set_deprecated(decl_attrs.is_deprecated());
                 attrs.section = decl_attrs.section;
                 attrs.visibility = decl_attrs.visibility;
                 attrs.symver = decl_attrs.symver;
@@ -826,8 +845,9 @@ impl Parser {
         if let Some(a) = self.attrs.parsed_alignas.take() {
             if has_c11_alignas {
                 // C11 §6.7.5: _Alignas(N) requires N to be a power of 2.
-                if a > 0 && (a & (a - 1)) != 0 {
-                    self.emit_error("requested alignment is not a power of 2", start);
+                // Use shared validate_alignas utility for consistent validation.
+                if let Err(msg) = crate::common::type_builder::validate_alignas(a) {
+                    self.emit_error(format!("_Alignas: {}", msg), start);
                 }
                 // C11 §6.7.5: _Alignas cannot reduce alignment below the natural
                 // alignment of the declared type.
@@ -1321,36 +1341,54 @@ impl Parser {
         self.expect_closing(&TokenKind::RParen, open);
         self.consume_if(&TokenKind::Semicolon);
 
-        // Evaluate the constant expression
-        let enums = if self.enum_constants.is_empty() {
-            None
-        } else {
-            Some(&self.enum_constants)
+        // Evaluate the constant expression using the shared eval_static_assert_expr
+        // utility, which delegates to the parser's constant evaluator.
+        let eval_result = {
+            let enums = if self.enum_constants.is_empty() {
+                None
+            } else {
+                Some(&self.enum_constants)
+            };
+            let tag_aligns = if self.struct_tag_alignments.is_empty() {
+                None
+            } else {
+                Some(&self.struct_tag_alignments)
+            };
+            let eval_fn = |e: &Expr| -> Option<crate::ir::constants::IrConst> {
+                Self::eval_const_int_expr_with_enums(e, enums, tag_aligns)
+                    .map(|v| crate::ir::constants::IrConst::I64(v as i64))
+            };
+            shared_const_eval::eval_static_assert_expr(&expr, &eval_fn)
         };
-        let tag_aligns = if self.struct_tag_alignments.is_empty() {
-            None
-        } else {
-            Some(&self.struct_tag_alignments)
-        };
-        let unevaluable = if self.unevaluable_enum_constants.is_empty() {
-            None
-        } else {
-            Some(&self.unevaluable_enum_constants)
-        };
-        if let Some(value) = Self::eval_const_int_expr_with_enums(&expr, enums, tag_aligns) {
-            if value == 0 {
-                // Static assertion failed
-                let msg = if let Some(ref m) = message {
-                    format!("static assertion failed: {}", m)
-                } else {
-                    "static assertion failed".to_string()
-                };
+        match eval_result {
+            Ok(true) => { /* assertion passed — nothing to emit */ }
+            Ok(false) => {
+                // Static assertion failed — use sema-level formatter for
+                // consistent error message formatting.
+                let msg = crate::frontend::sema::const_eval::SemaConstEval::format_static_assert_error(
+                    message.as_deref(),
+                    "<expr>",
+                );
                 self.emit_error(msg, assert_span);
             }
-        } else if Self::expr_has_non_const_identifier(&expr, enums, unevaluable) {
-            // The expression references variables or non-enum identifiers, which
-            // means it's definitely not a valid integer constant expression (C11 6.6).
-            self.emit_error("expression in static assertion is not an integer constant expression", assert_span);
+            Err(_) => {
+                // Could not evaluate — check if the expression uses non-const identifiers
+                let enums2 = if self.enum_constants.is_empty() {
+                    None
+                } else {
+                    Some(&self.enum_constants)
+                };
+                let unevaluable = if self.unevaluable_enum_constants.is_empty() {
+                    None
+                } else {
+                    Some(&self.unevaluable_enum_constants)
+                };
+                if Self::expr_has_non_const_identifier(&expr, enums2, unevaluable) {
+                    // The expression references variables or non-enum identifiers, which
+                    // means it's definitely not a valid integer constant expression (C11 6.6).
+                    self.emit_error("expression in static assertion is not an integer constant expression", assert_span);
+                }
+            }
         }
         // If we can't evaluate the expression but it doesn't contain variable
         // references (e.g. sizeof, offsetof, compiler builtins), silently accept.

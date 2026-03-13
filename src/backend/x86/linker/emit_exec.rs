@@ -604,10 +604,24 @@ pub(super) fn emit_executable(
                             let sec_end = sec.addr.saturating_add(sec.mem_size);
                             let region_end = region.origin.saturating_add(region.length);
                             if sec.addr < region.origin || sec_end > region_end {
+                                let attr_str = region.attributes.as_deref().unwrap_or("(none)");
                                 eprintln!(
-                                    "warning: section '{}' ({:#x}..{:#x}) exceeds MEMORY region '{}' ({:#x}..{:#x})",
-                                    sec.name, sec.addr, sec_end, region.name, region.origin, region_end
+                                    "warning: section '{}' ({:#x}..{:#x}) exceeds MEMORY region '{}' (attrs={}, {:#x}..{:#x})",
+                                    sec.name, sec.addr, sec_end, region.name, attr_str, region.origin, region_end
                                 );
+                            }
+                            // Validate memory region permission attributes: warn
+                            // when a writable section is placed into a read-only
+                            // memory region (attributes without 'w').
+                            if let Some(ref attrs) = region.attributes {
+                                let region_writable = attrs.contains('w');
+                                let sec_writable = sec.flags & 0x1 != 0; // SHF_WRITE
+                                if sec_writable && !region_writable {
+                                    eprintln!(
+                                        "warning: writable section '{}' placed in non-writable MEMORY region '{}' (attrs={})",
+                                        sec.name, region.name, attrs
+                                    );
+                                }
                             }
                         }
                     }

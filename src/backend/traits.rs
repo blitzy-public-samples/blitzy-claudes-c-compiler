@@ -1351,9 +1351,10 @@ pub trait ArchCodegen {
     /// at scope exit. The saved value is stored into `save_slot`, which is
     /// typically a fixed-offset stack slot allocated during stack layout.
     ///
-    /// Default is a no-op; backends must override for VLA support.
-    fn emit_vla_save_sp(&mut self, _save_slot: &Value) {
-        // No-op default — backends override for VLA support
+    /// Default delegates to emit_stack_save; backends may override for
+    /// architecture-specific VLA SP save.
+    fn emit_vla_save_sp(&mut self, save_slot: &Value) {
+        self.emit_stack_save(save_slot);
     }
 
     /// Restore the stack pointer from a previously saved value at VLA scope exit.
@@ -1362,9 +1363,10 @@ pub trait ArchCodegen {
     /// the dynamically allocated stack space. `save_slot` is the same value
     /// that was written by a prior `emit_vla_save_sp` call.
     ///
-    /// Default is a no-op; backends must override for VLA support.
-    fn emit_vla_restore_sp(&mut self, _save_slot: &Value) {
-        // No-op default — backends override for VLA support
+    /// Default delegates to emit_stack_restore; backends may override for
+    /// architecture-specific VLA SP restore.
+    fn emit_vla_restore_sp(&mut self, save_slot: &Value) {
+        self.emit_stack_restore(save_slot);
     }
 
     /// Emit dynamic stack allocation for a VLA (variable-length array).
@@ -1372,11 +1374,12 @@ pub trait ArchCodegen {
     /// The `size` operand contains the runtime byte count to allocate.
     /// The result is stored in `dest` as a pointer to the beginning of
     /// the allocated region. The allocation must maintain the target's
-    /// required stack alignment.
+    /// required stack alignment (16-byte).
     ///
-    /// Default is a no-op; backends must override for VLA support.
-    fn emit_vla_alloc(&mut self, _dest: &Value, _size: &Operand) {
-        // No-op default — backends override for VLA support
+    /// Default delegates to emit_dyn_alloca with 16-byte alignment;
+    /// backends may override for architecture-specific VLA allocation.
+    fn emit_vla_alloc(&mut self, dest: &Value, size: &Operand) {
+        self.emit_dyn_alloca(dest, size, 16);
     }
 
     /// Emit a 128-bit value copy.

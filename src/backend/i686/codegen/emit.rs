@@ -1374,11 +1374,12 @@ impl I686Codegen {
             if let Some(slot) = self.state.get_slot(v.0) {
                 let sr0 = self.slot_ref(slot);
                 let sr4 = self.slot_ref_offset(slot, 4);
-                emit!(self.state, "    movl {}, %eax", sr0);
-                emit!(self.state, "    movl %eax, {}(%esp)", stack_offset);
-                emit!(self.state, "    movl {}, %eax", sr4);
-                emit!(self.state, "    movl %eax, {}(%esp)", stack_offset + 4);
-                self.state.reg_cache.invalidate_acc();
+                let dst0 = format!("{}(%esp)", stack_offset);
+                let dst4 = format!("{}(%esp)", stack_offset + 4);
+                // Use the centralized two-word copy helper to ensure both
+                // the low and high 32-bit halves are transferred, fixing
+                // the i686 double param high-word store issue.
+                self.emit_f64_param_store_impl(&sr0, &sr4, &dst0, &dst4);
             } else {
                 self.operand_to_eax(arg);
                 emit!(self.state, "    movl %eax, {}(%esp)", stack_offset);
@@ -1971,6 +1972,10 @@ impl ArchCodegen for I686Codegen {
         fn emit_mov_sp_to_acc(&mut self) => emit_mov_sp_to_acc_impl;
         fn emit_mov_acc_to_sp(&mut self) => emit_mov_acc_to_sp_impl;
         fn emit_align_acc(&mut self, align: usize) => emit_align_acc_impl;
+        // VLA support
+        fn emit_vla_save_sp(&mut self, save_slot: &Value) => emit_vla_save_sp_impl;
+        fn emit_vla_restore_sp(&mut self, save_slot: &Value) => emit_vla_restore_sp_impl;
+        fn emit_vla_alloc(&mut self, dest: &Value, size: &Operand) => emit_vla_alloc_impl;
         fn emit_alloca_aligned_addr(&mut self, slot: StackSlot, val_id: u32) => emit_alloca_aligned_addr_impl;
         fn emit_alloca_aligned_addr_to_acc(&mut self, slot: StackSlot, val_id: u32) => emit_alloca_aligned_addr_to_acc_impl;
         fn emit_memcpy_load_dest_addr(&mut self, slot: StackSlot, is_alloca: bool, val_id: u32) => emit_memcpy_load_dest_addr_impl;

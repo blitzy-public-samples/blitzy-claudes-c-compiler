@@ -306,6 +306,63 @@ pub enum IntrinsicOp {
     NeonShr,
 }
 
+/// Resolve a NEON builtin function name to its corresponding IntrinsicOp.
+///
+/// Maps `__builtin_neon_*` compiler builtins and the short-form NEON intrinsic
+/// names (used when `arm_neon.h` intrinsics are implemented as compiler builtins
+/// rather than inline C functions) to the appropriate IntrinsicOp variant.
+///
+/// Returns `None` for unrecognized names, allowing the caller to fall back to
+/// other resolution strategies (e.g., regular function call lowering).
+pub(crate) fn resolve_neon_intrinsic(name: &str) -> Option<IntrinsicOp> {
+    // Strip common prefix variants
+    let core = name.strip_prefix("__builtin_neon_").unwrap_or(name);
+    match core {
+        // Lane manipulation
+        s if s.starts_with("vget_lane") => Some(IntrinsicOp::NeonGetLane),
+        s if s.starts_with("vset_lane") => Some(IntrinsicOp::NeonSetLane),
+        s if s.starts_with("vdup_n") || s.starts_with("vmov_n") => Some(IntrinsicOp::NeonDupScalar),
+        s if s.starts_with("vdup_lane") => Some(IntrinsicOp::NeonDupLane),
+        // Widening and narrowing
+        s if s.starts_with("vmovl") => Some(IntrinsicOp::NeonMovl),
+        s if s.starts_with("vmovn") && !s.starts_with("vmovn_high") => Some(IntrinsicOp::NeonMovn),
+        s if s.starts_with("vqmovn") => Some(IntrinsicOp::NeonQmovn),
+        s if s.starts_with("vaddl") => Some(IntrinsicOp::NeonAddl),
+        s if s.starts_with("vsubl") => Some(IntrinsicOp::NeonSubl),
+        // Saturating arithmetic
+        s if s.starts_with("vqadd") => Some(IntrinsicOp::NeonQadd),
+        s if s.starts_with("vqsub") => Some(IntrinsicOp::NeonQsub),
+        s if s.starts_with("vqdmull") => Some(IntrinsicOp::NeonQdmull),
+        // Load/store variants
+        s if s.starts_with("vld1") => Some(IntrinsicOp::NeonLd1),
+        s if s.starts_with("vld2") => Some(IntrinsicOp::NeonLd2),
+        s if s.starts_with("vld3") => Some(IntrinsicOp::NeonLd3),
+        s if s.starts_with("vld4") => Some(IntrinsicOp::NeonLd4),
+        s if s.starts_with("vst1") => Some(IntrinsicOp::NeonSt1),
+        s if s.starts_with("vst2") => Some(IntrinsicOp::NeonSt2),
+        // Comparison
+        s if s.starts_with("vceq") => Some(IntrinsicOp::NeonCeq),
+        s if s.starts_with("vcgt") => Some(IntrinsicOp::NeonCgt),
+        s if s.starts_with("vcge") => Some(IntrinsicOp::NeonCge),
+        // Bitwise
+        s if s.starts_with("vand") => Some(IntrinsicOp::NeonAnd),
+        s if s.starts_with("vorr") => Some(IntrinsicOp::NeonOrr),
+        s if s.starts_with("veor") => Some(IntrinsicOp::NeonEor),
+        s if s.starts_with("vbic") => Some(IntrinsicOp::NeonBic),
+        s if s.starts_with("vbsl") => Some(IntrinsicOp::NeonBsl),
+        // Arithmetic
+        s if s.starts_with("vadd") && !s.starts_with("vaddl") => Some(IntrinsicOp::NeonAdd),
+        s if s.starts_with("vsub") && !s.starts_with("vsubl") => Some(IntrinsicOp::NeonSub),
+        s if s.starts_with("vmul") && !s.starts_with("vmull") => Some(IntrinsicOp::NeonMul),
+        s if s.starts_with("vabs") => Some(IntrinsicOp::NeonAbs),
+        s if s.starts_with("vneg") => Some(IntrinsicOp::NeonNeg),
+        // Shifts
+        s if s.starts_with("vshl") => Some(IntrinsicOp::NeonShl),
+        s if s.starts_with("vshr") => Some(IntrinsicOp::NeonShr),
+        _ => None,
+    }
+}
+
 impl IntrinsicOp {
     /// Returns true if this intrinsic is a pure function (no side effects, result depends
     /// only on inputs). Pure intrinsics can be dead-code eliminated if their result is unused.

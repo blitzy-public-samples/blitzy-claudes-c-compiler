@@ -273,18 +273,28 @@ pub fn link_builtin(
     // Resolve PROVIDE symbols from linker script before undefined symbol check.
     // PROVIDE(symbol = expr) creates a symbol only if it is otherwise undefined.
     if let Some(ref s) = script {
+        // Build a name→hidden lookup so we can apply PROVIDE_HIDDEN semantics.
+        let hidden_lookup: HashMap<&str, bool> = s
+            .provide_symbols
+            .iter()
+            .map(|p| (p.name.as_str(), p.hidden))
+            .collect();
         let provide_pairs: Vec<(String, u64)> = s.provide_symbols.iter().filter_map(|p| {
             eval_symbol_expr(&p.expr, &globals).map(|val| (p.name.clone(), val))
         }).collect();
         let resolved = linker_common::resolve_provide_symbols(&provide_pairs, &globals);
         for (name, addr) in resolved {
+            // PROVIDE_HIDDEN symbols use local binding so they are not
+            // exported to the dynamic symbol table.  Regular PROVIDE
+            // symbols are global.
+            let is_hidden = hidden_lookup.get(name.as_str()).copied().unwrap_or(false);
+            let binding = if is_hidden { STB_LOCAL } else { STB_GLOBAL };
             // Create an absolute symbol (SHN_ABS) from the PROVIDE directive.
             // Use defined_in = Some(usize::MAX) as sentinel for linker-provided.
-            // STT_NOTYPE = 0, so info = STB_GLOBAL << 4
             let sym = GlobalSymbol {
                 value: addr,
                 size: 0,
-                info: STB_GLOBAL << 4,
+                info: binding << 4,
                 defined_in: Some(usize::MAX),
                 from_lib: None,
                 plt_idx: None,
@@ -576,18 +586,24 @@ pub fn link_shared(
         None
     };
 
-    // Resolve PROVIDE symbols from linker script.
+    // Resolve PROVIDE symbols from linker script (shared library path).
     if let Some(ref s) = script {
+        let hidden_lookup: HashMap<&str, bool> = s
+            .provide_symbols
+            .iter()
+            .map(|p| (p.name.as_str(), p.hidden))
+            .collect();
         let provide_pairs: Vec<(String, u64)> = s.provide_symbols.iter().filter_map(|p| {
             eval_symbol_expr(&p.expr, &globals).map(|val| (p.name.clone(), val))
         }).collect();
         let resolved = linker_common::resolve_provide_symbols(&provide_pairs, &globals);
         for (name, addr) in resolved {
-            // STT_NOTYPE = 0, so info = STB_GLOBAL << 4
+            let is_hidden = hidden_lookup.get(name.as_str()).copied().unwrap_or(false);
+            let binding = if is_hidden { STB_LOCAL } else { STB_GLOBAL };
             let sym = GlobalSymbol {
                 value: addr,
                 size: 0,
-                info: STB_GLOBAL << 4,
+                info: binding << 4,
                 defined_in: Some(usize::MAX),
                 from_lib: None,
                 plt_idx: None,

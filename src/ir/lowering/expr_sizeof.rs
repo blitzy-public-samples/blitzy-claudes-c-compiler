@@ -594,10 +594,12 @@ impl Lowerer {
                         if strides.is_empty() {
                             return None;
                         }
-                        // Get element type's size (compile-time for non-VLA elements)
-                        let elem_size = match ct {
-                            CType::Vla(ref elem) => elem.size(),
-                            _ => 0,
+                        // Get element type's size (compile-time for non-VLA elements).
+                        // Use vla_element_type() accessor for clean VLA type extraction.
+                        let elem_size = if let Some(elem) = ct.vla_element_type() {
+                            elem.size()
+                        } else {
+                            0
                         };
                         if elem_size > 0 {
                             Some((elem_size, strides))

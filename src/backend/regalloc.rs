@@ -124,8 +124,13 @@ pub fn allocate_registers(
     let mut value_max_depth: FxHashMap<u32, u32> = FxHashMap::default();
 
     // Precompute per-block loop weight: 10^depth, capped to avoid overflow.
-    let block_loop_weight: Vec<u64> = liveness.block_loop_depth.iter()
-        .map(|&d| {
+    // Use liveness.max_loop_depth() for early-out: when the function has no
+    // loops (max_depth == 0), all block weights are 1 and the depth bonus
+    // computation can be skipped entirely.
+    let _max_depth = liveness.max_loop_depth();
+    let block_loop_weight: Vec<u64> = (0..func.blocks.len())
+        .map(|bi| {
+            let d = liveness.loop_depth_for_block(bi);
             match d {
                 0 => 1,
                 1 => 10,
@@ -160,11 +165,7 @@ pub fn allocate_registers(
         };
 
         // Raw loop depth for this block — used for per-value max depth tracking.
-        let depth: u32 = if block_idx < liveness.block_loop_depth.len() {
-            liveness.block_loop_depth[block_idx]
-        } else {
-            0
-        };
+        let depth: u32 = liveness.loop_depth_for_block(block_idx);
 
         for inst in &block.instructions {
             // Values eligible for register allocation: those stored via the

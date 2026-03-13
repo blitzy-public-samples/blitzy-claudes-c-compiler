@@ -611,6 +611,13 @@ pub fn generate_module(cg: &mut dyn ArchCodegen, module: &IrModule, source_mgr: 
     // Emit architecture-specific runtime helper stubs (e.g., i686 __divdi3)
     cg.emit_runtime_stubs();
 
+    // When a linker script is active, annotate the assembly output so that
+    // post-link diagnostics can reference the script path.
+    if let Some(script_path) = cg.linker_script_path() {
+        let comment = format!("# linker script: {}", script_path.display());
+        cg.state().emit(&comment);
+    }
+
     // Emit .note.GNU-stack section to indicate non-executable stack
     cg.state().emit("");
     cg.state().emit(".section .note.GNU-stack,\"\",@progbits");
@@ -1252,7 +1259,16 @@ fn generate_instruction(cg: &mut dyn ArchCodegen, inst: &Instruction, gep_fold_m
             cg.state().reg_cache.invalidate_all();
         }
         Instruction::DynAlloca { dest, size, align } => {
-            cg.emit_dyn_alloca(dest, size, *align);
+            if *align <= 16 {
+                // Standard VLA allocation with 16-byte alignment — use the
+                // backend-specific VLA alloc path which is optimized for
+                // architecture-native stack operations.
+                cg.emit_vla_alloc(dest, size);
+            } else {
+                // Over-aligned allocation (e.g., __builtin_alloca with alignment
+                // > 16): use the generic emit_dyn_alloca which adds padding.
+                cg.emit_dyn_alloca(dest, size, *align);
+            }
             cg.state().reg_cache.invalidate_all();
         }
         // Note on _Noreturn: calls to functions marked `_Noreturn` or
@@ -1353,11 +1369,11 @@ fn generate_instruction(cg: &mut dyn ArchCodegen, inst: &Instruction, gep_fold_m
             cg.state().reg_cache.invalidate_all();
         }
         Instruction::StackSave { dest } => {
-            cg.emit_stack_save(dest);
+            cg.emit_vla_save_sp(dest);
             cg.state().reg_cache.invalidate_all();
         }
         Instruction::StackRestore { ptr } => {
-            cg.emit_stack_restore(ptr);
+            cg.emit_vla_restore_sp(ptr);
             cg.state().reg_cache.invalidate_all();
         }
         Instruction::ParamRef { dest, param_idx, ty } => {

@@ -665,6 +665,12 @@ impl RiscvCodegen {
         // designated IR value (may be register-allocated or stack-spilled).
         self.state.emit("    mv t0, sp");
         self.store_t0_to(save_slot);
+        // Record the save slot's stack offset (if spilled) for diagnostic/debug
+        // purposes. When the IR value has a stack slot, cache its offset so that
+        // the epilogue can verify proper VLA scope cleanup.
+        if let Some(slot) = self.state.get_slot(save_slot.0) {
+            self.vla_save_slot = Some(slot.0);
+        }
         // Mark that SP will be dynamically modified — the epilogue must
         // restore SP from s0 (frame pointer) rather than sp-relative offsets.
         self.state.has_dyn_alloca = true;

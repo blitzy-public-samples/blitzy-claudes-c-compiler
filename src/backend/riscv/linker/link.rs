@@ -222,6 +222,12 @@ pub fn link_builtin(
         let provide_pairs: Vec<(String, u64)> = s.provide_symbols.iter().filter_map(|p| {
             eval_symbol_expr(&p.expr, &global_syms).map(|val| (p.name.clone(), val))
         }).collect();
+        // Build a name→hidden lookup so we can apply PROVIDE_HIDDEN semantics.
+        let hidden_lookup: std::collections::HashMap<&str, bool> = s
+            .provide_symbols
+            .iter()
+            .map(|p| (p.name.as_str(), p.hidden))
+            .collect();
         // resolve_provide_symbols requires GlobalSymbolOps, but our GlobalSym
         // does not implement that trait.  Instead we apply the same logic inline:
         // add provided symbols only if they are currently undefined or absent.
@@ -229,12 +235,18 @@ pub fn link_builtin(
             let already_defined = global_syms.get(name.as_str()).map_or(false, |sym| sym.defined);
             if !already_defined {
                 use super::relocations::GlobalSym;
+                let is_hidden = hidden_lookup.get(name.as_str()).copied().unwrap_or(false);
+                let vis = if is_hidden {
+                    crate::backend::elf::STV_HIDDEN
+                } else {
+                    crate::backend::elf::STV_DEFAULT
+                };
                 global_syms.insert(name.clone(), GlobalSym {
                     value: *addr,
                     size: 0,
                     binding: crate::backend::elf::STB_GLOBAL,
                     sym_type: crate::backend::elf::STT_NOTYPE,
-                    visibility: crate::backend::elf::STV_DEFAULT,
+                    visibility: vis,
                     defined: true,
                     needs_plt: false,
                     plt_idx: 0,

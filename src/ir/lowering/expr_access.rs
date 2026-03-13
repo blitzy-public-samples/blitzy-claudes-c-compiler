@@ -407,6 +407,14 @@ impl Lowerer {
                 return Operand::Value(vla_val);
             }
         }
+        // For sizeof(expr) on VLA expressions — try full runtime sizeof computation
+        // which handles stride-based multi-dimensional VLA sizeof and VLA typedef
+        // expressions that get_vla_sizeof's simple lookup missed.
+        if let SizeofArg::Expr(expr) = arg {
+            if let Some(runtime_val) = self.try_sizeof_expr_runtime(expr) {
+                return Operand::Value(runtime_val);
+            }
+        }
         let size = match arg {
             SizeofArg::Type(ts) => self.sizeof_type(ts),
             SizeofArg::Expr(expr) => self.sizeof_expr(expr),

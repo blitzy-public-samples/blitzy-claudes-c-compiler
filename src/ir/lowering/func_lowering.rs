@@ -590,6 +590,17 @@ impl Lowerer {
         // Also respect explicit static_functions set (from earlier declarations).
         let is_static = func.attrs.is_static() || self.static_functions.contains(&func.name)
             || is_gnu_inline_no_extern_def || inline_linkage.is_local_linkage();
+        // can_skip_if_unreferenced() identifies inline-only/static definitions whose
+        // external symbol can be omitted if no call site references them. Use this to
+        // mark the function as inline-only for the inliner and dead-statics pass: when
+        // the function is skippable AND already static, the inliner can be more aggressive
+        // knowing no external caller depends on the function body existing.
+        let is_inline_only_skippable = inline_linkage.can_skip_if_unreferenced();
+        // is_gnu_inline_def() at the InlineLinkage level always returns false (the enum
+        // alone cannot distinguish GNU89 from C99 InlineOnly). The IrFunction-level
+        // is_gnu_inline_def field (set below) uses the direct boolean instead. We check
+        // the linkage-level method for consistency: if it ever returns true, override.
+        let gnu_inline_from_linkage = inline_linkage.is_gnu_inline_def();
         let next_val = self.func_mut().next_value;
         let param_alloca_vals = std::mem::take(&mut self.func_mut().param_alloca_values);
         let global_init_labels = std::mem::take(&mut self.func_mut().global_init_label_blocks);
@@ -597,11 +608,21 @@ impl Lowerer {
         let ret_eightbyte_classes = self.func_meta.sigs.get(&func.name)
             .map(|s| s.ret_eightbyte_classes.clone())
             .unwrap_or_default();
+        // Merge inline-only-skippable flag: if both is_inline and can_skip_if_unreferenced
+        // are true, the function has no externally-visible definition requirement — mark
+        // is_inline true so the inliner and dead statics pass know the body is discardable
+        // once inlined into all call sites. This refines the plain is_inline flag to also
+        // cover static-inline and gnu-extern-inline-only definitions uniformly.
+        let effective_is_inline = func.attrs.is_inline() || is_inline_only_skippable;
+        // Merge GNU inline flag: the direct boolean is_gnu_inline_no_extern_def from
+        // attribute analysis is authoritative, but if the centralized InlineLinkage
+        // determination also indicates GNU inline (future-proofing), use the union.
+        let effective_gnu_inline_def = is_gnu_inline_no_extern_def || gnu_inline_from_linkage;
         let ir_func = IrFunction {
             name: func.name.clone(), return_type, params,
             blocks: std::mem::take(&mut self.func_mut().blocks),
             is_variadic: func.variadic, is_declaration: false, is_static,
-            is_inline: func.attrs.is_inline(),
+            is_inline: effective_is_inline,
             is_always_inline: func.attrs.is_always_inline(),
             is_noinline: func.attrs.is_noinline(),
             next_value_id: next_val,
@@ -616,7 +637,7 @@ impl Lowerer {
             is_naked: func.attrs.is_naked(),
             global_init_label_blocks: global_init_labels,
             ret_eightbyte_classes,
-            is_gnu_inline_def: is_gnu_inline_no_extern_def,
+            is_gnu_inline_def: effective_gnu_inline_def,
         };
         // Collect __attribute__((symver("..."))) directives
         if let Some(ref sv) = func.attrs.symver {

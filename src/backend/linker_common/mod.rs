@@ -138,6 +138,6 @@ pub use gc_sections::gc_collect_sections_elf64;
 
 // linker_script.rs
 pub use linker_script::{
-    LinkerScript, ScriptSection, InputPattern, MemoryRegion, ProvideSymbol, SymbolExpr,
+    LinkerScript, ScriptSection, SymbolExpr,
     parse_linker_script,
 };

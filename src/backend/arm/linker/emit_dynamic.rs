@@ -458,7 +458,7 @@ pub(super) fn emit_dynamic_executable(
     }
     // Redirect IFUNC symbol value to its PLT stub address, and change type to STT_FUNC
     // so that call sites resolve through the PLT for lazy/eager resolution
-    for (name, gsym) in globals.iter_mut() {
+    for (_name, gsym) in globals.iter_mut() {
         if (gsym.info & 0xf) == STT_GNU_IFUNC && gsym.defined_in.is_some() {
             if let Some(pi) = gsym.plt_idx {
                 gsym.value = plt_addr + 32 + pi as u64 * 16;

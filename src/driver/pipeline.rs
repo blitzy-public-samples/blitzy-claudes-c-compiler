@@ -195,6 +195,9 @@ pub struct Driver {
     /// When false, bare GNU keywords like `typeof` and `asm` are treated as
     /// identifiers (the __typeof__/__asm__ forms always work).
     pub(super) gnu_extensions: bool,
+    /// The C standard version string from -std= (e.g., "c11", "gnu17").
+    /// Used to set __STDC_VERSION__ to the correct value.
+    pub(super) c_standard: Option<String>,
     /// Whether to place each function in its own section (-ffunction-sections).
     pub(super) function_sections: bool,
     /// Whether to place each data object in its own section (-fdata-sections).
@@ -306,6 +309,7 @@ impl Driver {
             undef_all: false,
             warning_config: WarningConfig::new(),
             gnu_extensions: true,
+            c_standard: None,
             function_sections: false,
             data_sections: false,
             gnu89_inline: false,
@@ -830,6 +834,11 @@ impl Driver {
         // select the correct inline linkage model.
         if self.gnu89_inline {
             preprocessor.set_gnu89_inline(true);
+        }
+        // Set __STDC_VERSION__ based on -std= flag. When -std=c11 is passed,
+        // __STDC_VERSION__ should be 201112L instead of the default 201710L.
+        if let Some(ref std_ver) = self.c_standard {
+            preprocessor.set_stdc_version(std_ver);
         }
         // Set optimization macros: __OPTIMIZE__ for -O1+, __OPTIMIZE_SIZE__ for -Os/-Oz.
         // The Linux kernel's BUILD_BUG() relies on __OPTIMIZE__ to expand to a noreturn

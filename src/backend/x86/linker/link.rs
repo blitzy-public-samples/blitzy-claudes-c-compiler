@@ -234,17 +234,28 @@ pub fn link_builtin(
     // Resolve PROVIDE symbols from linker script before undefined symbol check.
     // PROVIDE(symbol = expr) creates a symbol only if it is otherwise undefined.
     if let Some(ref s) = script {
+        // Build a name→hidden lookup so we can apply PROVIDE_HIDDEN semantics.
+        let hidden_lookup: HashMap<&str, bool> = s
+            .provide_symbols
+            .iter()
+            .map(|p| (p.name.as_str(), p.hidden))
+            .collect();
         let provide_pairs: Vec<(String, u64)> = s.provide_symbols.iter().filter_map(|p| {
             eval_symbol_expr(&p.expr, &globals).map(|val| (p.name.clone(), val))
         }).collect();
         let resolved = linker_common::resolve_provide_symbols(&provide_pairs, &globals);
         for (name, addr) in resolved {
+            // PROVIDE_HIDDEN symbols use local binding so they are not
+            // exported to the dynamic symbol table.  Regular PROVIDE
+            // symbols are global.
+            let is_hidden = hidden_lookup.get(name.as_str()).copied().unwrap_or(false);
+            let binding = if is_hidden { STB_LOCAL } else { STB_GLOBAL };
             // Create an absolute symbol (SHN_ABS) from the PROVIDE directive.
             // Use defined_in = Some(usize::MAX) as sentinel for linker-provided.
             let sym = GlobalSymbol {
                 value: addr,
                 size: 0,
-                info: (STB_GLOBAL << 4) | STT_NOTYPE,
+                info: (binding << 4) | STT_NOTYPE,
                 defined_in: Some(usize::MAX),
                 from_lib: None,
                 plt_idx: None,
@@ -375,6 +386,31 @@ pub fn link_builtin(
     // STT_GNU_IFUNC globals) and the corresponding emission code in
     // emit_exec.rs (static: .iplt/.rela.iplt) and plt_got.rs (dynamic: PLT/GOT).
     let ifunc_symbols = collect_ifunc_symbols(&globals, is_static);
+
+    // Use the shared resolve_entry_symbol utility for __start_/__stop_
+    // pattern resolution which requires the final output section layout.
+    // This supplements the early ENTRY aliasing above.
+    if let Some(ref s) = script {
+        if let Some(ref entry_name) = s.entry {
+            if !globals.contains_key(entry_name.as_str()) || !globals.get(entry_name.as_str()).map_or(false, |g| g.defined_in.is_some()) {
+                if let Some(addr) = linker_common::resolve_entry_symbol(entry_name, &globals, &output_sections) {
+                    let entry_sym = GlobalSymbol {
+                        value: addr, size: 0,
+                        info: (STB_GLOBAL << 4) | STT_NOTYPE,
+                        defined_in: Some(usize::MAX), from_lib: None,
+                        plt_idx: None, got_idx: None, section_idx: SHN_ABS,
+                        is_dynamic: false, copy_reloc: false,
+                        lib_sym_value: 0, version: None,
+                    };
+                    globals.entry(entry_name.clone()).or_insert(entry_sym.clone());
+                    let start_defined = globals.get("_start").map_or(false, |s| s.defined_in.is_some());
+                    if !start_defined {
+                        globals.insert("_start".to_string(), entry_sym);
+                    }
+                }
+            }
+        }
+    }
 
     // Emit executable
     emit_executable(

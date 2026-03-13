@@ -138,6 +138,8 @@ impl Lowerer {
                     // Mixed real * complex or complex * real:
                     //   result = (scalar * re, scalar * im)
                     // Normalize so the real operand is always the "scalar" side.
+                    // Delegates to `lower_real_times_complex` which handles the
+                    // componentwise multiplication per C11 Annex G.
                     let (real_expr, real_ct, complex_expr, complex_ct) = if lhs_is_complex {
                         (rhs, rhs_ct, lhs, lhs_ct)
                     } else {
@@ -147,43 +149,17 @@ impl Lowerer {
                     let complex_val = self.lower_expr(complex_expr);
                     let complex_converted = self.convert_to_complex(complex_val, complex_ct, &result_ct);
                     let complex_ptr = self.operand_to_value(complex_converted);
-                    let comp_ty = Self::complex_component_ir_type(&result_ct);
-                    // Cast the real scalar to the complex component float type
-                    let real_ir = IrType::from_ctype(real_ct);
-                    let converted_scalar = if real_ir != comp_ty {
-                        Operand::Value(self.emit_cast_val(scalar_val, real_ir, comp_ty))
-                    } else {
-                        scalar_val
-                    };
-                    let re = self.load_complex_real(complex_ptr, &result_ct);
-                    let im = self.load_complex_imag(complex_ptr, &result_ct);
-                    let new_re = self.emit_binop_val(IrBinOp::Mul, converted_scalar, re, comp_ty);
-                    let new_im = self.emit_binop_val(IrBinOp::Mul, converted_scalar, im, comp_ty);
-                    let result = self.alloca_complex(&result_ct);
-                    self.store_complex_parts(result, Operand::Value(new_re), Operand::Value(new_im), &result_ct);
-                    return Operand::Value(result);
+                    return self.lower_real_times_complex(scalar_val, real_ct, complex_ptr, &result_ct);
                 }
                 BinOp::Div if lhs_is_complex && !rhs_is_complex => {
                     // complex / real: (re / scalar, im / scalar)
+                    // Delegates to `lower_complex_div_real` which performs the
+                    // componentwise division per C11 Annex G.
                     let lhs_val = self.lower_expr(lhs);
                     let rhs_val = self.lower_expr(rhs);
                     let lhs_converted = self.convert_to_complex(lhs_val, lhs_ct, &result_ct);
                     let lhs_ptr = self.operand_to_value(lhs_converted);
-                    let comp_ty = Self::complex_component_ir_type(&result_ct);
-                    // Cast the real divisor to the complex component float type
-                    let rhs_ir = IrType::from_ctype(rhs_ct);
-                    let converted_scalar = if rhs_ir != comp_ty {
-                        Operand::Value(self.emit_cast_val(rhs_val, rhs_ir, comp_ty))
-                    } else {
-                        rhs_val
-                    };
-                    let re = self.load_complex_real(lhs_ptr, &result_ct);
-                    let im = self.load_complex_imag(lhs_ptr, &result_ct);
-                    let new_re = self.emit_binop_val(IrBinOp::SDiv, re, converted_scalar, comp_ty);
-                    let new_im = self.emit_binop_val(IrBinOp::SDiv, im, converted_scalar, comp_ty);
-                    let result = self.alloca_complex(&result_ct);
-                    self.store_complex_parts(result, Operand::Value(new_re), Operand::Value(new_im), &result_ct);
-                    return Operand::Value(result);
+                    return self.lower_complex_div_real(lhs_ptr, &result_ct, rhs_val, rhs_ct);
                 }
                 BinOp::Div if !lhs_is_complex && rhs_is_complex => {
                     // Annex G: real / complex uses conjugate method:

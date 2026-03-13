@@ -296,7 +296,7 @@ pub fn emit_executable(
     // gap between BASE_ADDR and the script address in the RX LOAD
     // segment (which would cause QEMU to reject the ELF due to
     // non-writable BSS in the memsz > filesz region).
-    let text_script_base: Option<u64> = {
+    let _text_script_base: Option<u64> = {
         let mut min_addr: Option<u64> = None;
         for &si in sec_indices {
             let ms = &merged_sections[si];

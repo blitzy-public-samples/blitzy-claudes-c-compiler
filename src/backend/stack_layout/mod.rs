@@ -118,16 +118,10 @@ struct StackLayoutContext {
     /// as the first operand loaded into the accumulator. These values don't need
     /// stack slots — the accumulator register cache keeps them alive.
     immediately_consumed: FxHashSet<u32>,
-    /// Whether the function contains DynAlloca (VLA) instructions.
-    /// When true, the function uses dynamic stack allocation and backends
-    /// must use frame-pointer-relative addressing (SP changes at runtime).
-    /// DynAlloca and StackSave dest values are excluded from block-local
-    /// coalescing (Tier 3) to ensure they get reliable permanent slots.
-    has_vla: bool,
-    /// Value IDs of DynAlloca and StackSave instruction destinations.
-    /// These values are critical for VLA correctness and must not be
-    /// coalesced or shared with other values.
-    vla_critical_values: FxHashSet<u32>,
+    // NOTE: has_vla and vla_critical_values are computed during construction
+    // (see below) and used to adjust `immediately_consumed`, but do not need
+    // to persist in the struct since all VLA-related decisions are applied
+    // eagerly during construction.
 }
 
 // ── Main stack space calculation ──────────────────────────────────────────
@@ -369,7 +363,5 @@ fn build_layout_context(
         dead_param_allocas,
         coalescable_allocas,
         immediately_consumed,
-        has_vla,
-        vla_critical_values,
     }
 }

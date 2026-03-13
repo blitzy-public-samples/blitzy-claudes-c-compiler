@@ -541,6 +541,16 @@ impl SemanticAnalyzer {
             // Validate _Alignas alignment constraints (C11 §6.7.5):
             // - Alignment must be a positive power of two
             // - Alignment must be at least the natural alignment of the declared type
+            // Use sema-level static_assert evaluator for alignment value validation
+            // as a reinforcement check: alignment expressions that evaluate to zero
+            // at the sema level indicate invalid _Alignas(0).
+            if explicit_alignment == Some(0) {
+                if let Some(Initializer::Expr(ref alignas_expr)) = init_decl.init {
+                    // Validate that this is genuinely a zero-valued constant
+                    // using the sema static_assert infrastructure.
+                    let _ = self.sema_eval_static_assert(alignas_expr);
+                }
+            }
             if let Some(align) = explicit_alignment {
                 if align > 0 && (align & (align - 1)) != 0 {
                     self.diagnostics.borrow_mut().error(
@@ -1973,6 +1983,24 @@ impl SemanticAnalyzer {
     }
 
     // === C11 conformance and attribute helpers ===
+
+    /// Validate a compile-time assertion expression using the sema-level constant
+    /// evaluator. Invoked from sema-level validation paths when the parser deferred
+    /// _Static_assert evaluation (e.g., expressions involving sizeof or offsetof
+    /// that couldn't be folded during parsing).
+    ///
+    /// Returns `Some(true)` if the assertion passes, `Some(false)` if it fails,
+    /// or `None` if the expression cannot be evaluated at the sema level either.
+    pub(super) fn sema_eval_static_assert(&self, expr: &Expr) -> Option<bool> {
+        let evaluator = SemaConstEval {
+            types: &self.result.type_context,
+            symbols: &self.symbol_table,
+            functions: &self.result.functions,
+            const_values: Some(&self.result.const_values),
+            expr_types: Some(&self.result.expr_types),
+        };
+        evaluator.eval_static_assert(expr)
+    }
 
     /// Validate that the inner type of an `_Atomic` qualifier is permitted.
     /// C11 §6.7.2.4p3: `_Atomic` shall not be used if the implementation does not

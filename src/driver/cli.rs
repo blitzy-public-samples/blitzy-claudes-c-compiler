@@ -463,6 +463,8 @@ impl Driver {
                     // Note: -fgnu89-inline can override this later on the command line.
                     self.gnu89_inline = matches!(std_value, "gnu89" | "c89" | "gnu90" | "c90"
                         | "iso9899:1990" | "iso9899:199409");
+                    // Store the standard version for __STDC_VERSION__ setting.
+                    self.c_standard = Some(std_value.to_string());
                 }
 
                 // Machine/target flags
