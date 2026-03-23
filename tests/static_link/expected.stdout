@@ -1,0 +1,1 @@
+PASS: static binary (no PT_INTERP, no PT_DYNAMIC)

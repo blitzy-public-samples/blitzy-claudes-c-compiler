@@ -1,6 +1,6 @@
 //! RiscvCodegen: prologue/epilogue and stack frame operations.
 
-use crate::ir::reexports::IrFunction;
+use crate::ir::reexports::{IrFunction, Value, Operand};
 use crate::common::types::IrType;
 use crate::backend::generation::{calculate_stack_space_common, find_param_alloca};
 use crate::backend::call_abi::{ParamClass, classify_params};
@@ -643,6 +643,83 @@ impl RiscvCodegen {
                 self.state.emit("    .cfi_offset s0, -16");
             }
         }
+    }
+
+    // ---- VLA (variable-length array) stack management ----
+    //
+    // VLAs dynamically modify the stack pointer at runtime. On RISC-V, the
+    // frame pointer (s0) remains stable throughout, so all local variable
+    // accesses via s0-relative offsets remain valid. The epilogue already
+    // handles the `has_dyn_alloca` flag by restoring sp from s0 instead of
+    // using sp-relative arithmetic. These three methods implement the VLA
+    // lifecycle: save sp → allocate → restore sp at scope exit.
+
+    /// Save the current stack pointer to `save_slot` before VLA allocation.
+    /// This records SP so it can be restored at scope exit to reclaim VLA space.
+    ///
+    /// The save value is stored via `store_t0_to` which handles both
+    /// register-allocated and stack-spilled IR values. Setting `has_dyn_alloca`
+    /// ensures the epilogue uses the s0-relative SP restore path.
+    pub(super) fn emit_vla_save_sp_impl(&mut self, save_slot: &Value) {
+        // Move current SP into the accumulator (t0), then store to the
+        // designated IR value (may be register-allocated or stack-spilled).
+        self.state.emit("    mv t0, sp");
+        self.store_t0_to(save_slot);
+        // Record the save slot's stack offset (if spilled) for diagnostic/debug
+        // purposes. When the IR value has a stack slot, cache its offset so that
+        // the epilogue can verify proper VLA scope cleanup.
+        if let Some(slot) = self.state.get_slot(save_slot.0) {
+            self.vla_save_slot = Some(slot.0);
+        }
+        // Mark that SP will be dynamically modified — the epilogue must
+        // restore SP from s0 (frame pointer) rather than sp-relative offsets.
+        self.state.has_dyn_alloca = true;
+    }
+
+    /// Restore the stack pointer from a previously saved value at VLA scope
+    /// exit. This reclaims all dynamically allocated VLA stack space from
+    /// the current scope by resetting SP to the value recorded by a prior
+    /// `emit_vla_save_sp` call.
+    ///
+    /// Handles both register-allocated and stack-spilled save slots: if the
+    /// IR value was assigned a physical register, SP is restored directly
+    /// from that callee-saved register; otherwise, the saved SP is loaded
+    /// from its stack slot via s0-relative addressing.
+    pub(super) fn emit_vla_restore_sp_impl(&mut self, save_slot: &Value) {
+        // Check if the save_slot IR value has a physical register assignment.
+        if let Some(&reg) = self.reg_assignments.get(&save_slot.0) {
+            let reg_name = callee_saved_name(reg);
+            self.state.emit_fmt(format_args!("    mv sp, {}", reg_name));
+        } else if let Some(slot) = self.state.get_slot(save_slot.0) {
+            // Load saved SP from its stack slot into t0, then restore.
+            self.emit_load_from_s0("t0", slot.0, "ld");
+            self.state.emit("    mv sp, t0");
+        }
+    }
+
+    /// Emit dynamic stack allocation for a VLA (variable-length array).
+    ///
+    /// The `size` operand contains the runtime byte count to allocate.
+    /// The result is stored in `dest` as a pointer to the beginning of
+    /// the allocated region. The allocation maintains RISC-V's mandatory
+    /// 16-byte stack alignment by rounding the size up before subtraction.
+    ///
+    /// On RISC-V the stack grows downward, so we subtract the rounded-up
+    /// size from sp and return the new sp value as the allocation pointer.
+    pub(super) fn emit_vla_alloc_impl(&mut self, dest: &Value, size: &Operand) {
+        // Load the requested byte count into t0.
+        self.operand_to_t0(size);
+        // Round up to 16-byte alignment: size = (size + 15) & ~15
+        self.state.emit("    addi t0, t0, 15");
+        self.state.emit("    andi t0, t0, -16");
+        // Subtract from SP to allocate stack space (stack grows downward).
+        self.state.emit("    sub sp, sp, t0");
+        // The allocated region starts at the new SP value.
+        self.state.emit("    mv t0, sp");
+        self.store_t0_to(dest);
+        // Mark that SP has been dynamically modified — ensures the epilogue
+        // restores SP from s0 rather than using sp-relative offsets.
+        self.state.has_dyn_alloca = true;
     }
 
     /// Emit epilogue: restore ra/s0 and deallocate stack.

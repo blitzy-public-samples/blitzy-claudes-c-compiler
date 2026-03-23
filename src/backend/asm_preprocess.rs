@@ -1431,4 +1431,165 @@ mod tests {
             "rdmsr\\()_safe_regs"
         );
     }
+
+    // ── Integration tests for macro parameter prefix-matching fix ──────
+
+    #[test]
+    fn test_expand_macros_prefix_param_names() {
+        // Regression test for fix_macro_param_prefix_substitution:
+        // When a macro has params `orig` and `orig_len`, naive substitution
+        // causes `\orig` to match inside `\orig_len`, producing corrupted
+        // output like `140b_len` instead of the actual value of orig_len.
+        //
+        // The fix sorts parameters by name length (longest first) so
+        // `\orig_len` is substituted before `\orig`, and
+        // `replace_macro_param` additionally checks word boundaries.
+        let lines = vec![
+            ".macro test_prefix orig, orig_len",
+            ".byte \\orig",
+            ".byte \\orig_len",
+            ".long \\orig_len - \\orig",
+            ".endm",
+            "test_prefix 140b, 42",
+        ];
+        let result = expand_macros(&lines, &CommentStyle::Hash).unwrap();
+        // \orig_len must resolve to "42", NOT "140b_len"
+        assert!(
+            result.iter().any(|l| l.contains(".byte 42")),
+            "\\orig_len should expand to 42, got: {:?}",
+            result
+        );
+        // \orig must resolve to "140b"
+        assert!(
+            result.iter().any(|l| l.contains(".byte 140b")),
+            "\\orig should expand to 140b, got: {:?}",
+            result
+        );
+        // Combined expression: "42 - 140b"
+        assert!(
+            result.iter().any(|l| l.contains(".long 42 - 140b")),
+            "combined expression should have both params resolved, got: {:?}",
+            result
+        );
+        // Crucially: no corrupted "140b_len" should appear anywhere
+        assert!(
+            !result.iter().any(|l| l.contains("140b_len")),
+            "corrupted prefix substitution detected — \\orig matched inside \\orig_len: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_expand_macros_altinstructions_pattern() {
+        // Simulates the Linux kernel's .altinstructions macro pattern
+        // that triggered the original bug. The kernel defines macros with
+        // parameters like `orig`, `orig_len`, `alt`, `alt_len` where
+        // naive substitution of `\orig` before `\orig_len` corrupts output.
+        let lines = vec![
+            ".macro ALTERNATIVE orig, orig_len, alt, alt_len, vendor_id",
+            ".long \\orig",
+            ".long \\alt",
+            ".byte \\vendor_id",
+            ".byte \\orig_len",
+            ".byte \\alt_len",
+            ".endm",
+            "ALTERNATIVE 886b, 888f-886b, 887b, 889f-887b, 0x1234",
+        ];
+        let result = expand_macros(&lines, &CommentStyle::Hash).unwrap();
+        // orig_len = "888f-886b", alt_len = "889f-887b"
+        assert!(
+            result.iter().any(|l| l.contains(".byte 888f-886b")),
+            "\\orig_len should expand to '888f-886b', got: {:?}",
+            result
+        );
+        assert!(
+            result.iter().any(|l| l.contains(".byte 889f-887b")),
+            "\\alt_len should expand to '889f-887b', got: {:?}",
+            result
+        );
+        assert!(
+            result.iter().any(|l| l.contains(".long 886b")),
+            "\\orig should expand to '886b', got: {:?}",
+            result
+        );
+        assert!(
+            result.iter().any(|l| l.contains(".long 887b")),
+            "\\alt should expand to '887b', got: {:?}",
+            result
+        );
+        assert!(
+            result.iter().any(|l| l.contains(".byte 0x1234")),
+            "\\vendor_id should expand to '0x1234', got: {:?}",
+            result
+        );
+        // No corrupted prefix substitution artifacts
+        assert!(
+            !result.iter().any(|l| l.contains("886b_len") || l.contains("887b_len")),
+            "corrupted prefix substitution detected in altinstructions pattern: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_expand_macros_three_prefix_params() {
+        // Edge case: three parameters where each is a prefix of the next:
+        // `a`, `ab`, `abc` — tests that longest-first sort handles chains.
+        let lines = vec![
+            ".macro chain a, ab, abc",
+            ".long \\abc",
+            ".long \\ab",
+            ".long \\a",
+            ".endm",
+            "chain X, Y, Z",
+        ];
+        let result = expand_macros(&lines, &CommentStyle::Hash).unwrap();
+        assert!(
+            result.iter().any(|l| l.contains(".long Z")),
+            "\\abc should expand to Z, got: {:?}",
+            result
+        );
+        assert!(
+            result.iter().any(|l| l.contains(".long Y")),
+            "\\ab should expand to Y, got: {:?}",
+            result
+        );
+        assert!(
+            result.iter().any(|l| l.contains(".long X")),
+            "\\a should expand to X, got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_expand_macros_with_reexpansion_prefix_params() {
+        // Test that re-expansion (nested macro calls) also handles prefix params.
+        // Inner macro has prefix-confusable params; outer macro invokes it.
+        let lines = vec![
+            ".macro inner val, val_extra",
+            ".word \\val",
+            ".word \\val_extra",
+            ".endm",
+            ".macro outer x, y",
+            "inner \\x, \\y",
+            ".endm",
+            "outer 10, 20",
+        ];
+        let result = expand_macros(&lines, &CommentStyle::Hash).unwrap();
+        assert!(
+            result.iter().any(|l| l.contains(".word 10")),
+            "\\val should expand to 10, got: {:?}",
+            result
+        );
+        assert!(
+            result.iter().any(|l| l.contains(".word 20")),
+            "\\val_extra should expand to 20, got: {:?}",
+            result
+        );
+        // No corruption: "10_extra" should not appear
+        assert!(
+            !result.iter().any(|l| l.contains("10_extra")),
+            "corrupted prefix substitution in re-expansion: {:?}",
+            result
+        );
+    }
 }

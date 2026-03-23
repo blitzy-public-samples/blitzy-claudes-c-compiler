@@ -1,0 +1,9 @@
+sizeof_struct: OK
+alignof_struct: OK
+store_load_a: OK
+store_load_b: OK
+a_stable_after_b: OK
+b_stable_after_a: OK
+unnamed_gap_no_leak: OK
+signed_values: OK
+All unnamed bitfield tests passed

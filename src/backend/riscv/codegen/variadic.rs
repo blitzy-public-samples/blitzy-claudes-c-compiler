@@ -1,4 +1,31 @@
 //! RiscvCodegen: va_arg, va_start, va_copy operations.
+//!
+//! ## RISC-V LP64D Variadic Argument Passing
+//!
+//! On RISC-V LP64D, `va_list` is a simple `void*` pointing to the next
+//! argument in the stack overflow area. The register save area holds a0–a7
+//! (64 bytes) above the frame pointer; stack overflow arguments follow.
+//!
+//! ### Alignment Contract
+//!
+//! Types requiring >8-byte alignment (I128, F128, and structs containing
+//! them) must be 16-byte aligned on the variadic argument stack. This is
+//! a caller/callee contract:
+//!
+//! - **Caller** (`calls.rs`): Must place ≥16-byte-aligned types at
+//!   16-byte-aligned stack offsets, inserting padding as needed.
+//! - **Callee** (`emit_va_arg_impl` here): Aligns the va_list pointer
+//!   for direct F128 and I128 reads.
+//!
+//! ### Struct va_arg Path
+//!
+//! Struct variadic arguments do NOT flow through `emit_va_arg_impl` as
+//! whole structs. Instead, the IR lowering in `lower_va_arg_struct`
+//! (expr_access.rs) decomposes struct reads into individual 8-byte
+//! `VaArg { result_ty: IrType::I64 }` slot reads. Struct alignment is
+//! handled at the IR level (before the slot reads) and at the caller
+//! level (proper stack padding). Each slot read enters the standard
+//! 8-byte path in `emit_va_arg_impl`.
 
 use crate::ir::reexports::Value;
 use crate::common::types::IrType;
@@ -19,6 +46,22 @@ impl RiscvCodegen {
         }
         // Load the current va_list pointer value (points to next arg)
         self.state.emit("    ld t2, 0(t1)");
+
+        // I128/U128: 16 bytes, 16-byte aligned on RISC-V LP64D.
+        // Like F128, __int128 needs 16-byte alignment when read from the
+        // variadic argument stack. Unlike F128 there is no float conversion;
+        // we simply load both 64-bit halves and store via store_t0_t1_to.
+        if matches!(result_ty, IrType::I128 | IrType::U128) {
+            self.state.emit("    addi t2, t2, 15");
+            self.state.emit("    andi t2, t2, -16");
+            self.state.emit("    ld t0, 0(t2)");      // low 64 bits
+            self.state.emit("    ld t3, 8(t2)");      // high 64 bits (temp in t3)
+            self.state.emit("    addi t2, t2, 16");
+            self.state.emit("    sd t2, 0(t1)");      // advance va_list
+            self.state.emit("    mv t1, t3");          // move high half to t1
+            self.store_t0_t1_to(dest);
+            return;
+        }
 
         if result_ty.is_long_double() {
             // F128 (long double): 16 bytes, 16-byte aligned.

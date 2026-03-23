@@ -423,14 +423,44 @@ impl SourceManager {
     /// Get the source line text for a given span (for error snippet display).
     /// Returns the full line containing the span start position.
     /// Assumes files[0] contains the preprocessed output (set by the driver via add_file).
+    ///
+    /// This method is stateless with respect to the span: it can be called multiple
+    /// times with different spans (including spans referencing different locations in
+    /// the same file) and will return the correct source line for each. This makes it
+    /// safe for multi-error recovery scenarios where the parser emits up to 20
+    /// diagnostics per translation unit, each with its own independent span.
     pub fn get_source_line(&self, span: Span) -> Option<String> {
         if self.files.is_empty() {
             return None;
         }
         let content = self.files[0].content.as_bytes();
         let offset = span.start as usize;
-        if offset >= content.len() {
+        if offset > content.len() {
             return None;
+        }
+
+        // Handle EOF: when offset equals content length, find the last line.
+        // This supports "expected ';' before end of file" diagnostics that point
+        // past the last character in the source.
+        if offset == content.len() {
+            if content.is_empty() {
+                return None;
+            }
+            // Back up past trailing newline if present to find a non-empty last line
+            let mut end = content.len();
+            if end > 0 && content[end - 1] == b'\n' {
+                end -= 1;
+            }
+            // Find start of the last line
+            let mut start = end;
+            while start > 0 && content[start - 1] != b'\n' {
+                start -= 1;
+            }
+            let line_bytes = &content[start..end];
+            if is_line_marker(line_bytes) {
+                return None;
+            }
+            return std::str::from_utf8(line_bytes).ok().map(|s| s.to_string());
         }
 
         // Find start of the line
@@ -455,6 +485,21 @@ impl SourceManager {
         }
 
         std::str::from_utf8(line_bytes).ok().map(|s| s.to_string())
+    }
+
+    /// Get both the source line text and column position for a given span in a single call.
+    ///
+    /// This is a convenience method that combines the functionality of `get_source_line()`
+    /// and the column portion of `resolve_span()`, avoiding redundant span resolution when
+    /// both the source line and column are needed (e.g., for rendering caret diagnostics).
+    ///
+    /// Returns `Some((line_text, column))` where column is 1-indexed, or `None` if the
+    /// source line cannot be determined. Like `get_source_line()`, this method is stateless
+    /// and safe for multi-error recovery scenarios.
+    pub fn get_source_line_and_column(&self, span: Span) -> Option<(String, u32)> {
+        let line_text = self.get_source_line(span)?;
+        let loc = self.resolve_span(span);
+        Some((line_text, loc.column))
     }
 
     /// Get the include chain for a file, from innermost to outermost.
@@ -594,3 +639,4 @@ fn parse_u32_from_digits(bytes: &[u8]) -> Option<u32> {
     }
     Some(result)
 }
+

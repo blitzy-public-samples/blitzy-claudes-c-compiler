@@ -18,7 +18,7 @@ impl RiscvCodegen {
     pub(super) fn amo_ordering(ordering: AtomicOrdering) -> &'static str {
         match ordering {
             AtomicOrdering::Relaxed => "",
-            AtomicOrdering::Acquire => ".aq",
+            AtomicOrdering::Consume | AtomicOrdering::Acquire => ".aq",
             AtomicOrdering::Release => ".rl",
             AtomicOrdering::AcqRel => ".aqrl",
             AtomicOrdering::SeqCst => ".aqrl",
@@ -180,6 +180,109 @@ impl RiscvCodegen {
                 self.state.emit("    and t3, t3, a4"); // mask to field
                 self.state.emit("    and t4, t0, a5"); // clear old field
                 self.state.emit("    or t4, t4, t3");  // insert new value
+            }
+            AtomicRmwOp::Min => {
+                // Signed min: new_field = smin(old_field, val_field)
+                // Extract old and val fields to low bits, sign-extend for
+                // correct signed comparison, select minimum, re-insert.
+                let skip_label = self.state.fresh_label("sw_min_skip");
+                self.state.emit("    and t3, t0, a4"); // t3 = old field (shifted)
+                self.state.emit("    srl t3, t3, a3"); // t3 = old field in low bits
+                self.state.emit("    srl t5, t2, a3"); // t5 = val field in low bits
+                // Sign-extend both operands to full register width for blt
+                if bits == 8 {
+                    self.state.emit("    slli t3, t3, 56");
+                    self.state.emit("    srai t3, t3, 56");
+                    self.state.emit("    slli t5, t5, 56");
+                    self.state.emit("    srai t5, t5, 56");
+                } else {
+                    self.state.emit("    slli t3, t3, 48");
+                    self.state.emit("    srai t3, t3, 48");
+                    self.state.emit("    slli t5, t5, 48");
+                    self.state.emit("    srai t5, t5, 48");
+                }
+                // If old < val (signed), old is the min — keep t3
+                self.state.emit_fmt(format_args!("    blt t3, t5, {}", skip_label));
+                self.state.emit("    mv t3, t5"); // old >= val: use val as min
+                self.state.emit_fmt(format_args!("{}:", skip_label));
+                // Mask back to sub-word field width, shift into position, insert
+                if bits == 8 {
+                    self.state.emit("    andi t3, t3, 0xff");
+                } else {
+                    self.state.emit("    slli t3, t3, 48");
+                    self.state.emit("    srli t3, t3, 48");
+                }
+                self.state.emit("    sllw t3, t3, a3"); // shift back
+                self.state.emit("    and t3, t3, a4"); // mask to field
+                self.state.emit("    and t4, t0, a5"); // clear old field
+                self.state.emit("    or t4, t4, t3");  // insert new value
+            }
+            AtomicRmwOp::Max => {
+                // Signed max: new_field = smax(old_field, val_field)
+                // Same as Min but keep old when old >= val (signed).
+                let skip_label = self.state.fresh_label("sw_max_skip");
+                self.state.emit("    and t3, t0, a4");
+                self.state.emit("    srl t3, t3, a3");
+                self.state.emit("    srl t5, t2, a3");
+                // Sign-extend both operands for correct signed comparison
+                if bits == 8 {
+                    self.state.emit("    slli t3, t3, 56");
+                    self.state.emit("    srai t3, t3, 56");
+                    self.state.emit("    slli t5, t5, 56");
+                    self.state.emit("    srai t5, t5, 56");
+                } else {
+                    self.state.emit("    slli t3, t3, 48");
+                    self.state.emit("    srai t3, t3, 48");
+                    self.state.emit("    slli t5, t5, 48");
+                    self.state.emit("    srai t5, t5, 48");
+                }
+                // If old >= val (signed), old is the max — keep t3
+                self.state.emit_fmt(format_args!("    bge t3, t5, {}", skip_label));
+                self.state.emit("    mv t3, t5"); // old < val: use val as max
+                self.state.emit_fmt(format_args!("{}:", skip_label));
+                // Mask back to sub-word field width, shift into position, insert
+                if bits == 8 {
+                    self.state.emit("    andi t3, t3, 0xff");
+                } else {
+                    self.state.emit("    slli t3, t3, 48");
+                    self.state.emit("    srli t3, t3, 48");
+                }
+                self.state.emit("    sllw t3, t3, a3");
+                self.state.emit("    and t3, t3, a4");
+                self.state.emit("    and t4, t0, a5");
+                self.state.emit("    or t4, t4, t3");
+            }
+            AtomicRmwOp::UMin => {
+                // Unsigned min: new_field = umin(old_field, val_field)
+                // Zero-extended values (from srl) are correct for bltu.
+                let skip_label = self.state.fresh_label("sw_umin_skip");
+                self.state.emit("    and t3, t0, a4");
+                self.state.emit("    srl t3, t3, a3");
+                self.state.emit("    srl t5, t2, a3");
+                // If old < val (unsigned), old is the min — keep t3
+                self.state.emit_fmt(format_args!("    bltu t3, t5, {}", skip_label));
+                self.state.emit("    mv t3, t5"); // old >= val: use val as min
+                self.state.emit_fmt(format_args!("{}:", skip_label));
+                self.state.emit("    sllw t3, t3, a3");
+                self.state.emit("    and t3, t3, a4");
+                self.state.emit("    and t4, t0, a5");
+                self.state.emit("    or t4, t4, t3");
+            }
+            AtomicRmwOp::UMax => {
+                // Unsigned max: new_field = umax(old_field, val_field)
+                // Zero-extended values (from srl) are correct for bgeu.
+                let skip_label = self.state.fresh_label("sw_umax_skip");
+                self.state.emit("    and t3, t0, a4");
+                self.state.emit("    srl t3, t3, a3");
+                self.state.emit("    srl t5, t2, a3");
+                // If old >= val (unsigned), old is the max — keep t3
+                self.state.emit_fmt(format_args!("    bgeu t3, t5, {}", skip_label));
+                self.state.emit("    mv t3, t5"); // old < val: use val as max
+                self.state.emit_fmt(format_args!("{}:", skip_label));
+                self.state.emit("    sllw t3, t3, a3");
+                self.state.emit("    and t3, t3, a4");
+                self.state.emit("    and t4, t0, a5");
+                self.state.emit("    or t4, t4, t3");
             }
         }
 
@@ -475,6 +578,18 @@ impl RiscvCodegen {
                     self.state.emit("    li t2, 1");
                     self.state.emit_fmt(format_args!("    amoswap.{}{} t0, t2, (t1)", suffix, aq_rl));
                 }
+                AtomicRmwOp::Min => {
+                    self.state.emit_fmt(format_args!("    amomin.{}{} t0, t2, (t1)", suffix, aq_rl));
+                }
+                AtomicRmwOp::Max => {
+                    self.state.emit_fmt(format_args!("    amomax.{}{} t0, t2, (t1)", suffix, aq_rl));
+                }
+                AtomicRmwOp::UMin => {
+                    self.state.emit_fmt(format_args!("    amominu.{}{} t0, t2, (t1)", suffix, aq_rl));
+                }
+                AtomicRmwOp::UMax => {
+                    self.state.emit_fmt(format_args!("    amomaxu.{}{} t0, t2, (t1)", suffix, aq_rl));
+                }
             }
         }
         Self::sign_extend_riscv(&mut self.state, ty);
@@ -518,6 +633,66 @@ impl RiscvCodegen {
         self.store_t0_to(dest);
     }
 
+    /// Weak compare-and-exchange: a single LR/SC attempt without retry.
+    ///
+    /// On RISC-V, weak CAS maps naturally to a single LR/SC pair. Unlike the
+    /// strong CAS (`emit_atomic_cmpxchg_impl`) which loops on SC failure, weak
+    /// CAS is allowed to fail spuriously, so we emit only one attempt. For
+    /// sub-word types, we delegate to the strong CAS since the masking logic
+    /// is the same and a single LR.W/SC.W attempt is already sufficient.
+    pub(super) fn emit_atomic_cmpxchg_weak_impl(
+        &mut self,
+        dest: &Value,
+        ptr: &Operand,
+        expected: &Operand,
+        desired: &Operand,
+        ty: IrType,
+        ordering: AtomicOrdering,
+        failure_ordering: AtomicOrdering,
+        returns_bool: bool,
+    ) {
+        if Self::is_subword_type(ty) {
+            // Sub-word: use strong CAS path (already a single LR.W/SC.W loop
+            // with masking; the retry is only on SC failure which is fine for weak).
+            self.emit_atomic_cmpxchg_impl(dest, ptr, expected, desired, ty, ordering, failure_ordering, returns_bool);
+            return;
+        }
+
+        // Word/doubleword: single LR/SC attempt without retry loop.
+        self.operand_to_t0(ptr);
+        self.state.emit("    mv t1, t0");
+        self.operand_to_t0(desired);
+        self.state.emit("    mv t3, t0");
+        self.operand_to_t0(expected);
+        self.state.emit("    mv t2, t0");
+
+        let aq_rl = Self::amo_ordering(ordering);
+        let suffix = Self::amo_width_suffix(ty);
+        let fail_label = self.state.fresh_label("wcas_fail");
+        let done_label = self.state.fresh_label("wcas_done");
+
+        // Single LR/SC attempt — no retry on SC failure (spurious fail allowed).
+        self.state.emit_fmt(format_args!("    lr.{}{} t0, (t1)", suffix, aq_rl));
+        self.state.emit_fmt(format_args!("    bne t0, t2, {}", fail_label));
+        self.state.emit_fmt(format_args!("    sc.{}{} t4, t3, (t1)", suffix, aq_rl));
+        // SC failure (t4 != 0) is treated as a spurious failure for weak CAS.
+        if returns_bool {
+            // Success if SC succeeded (t4 == 0) AND value matched.
+            self.state.emit_fmt(format_args!("    bnez t4, {}", fail_label));
+            self.state.emit("    li t0, 1");
+            self.state.emit_fmt(format_args!("    j {}", done_label));
+            self.state.emit_fmt(format_args!("{}:", fail_label));
+            self.state.emit("    li t0, 0");
+            self.state.emit_fmt(format_args!("{}:", done_label));
+        } else {
+            // returns the loaded value (old value at ptr)
+            self.state.emit_fmt(format_args!("    j {}", done_label));
+            self.state.emit_fmt(format_args!("{}:", fail_label));
+            self.state.emit_fmt(format_args!("{}:", done_label));
+        }
+        self.store_t0_to(dest);
+    }
+
     pub(super) fn emit_atomic_load_impl(&mut self, dest: &Value, ptr: &Operand, ty: IrType, ordering: AtomicOrdering) {
         self.operand_to_t0(ptr);
         if Self::is_subword_type(ty) {
@@ -531,14 +706,14 @@ impl RiscvCodegen {
                 IrType::U16 => self.state.emit("    lhu t0, 0(t0)"),
                 _ => unreachable!("non-subword type in subword atomic load: {:?}", ty),
             }
-            if matches!(ordering, AtomicOrdering::Acquire | AtomicOrdering::AcqRel | AtomicOrdering::SeqCst) {
+            if matches!(ordering, AtomicOrdering::Acquire | AtomicOrdering::Consume | AtomicOrdering::AcqRel | AtomicOrdering::SeqCst) {
                 self.state.emit("    fence r, rw");
             }
         } else {
             let suffix = Self::amo_width_suffix(ty);
             let lr_suffix = match ordering {
                 AtomicOrdering::Relaxed | AtomicOrdering::Release => "",
-                AtomicOrdering::Acquire => ".aq",
+                AtomicOrdering::Consume | AtomicOrdering::Acquire => ".aq",
                 AtomicOrdering::AcqRel | AtomicOrdering::SeqCst => ".aqrl",
             };
             self.state.emit_fmt(format_args!("    lr.{}{} t0, (t0)", suffix, lr_suffix));
@@ -573,7 +748,7 @@ impl RiscvCodegen {
     pub(super) fn emit_fence_impl(&mut self, ordering: AtomicOrdering) {
         match ordering {
             AtomicOrdering::Relaxed => {}
-            AtomicOrdering::Acquire => self.state.emit("    fence r, rw"),
+            AtomicOrdering::Consume | AtomicOrdering::Acquire => self.state.emit("    fence r, rw"),
             AtomicOrdering::Release => self.state.emit("    fence rw, w"),
             AtomicOrdering::AcqRel | AtomicOrdering::SeqCst => self.state.emit("    fence rw, rw"),
         }

@@ -23,6 +23,10 @@ pub struct IrModule {
     /// Symbol aliases: (alias_name, target_name, is_weak)
     /// From __attribute__((alias("target"))) and __attribute__((weak))
     pub aliases: Vec<(String, String, bool)>,
+    /// IFUNC symbol aliases: (ifunc_name, resolver_name)
+    /// From __attribute__((ifunc("resolver"))). The linker creates IPLT stubs
+    /// with IRELATIVE relocations for these symbols.
+    pub ifunc_aliases: Vec<(String, String)>,
     /// Top-level asm("...") directives - emitted verbatim in assembly output
     pub toplevel_asm: Vec<String>,
     /// Symbol attribute directives for extern declarations:
@@ -256,6 +260,7 @@ impl IrModule {
             constructors: Vec::new(),
             destructors: Vec::new(),
             aliases: Vec::new(),
+            ifunc_aliases: Vec::new(),
             toplevel_asm: Vec::new(),
             symbol_attrs: Vec::new(),
             symver_directives: Vec::new(),

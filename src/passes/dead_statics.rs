@@ -184,6 +184,14 @@ fn compute_reachability<'a>(
         mark_reachable(aid, &mut reachable, &mut worklist, *next_id);
     }
 
+    // Roots: IFUNC aliases (the resolver function must survive dead code elimination)
+    for (ifunc_name, resolver_name) in &module.ifunc_aliases {
+        let rid = get_or_create_id(resolver_name, name_to_id, next_id);
+        mark_reachable(rid, &mut reachable, &mut worklist, *next_id);
+        let iid = get_or_create_id(ifunc_name, name_to_id, next_id);
+        mark_reachable(iid, &mut reachable, &mut worklist, *next_id);
+    }
+
     // Roots: constructors and destructors
     for ctor in &module.constructors {
         let id = get_or_create_id(ctor, name_to_id, next_id);

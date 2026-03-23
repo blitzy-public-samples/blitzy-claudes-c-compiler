@@ -71,7 +71,11 @@ pub struct Preprocessor {
     pub(super) system_include_paths: Vec<PathBuf>,
     /// Files currently being processed (for recursion detection)
     pub(super) include_stack: Vec<PathBuf>,
-    /// Files that have been included with #pragma once
+    /// Files that have been included with #pragma once, tracked by (device, inode).
+    /// Primary deduplication method — catches symlinks and hard links.
+    pub(super) pragma_once_inodes: FxHashSet<(u64, u64)>,
+    /// Fallback path-based tracking for files where metadata cannot be obtained.
+    /// Also used by includes.rs for backward-compatible checks.
     pub(super) pragma_once_files: FxHashSet<PathBuf>,
     /// Whether to actually resolve includes (can be disabled for testing)
     pub(super) resolve_includes: bool,
@@ -119,6 +123,17 @@ pub struct Preprocessor {
     /// the macros expanded on that line. Populated during preprocessing and
     /// passed to the SourceManager for diagnostic rendering.
     macro_expansion_info: Vec<crate::common::source::MacroExpansionInfo>,
+    /// Whether trigraph processing is enabled (requires -trigraphs flag).
+    /// When enabled, trigraph sequences (e.g., `??=` → `#`) are replaced
+    /// in Phase 1 of translation, before line splicing. Disabled by default
+    /// per modern compiler conventions; enabled via `-trigraphs` CLI flag.
+    pub(super) trigraphs_enabled: bool,
+    /// Current pack alignment (None = default alignment).
+    /// Modified by `#pragma pack(N)` directives and restored by `#pragma pack()`.
+    pub(super) current_pack_alignment: Option<usize>,
+    /// Stack of pack alignments for `#pragma pack(push, N)` / `#pragma pack(pop)` semantics.
+    /// Each push saves the current alignment and sets a new one; pop restores the previous.
+    pub(super) pack_alignment_stack: Vec<Option<usize>>,
 }
 
 impl Preprocessor {
@@ -136,6 +151,7 @@ impl Preprocessor {
             after_include_paths: Vec::new(),
             system_include_paths: Self::default_system_include_paths(),
             include_stack: Vec::new(),
+            pragma_once_inodes: FxHashSet::default(),
             pragma_once_files: FxHashSet::default(),
             resolve_includes: true,
             pending_injections: Vec::new(),
@@ -148,6 +164,9 @@ impl Preprocessor {
             include_guard_macros: FxHashMap::default(),
             directive_expanding: FxHashSet::default(),
             macro_expansion_info: Vec::new(),
+            trigraphs_enabled: false,
+            current_pack_alignment: None,
+            pack_alignment_stack: Vec::new(),
         };
         pp.define_predefined_macros();
         define_builtin_macros(&mut pp.macros);
@@ -197,10 +216,21 @@ impl Preprocessor {
     /// - Only processes directives when no multi-line accumulation is pending
     fn preprocess_source(&mut self, source: &str, is_include: bool) -> String {
         // Per C standard (C11 5.1.1.2), translation phases are:
+        // Phase 1: Trigraph replacement (only when -trigraphs flag is active)
         // Phase 2: Line splicing (backslash-newline removal)
         // Phase 3: Comment replacement
-        // So we must join continued lines BEFORE stripping comments.
-        let source = self.join_continued_lines(source);
+        // So trigraphs are replaced first, then we join continued lines BEFORE
+        // stripping comments.
+        let source: std::borrow::Cow<'_, str> = if self.trigraphs_enabled {
+            let processed: String = source.lines()
+                .map(|line| Self::process_trigraphs(line))
+                .collect::<Vec<_>>()
+                .join("\n");
+            std::borrow::Cow::Owned(processed)
+        } else {
+            std::borrow::Cow::Borrowed(source)
+        };
+        let source = self.join_continued_lines(&source);
         let (source, line_map) = Self::strip_block_comments(&source);
         let mut output = String::with_capacity(source.len());
 
@@ -258,6 +288,45 @@ impl Preprocessor {
             // be processed regardless of pending multi-line accumulation. Other
             // directives (#include, #define, etc.) are only processed when there's
             // no pending line in included files.
+            //
+            // Also recognize the digraph `%:` as equivalent to `#` per C11 §6.4.6.
+            // Digraphs are alternate token spellings recognized unconditionally.
+            // When `%:` starts a line, it functions as a preprocessor directive
+            // introducer just like `#`. We normalize it to `#`-prefixed form so
+            // process_directive and all downstream handling works unchanged.
+            let digraph_normalized: String;
+            let trimmed = if !trimmed.starts_with('#') && trimmed.starts_with("%:") {
+                // Replace digraph sequences for directive processing per C11 §6.4.6:
+                //   %:%: → ##  (token paste operator, must be replaced FIRST)
+                //   %:   → #   (preprocessor directive / stringify operator)
+                // This normalization ensures process_directive and macro expansion
+                // see canonical `#` and `##` tokens.
+                let s = &trimmed;
+                let mut norm = String::with_capacity(s.len());
+                let bytes = s.as_bytes();
+                let mut j = 0;
+                while j < bytes.len() {
+                    if j + 3 < bytes.len()
+                        && bytes[j] == b'%' && bytes[j + 1] == b':'
+                        && bytes[j + 2] == b'%' && bytes[j + 3] == b':'
+                    {
+                        norm.push_str("##");
+                        j += 4;
+                    } else if j + 1 < bytes.len()
+                        && bytes[j] == b'%' && bytes[j + 1] == b':'
+                    {
+                        norm.push('#');
+                        j += 2;
+                    } else {
+                        norm.push(bytes[j] as char);
+                        j += 1;
+                    }
+                }
+                digraph_normalized = norm;
+                digraph_normalized.as_str()
+            } else {
+                trimmed
+            };
             let is_directive = trimmed.starts_with('#');
             let is_conditional_directive = if is_directive {
                 let after_hash = trimmed[1..].trim_start();
@@ -347,6 +416,13 @@ impl Preprocessor {
                     let after_hash = trimmed[1..].trim_start();
                     if after_hash.starts_with("define") || after_hash.starts_with("undef") {
                         let expanded = self.macros.expand_line_reuse(&pending_line, &mut expanding);
+                        // Process any _Pragma directives from this expansion
+                        let pending_pragmas = self.macros.take_pending_pragmas();
+                        for pragma_text in pending_pragmas {
+                            if let Some(pragma_output) = self.handle_pragma(&pragma_text) {
+                                output.push_str(&pragma_output);
+                            }
+                        }
                         pending_line.clear();
                         pending_line.push_str(&expanded);
                     } else if after_hash.starts_with("include") {
@@ -355,6 +431,13 @@ impl Preprocessor {
                         // pending tokens to output first. The included content must appear
                         // after the preceding tokens, not before them.
                         let expanded = self.macros.expand_line_reuse(&pending_line, &mut expanding);
+                        // Process any _Pragma directives from this expansion
+                        let pending_pragmas = self.macros.take_pending_pragmas();
+                        for pragma_text in pending_pragmas {
+                            if let Some(pragma_output) = self.handle_pragma(&pragma_text) {
+                                output.push_str(&pragma_output);
+                            }
+                        }
                         output.push_str(&expanded);
                         output.push('\n');
                         for _ in 1..pending_newlines {
@@ -408,6 +491,17 @@ impl Preprocessor {
                     line, &mut pending_line, &mut pending_newlines, &mut output,
                     &mut expanding,
                 );
+                // Process any _Pragma directives desugared during macro expansion.
+                // _Pragma("...") is equivalent to #pragma ... (C11 §6.10.9) and must
+                // be processed after each macro expansion pass. The MacroTable collects
+                // pending pragma strings during expansion; we drain and handle them here
+                // since accumulate_and_expand takes &self and cannot call &mut self methods.
+                let pending_pragmas = self.macros.take_pending_pragmas();
+                for pragma_text in pending_pragmas {
+                    if let Some(pragma_output) = self.handle_pragma(&pragma_text) {
+                        output.push_str(&pragma_output);
+                    }
+                }
                 // Collect macro expansion info for diagnostics.
                 // If expansion added content to the output, check if macros were used.
                 if !is_include && output.len() > output_len_before {
@@ -445,6 +539,13 @@ impl Preprocessor {
             let expanded = self.macros.expand_line_reuse(&pending_line, &mut expanding);
             output.push_str(&expanded);
             output.push('\n');
+            // Process any _Pragma directives from the final expansion pass
+            let pending_pragmas = self.macros.take_pending_pragmas();
+            for pragma_text in pending_pragmas {
+                if let Some(pragma_output) = self.handle_pragma(&pragma_text) {
+                    output.push_str(&pragma_output);
+                }
+            }
             // Collect macro expansion info for the flushed line
             if !is_include {
                 let expanded_names = self.macros.take_expanded_macros();
@@ -610,6 +711,72 @@ impl Preprocessor {
         self.macros.asm_mode = asm_mode;
     }
 
+    /// Enable or disable trigraph processing (C11 §5.2.1.1, Phase 1).
+    /// Called by the driver when the `-trigraphs` CLI flag is specified.
+    /// When enabled, three-character sequences beginning with `??` are replaced
+    /// with their single-character equivalents before any other preprocessing.
+    pub fn set_trigraphs(&mut self, enabled: bool) {
+        self.trigraphs_enabled = enabled;
+    }
+
+    /// Check if a file has been marked with `#pragma once`, using device+inode
+    /// as the primary lookup and path as a fallback.
+    ///
+    /// The device+inode approach correctly identifies files across symlinks and
+    /// hard links (two different paths pointing to the same filesystem object),
+    /// which the path-based check alone would miss. The path fallback handles
+    /// edge cases where filesystem metadata is unavailable.
+    pub(super) fn is_pragma_once_file(&self, path: &PathBuf) -> bool {
+        // Primary: check by device+inode (handles symlinks and hard links)
+        use std::os::unix::fs::MetadataExt;
+        if let Ok(metadata) = std::fs::metadata(path) {
+            if self.pragma_once_inodes.contains(&(metadata.dev(), metadata.ino())) {
+                return true;
+            }
+        }
+        // Fallback: check by path (backward compatibility)
+        self.pragma_once_files.contains(path)
+    }
+
+    /// Process trigraph sequences in a line (C11 §5.2.1.1, Phase 1).
+    /// Replaces three-character sequences beginning with `??` with their
+    /// single-character equivalents. Only called when `-trigraphs` is enabled.
+    ///
+    /// The nine trigraph sequences defined by the C standard are:
+    ///   `??=` → `#`    `??(` → `[`    `??/` → `\`
+    ///   `??)` → `]`    `??'` → `^`    `??<` → `{`
+    ///   `??!` → `|`    `??>` → `}`    `??-` → `~`
+    fn process_trigraphs(line: &str) -> String {
+        let bytes = line.as_bytes();
+        let len = bytes.len();
+        let mut result = String::with_capacity(len);
+        let mut i = 0;
+        while i < len {
+            if i + 2 < len && bytes[i] == b'?' && bytes[i + 1] == b'?' {
+                let replacement = match bytes[i + 2] {
+                    b'=' => Some('#'),
+                    b'(' => Some('['),
+                    b'/' => Some('\\'),
+                    b')' => Some(']'),
+                    b'\'' => Some('^'),
+                    b'<' => Some('{'),
+                    b'!' => Some('|'),
+                    b'>' => Some('}'),
+                    b'-' => Some('~'),
+                    _ => None,
+                };
+                if let Some(ch) = replacement {
+                    result.push(ch);
+                    i += 3;
+                    continue;
+                }
+            }
+            result.push(bytes[i] as char);
+            i += 1;
+        }
+        result
+    }
+
     /// Set the filename for __FILE__ and __BASE_FILE__ macros and set as the base include directory.
     pub fn set_filename(&mut self, filename: &str) {
         self.filename = filename.to_string();
@@ -734,8 +901,8 @@ impl Preprocessor {
     pub fn preprocess_force_include(&mut self, content: &str, resolved_path: &str) {
         let resolved = PathBuf::from(resolved_path);
 
-        // Check for #pragma once
-        if self.pragma_once_files.contains(&resolved) {
+        // Check for #pragma once (uses device+inode primary, path fallback)
+        if self.is_pragma_once_file(&resolved) {
             return;
         }
 
@@ -965,4 +1132,172 @@ impl Default for Preprocessor {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_process_trigraphs_all_nine() {
+        // ??= -> #
+        assert_eq!(Preprocessor::process_trigraphs("??="), "#");
+        // ??( -> [
+        assert_eq!(Preprocessor::process_trigraphs("??("), "[");
+        // ??/ -> backslash
+        assert_eq!(Preprocessor::process_trigraphs("??/"), "\\");
+        // ??) -> ]
+        assert_eq!(Preprocessor::process_trigraphs("??)"), "]");
+        // ??' -> ^
+        assert_eq!(Preprocessor::process_trigraphs("??'"), "^");
+        // ??< -> {
+        assert_eq!(Preprocessor::process_trigraphs("??<"), "{");
+        // ??! -> |
+        assert_eq!(Preprocessor::process_trigraphs("??!"), "|");
+        // ??> -> }
+        assert_eq!(Preprocessor::process_trigraphs("??>"), "}");
+        // ??- -> ~
+        assert_eq!(Preprocessor::process_trigraphs("??-"), "~");
+    }
+
+    #[test]
+    fn test_process_trigraphs_no_match() {
+        // ?? followed by non-trigraph char should pass through
+        assert_eq!(Preprocessor::process_trigraphs("??x"), "??x");
+        assert_eq!(Preprocessor::process_trigraphs("??"), "??");
+        assert_eq!(Preprocessor::process_trigraphs("?"), "?");
+    }
+
+    #[test]
+    fn test_process_trigraphs_empty() {
+        assert_eq!(Preprocessor::process_trigraphs(""), "");
+    }
+
+    #[test]
+    fn test_process_trigraphs_mixed() {
+        // Mix of trigraphs and normal text
+        assert_eq!(
+            Preprocessor::process_trigraphs("int a??(??) = ??<0??>;"),
+            "int a[] = {0};"
+        );
+    }
+
+    #[test]
+    fn test_process_trigraphs_consecutive() {
+        // Two trigraphs in sequence
+        assert_eq!(Preprocessor::process_trigraphs("??=??="), "##");
+    }
+
+    #[test]
+    fn test_trigraphs_disabled_by_default() {
+        let pp = Preprocessor::new();
+        assert!(!pp.trigraphs_enabled, "Trigraphs should be disabled by default");
+    }
+
+    #[test]
+    fn test_set_trigraphs() {
+        let mut pp = Preprocessor::new();
+        pp.set_trigraphs(true);
+        assert!(pp.trigraphs_enabled);
+        pp.set_trigraphs(false);
+        assert!(!pp.trigraphs_enabled);
+    }
+
+    #[test]
+    fn test_default_pack_alignment() {
+        let pp = Preprocessor::new();
+        assert!(pp.current_pack_alignment.is_none(), "Default pack should be None");
+        assert!(pp.pack_alignment_stack.is_empty(), "Default pack stack should be empty");
+    }
+
+    #[test]
+    fn test_pragma_once_inodes_initialized() {
+        let pp = Preprocessor::new();
+        assert!(pp.pragma_once_inodes.is_empty(), "Inodes set should start empty");
+        assert!(pp.pragma_once_files.is_empty(), "Files set should start empty");
+    }
+
+    #[test]
+    fn test_is_pragma_once_file_empty() {
+        let pp = Preprocessor::new();
+        let path = PathBuf::from("/nonexistent/path/to/file.h");
+        // Should return false for unknown files
+        assert!(!pp.is_pragma_once_file(&path));
+    }
+
+    #[test]
+    fn test_is_pragma_once_file_path_fallback() {
+        let mut pp = Preprocessor::new();
+        let path = PathBuf::from("/some/test/header.h");
+        pp.pragma_once_files.insert(path.clone());
+        // Should find via path fallback even though inode is not tracked
+        assert!(pp.is_pragma_once_file(&path));
+    }
+
+    #[test]
+    fn test_is_pragma_once_file_inode_tracking() {
+        use std::io::Write;
+        let mut pp = Preprocessor::new();
+        // Create a real temp file to get a valid device+inode
+        let tmp_dir = std::env::temp_dir();
+        let tmp_file = tmp_dir.join("blitzy_test_pragma_once.h");
+        {
+            let mut f = std::fs::File::create(&tmp_file).expect("create temp file");
+            f.write_all(b"// test header\n").expect("write temp file");
+        }
+        // Get the device+inode from the file
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::metadata(&tmp_file).expect("metadata");
+        let dev_ino = (meta.dev(), meta.ino());
+        // Insert the inode into the set
+        pp.pragma_once_inodes.insert(dev_ino);
+        // Should find via inode lookup
+        assert!(pp.is_pragma_once_file(&tmp_file));
+        // Clean up
+        let _ = std::fs::remove_file(&tmp_file);
+    }
+
+    #[test]
+    fn test_trigraph_pipeline_enabled() {
+        let mut pp = Preprocessor::new();
+        pp.set_filename("test.c");
+        pp.set_trigraphs(true);
+        // ??=define should become #define, making FOO a macro
+        let output = pp.preprocess("??=define FOO 42\nint x = FOO;");
+        assert!(
+            output.contains("int x = 42;"),
+            "Trigraph ??= should become # enabling #define, got: {}",
+            output
+        );
+    }
+
+    #[test]
+    fn test_trigraph_pipeline_disabled() {
+        let mut pp = Preprocessor::new();
+        pp.set_filename("test.c");
+        // Trigraphs disabled (default)
+        let output = pp.preprocess("??=define FOO 42\nint x = FOO;");
+        // FOO should NOT be defined since ??= was not converted to #
+        assert!(
+            !output.contains("int x = 42;"),
+            "Trigraph should NOT be processed when disabled, got: {}",
+            output
+        );
+    }
+
+    #[test]
+    fn test_preprocessor_default_impl() {
+        let pp = Preprocessor::default();
+        assert!(!pp.trigraphs_enabled);
+        assert!(pp.current_pack_alignment.is_none());
+        assert!(pp.pack_alignment_stack.is_empty());
+        assert!(pp.pragma_once_inodes.is_empty());
+    }
+
+    #[test]
+    fn test_take_pending_pragmas_empty() {
+        // Ensure take_pending_pragmas returns empty vec when no pragmas pending
+        let mt = super::super::macro_defs::MacroTable::new();
+        let result = mt.take_pending_pragmas();
+        assert!(result.is_empty(), "Should return empty vec");
+    }
+}
 

@@ -407,6 +407,14 @@ impl Lowerer {
                 return Operand::Value(vla_val);
             }
         }
+        // For sizeof(expr) on VLA expressions — try full runtime sizeof computation
+        // which handles stride-based multi-dimensional VLA sizeof and VLA typedef
+        // expressions that get_vla_sizeof's simple lookup missed.
+        if let SizeofArg::Expr(expr) = arg {
+            if let Some(runtime_val) = self.try_sizeof_expr_runtime(expr) {
+                return Operand::Value(runtime_val);
+            }
+        }
         let size = match arg {
             SizeofArg::Type(ts) => self.sizeof_type(ts),
             SizeofArg::Expr(expr) => self.sizeof_expr(expr),
@@ -415,16 +423,37 @@ impl Lowerer {
     }
 
     fn get_vla_sizeof(&self, arg: &SizeofArg) -> Option<Value> {
-        if let SizeofArg::Expr(Expr::Identifier(name, _)) = arg {
-            // Check local VLA variables first
-            if let Some(info) = self.func().locals.get(name) {
-                if info.vla_size.is_some() {
-                    return info.vla_size;
+        if let SizeofArg::Expr(expr) = arg {
+            match expr {
+                Expr::Identifier(name, _) => {
+                    // Check local VLA variables first
+                    if let Some(info) = self.func().locals.get(name) {
+                        if info.vla_size.is_some() {
+                            return info.vla_size;
+                        }
+                    }
+                    // Then check VLA typedef names (sizeof applied to a typedef identifier)
+                    if let Some(&vla_size) = self.func().vla_typedef_sizes.get(name) {
+                        return Some(vla_size);
+                    }
                 }
-            }
-            // Then check VLA typedef names (sizeof applied to a typedef identifier)
-            if let Some(&vla_size) = self.func().vla_typedef_sizes.get(name) {
-                return Some(vla_size);
+                Expr::ArraySubscript(base, _index, _) => {
+                    // sizeof(arr[i]) where arr is a multi-dimensional VLA.
+                    // For `int arr[n][m]`, sizeof(arr[0]) = m * sizeof(int).
+                    // This value is stored in vla_strides[0] by
+                    // compute_vla_local_strides (the stride for the outermost
+                    // dimension equals the sub-array size).
+                    if let Expr::Identifier(name, _) = base.as_ref() {
+                        if let Some(info) = self.func().locals.get(name) {
+                            if info.vla_size.is_some() && !info.vla_strides.is_empty() {
+                                if let Some(stride) = info.vla_strides[0] {
+                                    return Some(stride);
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
             }
         }
         None

@@ -392,6 +392,146 @@ pub(super) struct IrParamBuildResult {
     pub uses_sret: bool,
 }
 
+/// Classification of a function definition's inline linkage behavior.
+///
+/// Inline linkage determines whether a function definition emits an externally
+/// visible symbol, an internal (static) symbol, or is available for inlining only.
+///
+/// C99/C11 semantics (§6.7.4p7):
+///   `inline` without `extern` = inline definition only (no external def)
+///   `extern inline` = provides external definition
+///   `static inline` = internal linkage
+///
+/// GNU89 semantics (-fgnu89-inline, -std=c89, or __attribute__((gnu_inline))):
+///   `inline` without `extern` = provides external definition (may be weak/comdat)
+///   `extern inline` = inline definition only (expects external def elsewhere)
+///   `static inline` = internal linkage (same as C99)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum InlineLinkage {
+    /// Function provides an external (global) definition.
+    /// Symbol is visible to the linker for external resolution.
+    ExternalDef,
+    /// Function is an inline-only definition — no external symbol emitted.
+    /// The body is available for inlining, but if not inlined, it is lowered
+    /// as a static/local symbol to avoid duplicate definition errors.
+    InlineOnly,
+    /// Function has internal (static) linkage.
+    /// Always emitted as a local symbol, safe to skip if unreferenced.
+    StaticDef,
+    /// Function is not declared `inline` — standard external definition.
+    NotInline,
+}
+
+impl InlineLinkage {
+    /// Whether this function can be skipped if unreferenced.
+    /// InlineOnly and StaticDef functions don't need external symbols,
+    /// so they can be omitted if no call site references them.
+    pub fn can_skip_if_unreferenced(&self) -> bool {
+        matches!(self, InlineLinkage::InlineOnly | InlineLinkage::StaticDef)
+    }
+
+    /// Whether this function should be emitted with local/static linkage.
+    /// Both InlineOnly and StaticDef emit as local symbols.
+    pub fn is_local_linkage(&self) -> bool {
+        matches!(self, InlineLinkage::InlineOnly | InlineLinkage::StaticDef)
+    }
+
+    /// Whether this function is a GNU inline definition (extern inline with GNU89 semantics).
+    /// Such functions need special handling in the IR: they don't provide an external def
+    /// but their body should be available for inlining at call sites.
+    ///
+    /// Note: This method returns `false` because the InlineLinkage enum alone cannot
+    /// distinguish GNU89 InlineOnly from C99 InlineOnly. The actual `is_gnu_inline_def`
+    /// flag on `IrFunction` (set in `func_lowering.rs`) should continue using
+    /// `is_gnu_inline_no_extern_def` directly. Callers that need this distinction should
+    /// check `is_gnu_inline_attr` or `gnu89_inline_mode` at the call site.
+    pub fn is_gnu_inline_def(&self) -> bool {
+        false
+    }
+}
+
+/// Determine the inline linkage class for a function definition.
+///
+/// This centralizes the C99/C11 vs GNU89 inline linkage rules (C11 §6.7.4p7)
+/// into a single decision point. The result controls:
+/// - Whether the function can be skipped if unreferenced (InlineOnly, StaticDef)
+/// - Whether the emitted symbol is global or local (ExternalDef vs InlineOnly/StaticDef)
+///
+/// # Arguments
+/// - `is_inline`: function has `inline` specifier
+/// - `is_extern`: function has `extern` specifier
+/// - `is_static`: function has `static` specifier
+/// - `is_gnu_inline_attr`: function has `__attribute__((gnu_inline))`
+/// - `gnu89_inline_mode`: driver is in GNU89 inline mode (-fgnu89-inline or -std=c89)
+/// - `has_non_inline_decl`: any prior file-scope declaration of this function lacks
+///   `inline` or has `extern`
+///
+/// # C99/C11 Semantics (default)
+/// - `extern inline` → ExternalDef (provides the external definition)
+/// - `inline` (no extern, all decls also `inline`) → InlineOnly
+/// - `inline` (no extern, but some decl has `extern` or lacks `inline`) → ExternalDef
+/// - `static inline` → StaticDef
+///
+/// # GNU89 Semantics (via `-fgnu89-inline`, `-std=c89`, or `__attribute__((gnu_inline))`)
+/// - `extern inline` → InlineOnly (no external def; expects external def elsewhere)
+/// - `inline` (no extern) → ExternalDef (provides the externally-visible definition)
+/// - `static inline` → StaticDef (same as C99)
+pub(super) fn determine_inline_linkage(
+    is_inline: bool,
+    is_extern: bool,
+    is_static: bool,
+    is_gnu_inline_attr: bool,
+    gnu89_inline_mode: bool,
+    has_non_inline_decl: bool,
+) -> InlineLinkage {
+    // `static` always wins — internal linkage regardless of inline
+    if is_static {
+        return InlineLinkage::StaticDef;
+    }
+
+    // Not inline at all — standard external definition
+    if !is_inline {
+        return InlineLinkage::NotInline;
+    }
+
+    // Determine whether to use GNU89 semantics for this function.
+    // __attribute__((gnu_inline)) always forces GNU89 semantics for THAT function.
+    // The driver's gnu89_inline_mode applies to all inline functions without the attr.
+    let effective_gnu89 = is_gnu_inline_attr || gnu89_inline_mode;
+
+    if effective_gnu89 {
+        // GNU89 semantics
+        if is_extern {
+            // `extern inline` in GNU89 = inline-only, no external def.
+            // The function body is available for inlining, but it expects an
+            // external definition to be provided in another translation unit.
+            InlineLinkage::InlineOnly
+        } else {
+            // `inline` (no extern) in GNU89 = provides external definition.
+            // This is the externally-visible definition that the `extern inline`
+            // in headers refers to.
+            InlineLinkage::ExternalDef
+        }
+    } else {
+        // C99/C11 semantics (default)
+        if is_extern {
+            // `extern inline` in C99 = provides external definition
+            InlineLinkage::ExternalDef
+        } else {
+            // `inline` (no extern) in C99:
+            // - If ALL file-scope declarations include `inline` without `extern`,
+            //   this is an inline-only definition (no external def)
+            // - If ANY declaration lacks `inline` or has `extern`, this provides
+            //   an external definition (C99 §6.7.4p7)
+            if has_non_inline_decl {
+                InlineLinkage::ExternalDef
+            } else {
+                InlineLinkage::InlineOnly
+            }
+        }
+    }
+}
+
 // --- Construction helpers ---
 
 impl VarInfo {
@@ -453,5 +593,127 @@ impl LocalInfo {
             cleanup_fn: None,
             is_const,
         }
+    }
+}
+
+#[cfg(test)]
+mod inline_linkage_tests {
+    use super::{InlineLinkage, determine_inline_linkage};
+
+    // --- C99/C11 semantics tests ---
+
+    #[test]
+    fn c99_inline_no_extern_no_non_inline_decl_returns_inline_only() {
+        let result = determine_inline_linkage(true, false, false, false, false, false);
+        assert_eq!(result, InlineLinkage::InlineOnly);
+    }
+
+    #[test]
+    fn c99_extern_inline_returns_external_def() {
+        let result = determine_inline_linkage(true, true, false, false, false, false);
+        assert_eq!(result, InlineLinkage::ExternalDef);
+    }
+
+    #[test]
+    fn c99_inline_with_non_inline_decl_returns_external_def() {
+        let result = determine_inline_linkage(true, false, false, false, false, true);
+        assert_eq!(result, InlineLinkage::ExternalDef);
+    }
+
+    // --- static inline tests ---
+
+    #[test]
+    fn static_inline_returns_static_def() {
+        let result = determine_inline_linkage(true, false, true, false, false, false);
+        assert_eq!(result, InlineLinkage::StaticDef);
+    }
+
+    #[test]
+    fn static_inline_in_gnu89_returns_static_def() {
+        let result = determine_inline_linkage(true, false, true, false, true, false);
+        assert_eq!(result, InlineLinkage::StaticDef);
+    }
+
+    // --- GNU89 semantics tests ---
+
+    #[test]
+    fn gnu89_inline_no_extern_returns_external_def() {
+        let result = determine_inline_linkage(true, false, false, false, true, false);
+        assert_eq!(result, InlineLinkage::ExternalDef);
+    }
+
+    #[test]
+    fn gnu89_extern_inline_returns_inline_only() {
+        let result = determine_inline_linkage(true, true, false, false, true, false);
+        assert_eq!(result, InlineLinkage::InlineOnly);
+    }
+
+    // --- gnu_inline attribute tests ---
+
+    #[test]
+    fn gnu_inline_attr_extern_returns_inline_only() {
+        let result = determine_inline_linkage(true, true, false, true, false, false);
+        assert_eq!(result, InlineLinkage::InlineOnly);
+    }
+
+    #[test]
+    fn gnu_inline_attr_no_extern_returns_external_def() {
+        let result = determine_inline_linkage(true, false, false, true, false, false);
+        assert_eq!(result, InlineLinkage::ExternalDef);
+    }
+
+    // --- Not inline tests ---
+
+    #[test]
+    fn not_inline_returns_not_inline() {
+        let result = determine_inline_linkage(false, false, false, false, false, false);
+        assert_eq!(result, InlineLinkage::NotInline);
+    }
+
+    #[test]
+    fn extern_but_not_inline_returns_not_inline() {
+        let result = determine_inline_linkage(false, true, false, false, false, false);
+        assert_eq!(result, InlineLinkage::NotInline);
+    }
+
+    #[test]
+    fn static_not_inline_returns_static_def() {
+        let result = determine_inline_linkage(false, false, true, false, false, false);
+        assert_eq!(result, InlineLinkage::StaticDef);
+    }
+
+    // --- InlineLinkage method tests ---
+
+    #[test]
+    fn can_skip_if_unreferenced() {
+        assert!(InlineLinkage::InlineOnly.can_skip_if_unreferenced());
+        assert!(InlineLinkage::StaticDef.can_skip_if_unreferenced());
+        assert!(!InlineLinkage::ExternalDef.can_skip_if_unreferenced());
+        assert!(!InlineLinkage::NotInline.can_skip_if_unreferenced());
+    }
+
+    #[test]
+    fn is_local_linkage() {
+        assert!(InlineLinkage::InlineOnly.is_local_linkage());
+        assert!(InlineLinkage::StaticDef.is_local_linkage());
+        assert!(!InlineLinkage::ExternalDef.is_local_linkage());
+        assert!(!InlineLinkage::NotInline.is_local_linkage());
+    }
+
+    #[test]
+    fn is_gnu_inline_def_returns_false() {
+        assert!(!InlineLinkage::ExternalDef.is_gnu_inline_def());
+        assert!(!InlineLinkage::InlineOnly.is_gnu_inline_def());
+        assert!(!InlineLinkage::StaticDef.is_gnu_inline_def());
+        assert!(!InlineLinkage::NotInline.is_gnu_inline_def());
+    }
+
+    #[test]
+    fn inline_linkage_is_copy_and_debug() {
+        let a = InlineLinkage::ExternalDef;
+        let b = a; // Copy trait
+        assert_eq!(a, b);
+        let s = format!("{:?}", InlineLinkage::InlineOnly);
+        assert!(s.contains("InlineOnly"));
     }
 }

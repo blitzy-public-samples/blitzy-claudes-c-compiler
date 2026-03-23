@@ -15,6 +15,8 @@
 /// - CRC32
 /// - Scalar math (SqrtF32, SqrtF64, FabsF32, FabsF64)
 /// - Frame/return address builtins
+/// - ARM NEON 128-bit operations (lane manipulation, widening/narrowing,
+///   saturating arithmetic, load/store, comparison, bitwise)
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum IntrinsicOp {
@@ -185,6 +187,180 @@ pub enum IntrinsicOp {
     Pinsrq128,
     /// Extract 64-bit value at lane (PEXTRQ) - returns scalar i64
     Pextrq128,
+
+    // --- ARM NEON 128-bit vector operations ---
+
+    // Lane manipulation
+    /// NEON: vget_lane - extract a scalar lane from a vector
+    /// args[0] = vector ptr, args[1] = lane index (imm); dest = scalar value
+    NeonGetLane,
+    /// NEON: vset_lane - insert a scalar value into a vector lane
+    /// args[0] = scalar value, args[1] = vector ptr, args[2] = lane index (imm); dest_ptr = result ptr
+    NeonSetLane,
+    /// NEON: vdup_n - broadcast a scalar to all vector lanes
+    /// args[0] = scalar value; dest_ptr = result vector ptr
+    NeonDupScalar,
+    /// NEON: vdup_lane - broadcast a lane from one vector to all lanes of result
+    /// args[0] = vector ptr, args[1] = lane index; dest_ptr = result vector ptr
+    NeonDupLane,
+
+    // Widening and narrowing
+    /// NEON: vmovl - sign/zero extend narrow vector to wide vector
+    /// args[0] = narrow vector ptr; dest_ptr = wide vector ptr
+    NeonMovl,
+    /// NEON: vmovn - truncate wide vector to narrow vector
+    /// args[0] = wide vector ptr; dest_ptr = narrow vector ptr
+    NeonMovn,
+    /// NEON: vqmovn - saturating narrow (wide to narrow with saturation)
+    /// args[0] = wide vector ptr; dest_ptr = narrow vector ptr
+    NeonQmovn,
+    /// NEON: vaddl - widening add (widen operands, then add)
+    /// args[0] = src1 ptr, args[1] = src2 ptr; dest_ptr = wide result ptr
+    NeonAddl,
+    /// NEON: vsubl - widening subtract
+    /// args[0] = src1 ptr, args[1] = src2 ptr; dest_ptr = wide result ptr
+    NeonSubl,
+
+    // Saturating arithmetic
+    /// NEON: vqadd - saturating add
+    /// args[0] = src1 ptr, args[1] = src2 ptr; dest_ptr = result ptr
+    NeonQadd,
+    /// NEON: vqsub - saturating subtract
+    /// args[0] = src1 ptr, args[1] = src2 ptr; dest_ptr = result ptr
+    NeonQsub,
+    /// NEON: vqdmull - saturating doubling multiply long
+    /// args[0] = src1 ptr, args[1] = src2 ptr; dest_ptr = result ptr
+    NeonQdmull,
+
+    // Vector load/store variants
+    /// NEON: vld1q - load single vector (128-bit aligned load)
+    /// args[0] = src memory ptr; dest_ptr = result vector ptr
+    NeonLd1,
+    /// NEON: vld2q - load and deinterleave two vectors
+    /// args[0] = src memory ptr; dest_ptr = result struct-of-2-vectors ptr
+    NeonLd2,
+    /// NEON: vld3q - load and deinterleave three vectors
+    /// args[0] = src memory ptr; dest_ptr = result struct-of-3-vectors ptr
+    NeonLd3,
+    /// NEON: vld4q - load and deinterleave four vectors
+    /// args[0] = src memory ptr; dest_ptr = result struct-of-4-vectors ptr
+    NeonLd4,
+    /// NEON: vst1q - store single vector (128-bit aligned store)
+    /// args[0] = vector ptr, args[1] = dest memory ptr
+    NeonSt1,
+    /// NEON: vst2q - interleave and store two vectors
+    /// args[0] = struct-of-2-vectors ptr, args[1] = dest memory ptr
+    NeonSt2,
+
+    // Comparison
+    /// NEON: vceq - compare equal (element-wise), result is mask
+    /// args[0] = src1 ptr, args[1] = src2 ptr; dest_ptr = result mask ptr
+    NeonCeq,
+    /// NEON: vcgt - compare greater-than (element-wise), result is mask
+    /// args[0] = src1 ptr, args[1] = src2 ptr; dest_ptr = result mask ptr
+    NeonCgt,
+    /// NEON: vcge - compare greater-than-or-equal (element-wise)
+    /// args[0] = src1 ptr, args[1] = src2 ptr; dest_ptr = result mask ptr
+    NeonCge,
+
+    // Bitwise operations
+    /// NEON: vand - bitwise AND of two vectors
+    /// args[0] = src1 ptr, args[1] = src2 ptr; dest_ptr = result ptr
+    NeonAnd,
+    /// NEON: vorr - bitwise OR of two vectors
+    /// args[0] = src1 ptr, args[1] = src2 ptr; dest_ptr = result ptr
+    NeonOrr,
+    /// NEON: veor - bitwise XOR of two vectors
+    /// args[0] = src1 ptr, args[1] = src2 ptr; dest_ptr = result ptr
+    NeonEor,
+    /// NEON: vbic - bitwise clear (AND NOT): a & ~b
+    /// args[0] = src1 ptr, args[1] = src2 ptr; dest_ptr = result ptr
+    NeonBic,
+    /// NEON: vbsl - bitwise select: (a & mask) | (b & ~mask)
+    /// args[0] = mask ptr, args[1] = src1 ptr, args[2] = src2 ptr; dest_ptr = result ptr
+    NeonBsl,
+
+    // Additional NEON arithmetic
+    /// NEON: vadd - vector add (non-saturating)
+    /// args[0] = src1 ptr, args[1] = src2 ptr; dest_ptr = result ptr
+    NeonAdd,
+    /// NEON: vsub - vector subtract (non-saturating)
+    /// args[0] = src1 ptr, args[1] = src2 ptr; dest_ptr = result ptr
+    NeonSub,
+    /// NEON: vmul - vector multiply
+    /// args[0] = src1 ptr, args[1] = src2 ptr; dest_ptr = result ptr
+    NeonMul,
+    /// NEON: vabs - vector absolute value
+    /// args[0] = src ptr; dest_ptr = result ptr
+    NeonAbs,
+    /// NEON: vneg - vector negate
+    /// args[0] = src ptr; dest_ptr = result ptr
+    NeonNeg,
+
+    // NEON shift operations
+    /// NEON: vshl - vector shift left by vector
+    /// args[0] = src ptr, args[1] = shift vector ptr; dest_ptr = result ptr
+    NeonShl,
+    /// NEON: vshr - vector shift right by immediate
+    /// args[0] = src ptr, args[1] = imm shift amount; dest_ptr = result ptr
+    NeonShr,
+}
+
+/// Resolve a NEON builtin function name to its corresponding IntrinsicOp.
+///
+/// Maps `__builtin_neon_*` compiler builtins and the short-form NEON intrinsic
+/// names (used when `arm_neon.h` intrinsics are implemented as compiler builtins
+/// rather than inline C functions) to the appropriate IntrinsicOp variant.
+///
+/// Returns `None` for unrecognized names, allowing the caller to fall back to
+/// other resolution strategies (e.g., regular function call lowering).
+pub(crate) fn resolve_neon_intrinsic(name: &str) -> Option<IntrinsicOp> {
+    // Strip common prefix variants
+    let core = name.strip_prefix("__builtin_neon_").unwrap_or(name);
+    match core {
+        // Lane manipulation
+        s if s.starts_with("vget_lane") => Some(IntrinsicOp::NeonGetLane),
+        s if s.starts_with("vset_lane") => Some(IntrinsicOp::NeonSetLane),
+        s if s.starts_with("vdup_n") || s.starts_with("vmov_n") => Some(IntrinsicOp::NeonDupScalar),
+        s if s.starts_with("vdup_lane") => Some(IntrinsicOp::NeonDupLane),
+        // Widening and narrowing
+        s if s.starts_with("vmovl") => Some(IntrinsicOp::NeonMovl),
+        s if s.starts_with("vmovn") && !s.starts_with("vmovn_high") => Some(IntrinsicOp::NeonMovn),
+        s if s.starts_with("vqmovn") => Some(IntrinsicOp::NeonQmovn),
+        s if s.starts_with("vaddl") => Some(IntrinsicOp::NeonAddl),
+        s if s.starts_with("vsubl") => Some(IntrinsicOp::NeonSubl),
+        // Saturating arithmetic
+        s if s.starts_with("vqadd") => Some(IntrinsicOp::NeonQadd),
+        s if s.starts_with("vqsub") => Some(IntrinsicOp::NeonQsub),
+        s if s.starts_with("vqdmull") => Some(IntrinsicOp::NeonQdmull),
+        // Load/store variants
+        s if s.starts_with("vld1") => Some(IntrinsicOp::NeonLd1),
+        s if s.starts_with("vld2") => Some(IntrinsicOp::NeonLd2),
+        s if s.starts_with("vld3") => Some(IntrinsicOp::NeonLd3),
+        s if s.starts_with("vld4") => Some(IntrinsicOp::NeonLd4),
+        s if s.starts_with("vst1") => Some(IntrinsicOp::NeonSt1),
+        s if s.starts_with("vst2") => Some(IntrinsicOp::NeonSt2),
+        // Comparison
+        s if s.starts_with("vceq") => Some(IntrinsicOp::NeonCeq),
+        s if s.starts_with("vcgt") => Some(IntrinsicOp::NeonCgt),
+        s if s.starts_with("vcge") => Some(IntrinsicOp::NeonCge),
+        // Bitwise
+        s if s.starts_with("vand") => Some(IntrinsicOp::NeonAnd),
+        s if s.starts_with("vorr") => Some(IntrinsicOp::NeonOrr),
+        s if s.starts_with("veor") => Some(IntrinsicOp::NeonEor),
+        s if s.starts_with("vbic") => Some(IntrinsicOp::NeonBic),
+        s if s.starts_with("vbsl") => Some(IntrinsicOp::NeonBsl),
+        // Arithmetic
+        s if s.starts_with("vadd") && !s.starts_with("vaddl") => Some(IntrinsicOp::NeonAdd),
+        s if s.starts_with("vsub") && !s.starts_with("vsubl") => Some(IntrinsicOp::NeonSub),
+        s if s.starts_with("vmul") && !s.starts_with("vmull") => Some(IntrinsicOp::NeonMul),
+        s if s.starts_with("vabs") => Some(IntrinsicOp::NeonAbs),
+        s if s.starts_with("vneg") => Some(IntrinsicOp::NeonNeg),
+        // Shifts
+        s if s.starts_with("vshl") => Some(IntrinsicOp::NeonShl),
+        s if s.starts_with("vshr") => Some(IntrinsicOp::NeonShr),
+        _ => None,
+    }
 }
 
 impl IntrinsicOp {
@@ -220,7 +396,20 @@ impl IntrinsicOp {
             // SSE4.1 insert/extract are pure
             IntrinsicOp::Pinsrd128 | IntrinsicOp::Pextrd128 |
             IntrinsicOp::Pinsrb128 | IntrinsicOp::Pextrb128 |
-            IntrinsicOp::Pinsrq128 | IntrinsicOp::Pextrq128
+            IntrinsicOp::Pinsrq128 | IntrinsicOp::Pextrq128 |
+            // NEON pure operations (lane manipulation, widening/narrowing, saturating,
+            // comparison, bitwise, arithmetic, shifts — NOT loads/stores)
+            IntrinsicOp::NeonGetLane | IntrinsicOp::NeonSetLane |
+            IntrinsicOp::NeonDupScalar | IntrinsicOp::NeonDupLane |
+            IntrinsicOp::NeonMovl | IntrinsicOp::NeonMovn | IntrinsicOp::NeonQmovn |
+            IntrinsicOp::NeonAddl | IntrinsicOp::NeonSubl |
+            IntrinsicOp::NeonQadd | IntrinsicOp::NeonQsub | IntrinsicOp::NeonQdmull |
+            IntrinsicOp::NeonCeq | IntrinsicOp::NeonCgt | IntrinsicOp::NeonCge |
+            IntrinsicOp::NeonAnd | IntrinsicOp::NeonOrr | IntrinsicOp::NeonEor |
+            IntrinsicOp::NeonBic | IntrinsicOp::NeonBsl |
+            IntrinsicOp::NeonAdd | IntrinsicOp::NeonSub | IntrinsicOp::NeonMul |
+            IntrinsicOp::NeonAbs | IntrinsicOp::NeonNeg |
+            IntrinsicOp::NeonShl | IntrinsicOp::NeonShr
         )
     }
 }

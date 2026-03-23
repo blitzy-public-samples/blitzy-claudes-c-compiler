@@ -8,12 +8,62 @@ use crate::frontend::lexer::token::TokenKind;
 use super::ast::*;
 use super::parse::Parser;
 
+/// Check if an expression is a simple compile-time integer constant literal.
+/// Only bare integer and character literals are considered constant here — complex
+/// constant expressions (sizeof, binary ops on literals, enum constants, etc.) are
+/// left for sema/lowering to evaluate authoritatively.
+fn is_constant_integer_expr(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::IntLiteral(_, _)
+            | Expr::UIntLiteral(_, _)
+            | Expr::LongLiteral(_, _)
+            | Expr::ULongLiteral(_, _)
+            | Expr::LongLongLiteral(_, _)
+            | Expr::ULongLongLiteral(_, _)
+            | Expr::CharLiteral(_, _)
+    )
+}
+
+/// Check if a declaration contains VLA (Variable-Length Array) declarators.
+///
+/// A VLA is detected when any declarator in the declaration has:
+/// - An array with `[*]` syntax (`is_vla_unspecified = true`), OR
+/// - An array with a size expression that is not a simple integer literal
+///
+/// This is a best-effort parser-level heuristic. The authoritative VLA detection
+/// is performed later by the semantic analysis and IR lowering passes, which can
+/// evaluate full constant expressions. This check is intentionally conservative:
+/// it may produce false positives on arrays sized by complex constant expressions
+/// (e.g., `int arr[sizeof(int)]`) but will not miss genuine VLAs or false-positive
+/// on arrays with plain integer literal sizes (e.g., `int arr[10]`).
+fn declaration_has_vla(decl: &Declaration) -> bool {
+    for init_decl in &decl.declarators {
+        for derived in &init_decl.derived {
+            match derived {
+                DerivedDeclarator::Array { is_vla_unspecified: true, .. } => {
+                    return true;
+                }
+                DerivedDeclarator::Array { size: Some(expr), .. } => {
+                    if !is_constant_integer_expr(expr) {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    false
+}
+
 impl Parser {
+    // grammar: compound-statement
     pub(super) fn parse_compound_stmt(&mut self) -> CompoundStmt {
         let open_brace = self.peek_span();
         self.expect(&TokenKind::LBrace);
         let mut items = Vec::new();
         let mut local_labels = Vec::new();
+        let mut has_vla = false;
 
         // Save typedef shadowing state for this scope
         let saved_shadowed = self.shadowed_typedefs.clone();
@@ -76,6 +126,11 @@ impl Parser {
                 self.parse_static_assert();
             } else if self.is_type_specifier() && !self.is_typedef_label() {
                 if let Some(decl) = self.parse_local_declaration() {
+                    // Track VLA declarations for stack pointer save/restore at scope boundaries.
+                    // Once a VLA is found, skip further checks for this compound statement.
+                    if !has_vla && declaration_has_vla(&decl) {
+                        has_vla = true;
+                    }
                     items.push(BlockItem::Declaration(decl));
                 }
             } else {
@@ -87,9 +142,10 @@ impl Parser {
         self.expect_closing(&TokenKind::RBrace, open_brace);
         self.shadowed_typedefs = saved_shadowed;
         self.attrs.restore_flags(saved_attr_flags);
-        CompoundStmt { items, local_labels }
+        CompoundStmt { items, local_labels, has_vla }
     }
 
+    // grammar: statement
     pub(super) fn parse_stmt(&mut self) -> Stmt {
         // C23 / GNU extension: declarations are allowed in statement position.
         // This handles declarations after labels (e.g., `label: int x = 5;`),
@@ -261,6 +317,7 @@ impl Parser {
     }
 
     /// Parse a for statement: for (init; cond; inc) body
+    // grammar: iteration-statement (for)
     fn parse_for_stmt(&mut self) -> Stmt {
         let span = self.peek_span();
         self.advance();
@@ -299,6 +356,7 @@ impl Parser {
 
     // === Inline assembly parsing ===
 
+    // grammar: asm-statement (GNU extension)
     fn parse_inline_asm(&mut self) -> Stmt {
         self.advance(); // consume 'asm' / '__asm__'
         // Skip optional qualifiers: volatile, goto, inline
@@ -348,6 +406,7 @@ impl Parser {
         Stmt::InlineAsm { template, outputs, inputs, clobbers, goto_labels }
     }
 
+    // grammar: asm-string-literal
     fn parse_asm_string(&mut self) -> String {
         let mut result = String::new();
         while let TokenKind::StringLiteral(ref s) = self.peek() {
@@ -357,6 +416,7 @@ impl Parser {
         result
     }
 
+    // grammar: asm-operands
     fn parse_asm_operands(&mut self) -> Vec<AsmOperand> {
         let mut operands = Vec::new();
         if matches!(self.peek(), TokenKind::Colon | TokenKind::RParen) {
@@ -372,6 +432,7 @@ impl Parser {
         operands
     }
 
+    // grammar: asm-operand
     fn parse_one_asm_operand(&mut self) -> AsmOperand {
         // Optional [name]
         let name = if matches!(self.peek(), TokenKind::LBracket) {
@@ -412,6 +473,7 @@ impl Parser {
         AsmOperand { name, constraint, expr }
     }
 
+    // grammar: asm-clobbers
     fn parse_asm_clobbers(&mut self) -> Vec<String> {
         let mut clobbers = Vec::new();
         if matches!(self.peek(), TokenKind::Colon | TokenKind::RParen) {
@@ -427,6 +489,7 @@ impl Parser {
         clobbers
     }
 
+    // grammar: asm-goto-labels
     /// Parse the goto labels section (fourth colon) of an asm goto statement.
     /// Labels are comma-separated identifiers: `asm goto("..." : : : : label1, label2)`
     fn parse_asm_goto_labels(&mut self) -> Vec<String> {

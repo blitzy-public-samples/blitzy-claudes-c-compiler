@@ -41,6 +41,13 @@ impl Lowerer {
             self.local_label_scopes.push(scope);
         }
 
+        // If the parser flagged this block as containing VLA declarations,
+        // mark the function-level VLA flag early so that prologue generation
+        // uses frame-pointer-relative addressing (SP is dynamic in VLA scopes).
+        if compound.has_vla && !self.func().has_vla {
+            self.func_mut().has_vla = true;
+        }
+
         // Check if this block contains any declarations. If not, we can skip
         // scope tracking entirely since statements don't introduce new bindings.
         let has_declarations = compound.items.iter().any(|item| matches!(item, BlockItem::Declaration(_)));
@@ -119,6 +126,16 @@ impl Lowerer {
             }
 
             let vla_size = if da.is_array {
+                self.compute_vla_runtime_size(type_spec, &declarator.derived)
+            } else if da.c_type.as_ref().map_or(false, |ct| ct.is_vla()) {
+                // CType::Vla detected — compute runtime size from the VLA type.
+                // This handles cases where the VLA information comes through the
+                // CType system (e.g., typedef'd VLAs) rather than through
+                // DerivedDeclarator::Array entries.
+                self.compute_vla_runtime_size(type_spec, &declarator.derived)
+            } else if self.is_type_vla(type_spec) {
+                // TypeSpecifier resolves to a VLA through typedef resolution.
+                // This catches VLA typedefs that are not yet reflected in CType.
                 self.compute_vla_runtime_size(type_spec, &declarator.derived)
             } else {
                 None
@@ -200,6 +217,10 @@ impl Lowerer {
                 self.types.func_ptr_typedef_info.insert(declarator.name.clone(), fti);
             }
             let mut resolved_ctype = self.build_full_ctype(type_spec, &declarator.derived);
+            // Apply restrict qualifier when declared (e.g., `int * restrict p`).
+            if decl.is_restrict() && matches!(resolved_ctype, CType::Pointer(_, _)) {
+                resolved_ctype = resolved_ctype.with_restrict();
+            }
             if let Some(vs) = decl.resolve_vector_size(resolved_ctype.size()) {
                 resolved_ctype = CType::Vector(Box::new(resolved_ctype), vs);
             }
@@ -313,6 +334,18 @@ impl Lowerer {
         if explicit_align > 0 {
             local_info.var.explicit_alignment = Some(explicit_align);
         }
+        // When the declaration has a runtime VLA size, wrap the CType with
+        // CType::Vla to enable runtime sizeof evaluation and type-level VLA
+        // detection by downstream passes (GVN, LICM).
+        if vla_size.is_some() {
+            if let Some(ref ctype) = local_info.var.c_type {
+                let elem_ty = match ctype {
+                    CType::Array(elem, _) => (**elem).clone(),
+                    other => other.clone(),
+                };
+                local_info.var.c_type = Some(CType::Vla(Box::new(elem_ty)));
+            }
+        }
         local_info.vla_size = vla_size;
         if vla_size.is_some() {
             let strides = self.compute_vla_local_strides(type_spec, &declarator.derived);
@@ -339,7 +372,7 @@ impl Lowerer {
                 // syntax marker (1) plus any return-type pointer indirections.
                 // If there are return-type pointers, the return type is a pointer.
                 let ptr_count_before = declarator.derived[..i].iter()
-                    .filter(|d| matches!(d, DerivedDeclarator::Pointer | DerivedDeclarator::Array(_)))
+                    .filter(|d| matches!(d, DerivedDeclarator::Pointer | DerivedDeclarator::Array { .. }))
                     .count();
                 // Subtract 1 for the syntax marker pointer
                 let return_type_ptrs = ptr_count_before.saturating_sub(1);
@@ -500,7 +533,7 @@ impl Lowerer {
         for (i, d) in declarator.derived.iter().enumerate() {
             if let DerivedDeclarator::FunctionPointer(params, _) = d {
                 let ptr_count_before = declarator.derived[..i].iter()
-                    .filter(|d| matches!(d, DerivedDeclarator::Pointer | DerivedDeclarator::Array(_)))
+                    .filter(|d| matches!(d, DerivedDeclarator::Pointer | DerivedDeclarator::Array { .. }))
                     .count();
                 let return_type_ptrs = ptr_count_before.saturating_sub(1);
                 let ret_ty = if return_type_ptrs > 0 {
@@ -1084,6 +1117,15 @@ impl Lowerer {
                 // Emit cleanup calls for all active scopes before returning
                 let all_cleanups = self.collect_all_scope_cleanup_vars();
                 self.emit_cleanup_calls(&all_cleanups);
+                // Restore the function-level VLA stack pointer before returning.
+                // This ensures all dynamically-allocated VLA stack memory is
+                // reclaimed even when returning from nested VLA scopes. While
+                // the stack frame is torn down on return anyway, explicit
+                // restoration keeps the IR consistent with break/continue/goto
+                // paths and aids correctness for backends that track SP offsets.
+                if let Some(save_val) = self.func().vla_stack_save {
+                    self.emit(Instruction::StackRestore { ptr: save_val });
+                }
                 self.terminate(Terminator::Return(op));
                 let label = self.fresh_label();
                 self.start_block(label);
@@ -1129,7 +1171,7 @@ impl Lowerer {
     ) -> Option<Value> {
         // Collect array dimensions from derived declarators
         let array_dims: Vec<&Option<Box<Expr>>> = derived.iter().filter_map(|d| {
-            if let DerivedDeclarator::Array(size) = d {
+            if let DerivedDeclarator::Array { size, .. } = d {
                 Some(size)
             } else {
                 None
@@ -1223,7 +1265,7 @@ impl Lowerer {
     ) -> Vec<Option<Value>> {
         // Collect array dimensions from derived declarators
         let array_dims: Vec<&Option<Box<Expr>>> = derived.iter().filter_map(|d| {
-            if let DerivedDeclarator::Array(size) = d {
+            if let DerivedDeclarator::Array { size, .. } = d {
                 Some(size)
             } else {
                 None
@@ -1338,8 +1380,8 @@ impl Lowerer {
         let has_pointer = derived.iter().any(|d| matches!(d, DerivedDeclarator::Pointer));
         let has_func_ptr = derived.iter().any(|d| matches!(d,
             DerivedDeclarator::FunctionPointer(_, _) | DerivedDeclarator::Function(_, _)));
-        let has_array = derived.iter().any(|d| matches!(d, DerivedDeclarator::Array(_)));
-        let last_is_array = matches!(derived.last(), Some(DerivedDeclarator::Array(_)));
+        let has_array = derived.iter().any(|d| matches!(d, DerivedDeclarator::Array { .. }));
+        let last_is_array = matches!(derived.last(), Some(DerivedDeclarator::Array { .. }));
 
         if has_array && (has_pointer || has_func_ptr) && last_is_array {
             // Array of pointers (e.g., int *ap[n], void (*fns[n])(int))

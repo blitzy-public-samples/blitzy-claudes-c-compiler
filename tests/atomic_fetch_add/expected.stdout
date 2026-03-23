@@ -1,0 +1,8 @@
+fetch_add int: old=10 new=15
+add_fetch int: result=27 y=27
+fetch_add relaxed: old=100 new=150
+sequential: w=6
+negative: old=50 new=20
+add_fetch accum: r1=10 r2=30 a=30
+fetch_add long: old=100000 new=300000
+fetch_add char: old=10 new=30

@@ -1,0 +1,8 @@
+sizeof_empty: OK
+sizeof_zero_array: OK
+pass_empty_before_int: OK
+pass_empty_between_ints: OK
+pass_multiple_empty: OK
+return_empty: OK
+pass_zero_array: OK
+All empty struct tests passed

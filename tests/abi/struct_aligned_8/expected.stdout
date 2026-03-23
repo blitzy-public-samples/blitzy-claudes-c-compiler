@@ -1,0 +1,9 @@
+sizeof_aligned8: OK
+alignof_aligned8: OK
+offsetof_a: OK
+offsetof_b: OK
+sizeof_larger: OK
+sizeof_default: OK
+value_correctness: OK
+alignof_larger: OK
+All aligned(8) tests passed

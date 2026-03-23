@@ -4,6 +4,10 @@
 /// memory operations, arithmetic, control flow, atomics, SIMD intrinsics,
 /// inline assembly, and ABI support (va_arg, sret, complex returns).
 ///
+/// Full C11 `_Atomic` qualifier support is provided via five atomic instruction variants:
+/// `AtomicLoad`, `AtomicStore`, `AtomicRmw`, `AtomicCmpxchg`, and `Fence`.
+/// These map directly to C11 `<stdatomic.h>` operations and GCC `__atomic_*` builtins.
+///
 /// Key types:
 /// - `BlockId`: basic block identifier (u32 index, formats as ".LBB{id}")
 /// - `Value`: SSA value reference (u32 index)
@@ -192,6 +196,10 @@ pub enum Instruction {
 
     /// Atomic read-modify-write: %dest = atomicrmw op ptr, val
     /// Performs: old = *ptr; *ptr = op(old, val); dest = old (fetch_and_*) or dest = op(old, val) (*_and_fetch)
+    ///
+    /// C11 atomic_fetch_* operations: atomic_fetch_add, atomic_fetch_sub,
+    /// atomic_fetch_and, atomic_fetch_or, atomic_fetch_xor, plus
+    /// GCC __atomic_exchange_n (via Xchg) and __atomic_test_and_set (via TestAndSet).
     AtomicRmw {
         dest: Value,
         op: AtomicRmwOp,
@@ -204,6 +212,8 @@ pub enum Instruction {
     /// Atomic compare-exchange: %dest = cmpxchg ptr, expected, desired
     /// Returns whether the exchange succeeded (as a boolean i8 for __atomic_compare_exchange_n)
     /// or the old value (for __sync_val_compare_and_swap).
+    /// C11 provides both strong and weak variants: weak may fail spuriously
+    /// on LL/SC architectures (AArch64, RISC-V), enabling simpler retry loops.
     AtomicCmpxchg {
         dest: Value,
         ptr: Operand,
@@ -214,9 +224,18 @@ pub enum Instruction {
         failure_ordering: AtomicOrdering,
         /// If true, dest gets the success/failure boolean; if false, dest gets the old value.
         returns_bool: bool,
+        /// If true, use weak compare-exchange (may fail spuriously).
+        /// C11 atomic_compare_exchange_weak vs atomic_compare_exchange_strong.
+        /// Weak CAS maps to a single LL/SC attempt on AArch64/RISC-V;
+        /// strong CAS maps to a retry loop.
+        weak: bool,
     },
 
     /// Atomic load: %dest = atomic_load ptr
+    ///
+    /// C11 atomic_load / __atomic_load_n: performs an atomic read with specified memory ordering.
+    /// For _Atomic qualified variables, regular variable reads are lowered to AtomicLoad
+    /// with SeqCst ordering (C11 default).
     AtomicLoad {
         dest: Value,
         ptr: Operand,
@@ -225,6 +244,10 @@ pub enum Instruction {
     },
 
     /// Atomic store: atomic_store ptr, val
+    ///
+    /// C11 atomic_store / __atomic_store_n: performs an atomic write with specified memory ordering.
+    /// For _Atomic qualified variables, regular variable writes are lowered to AtomicStore
+    /// with SeqCst ordering (C11 default).
     AtomicStore {
         ptr: Operand,
         val: Operand,
@@ -233,6 +256,10 @@ pub enum Instruction {
     },
 
     /// Memory fence
+    ///
+    /// C11 atomic_thread_fence: memory ordering fence.
+    /// atomic_thread_fence(memory_order_seq_cst) ensures total ordering.
+    /// Backends emit: x86-64: MFENCE, AArch64: DMB ISH, RISC-V: FENCE rw,rw, i686: MFENCE.
     Fence {
         ordering: AtomicOrdering,
     },
@@ -557,3 +584,4 @@ impl Terminator {
         used
     }
 }
+

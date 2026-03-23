@@ -84,6 +84,16 @@ pub(super) fn create_plt_got(
             }
         }
     }
+    // Add locally-defined IFUNC symbols to PLT. These need IPLT stubs with
+    // IRELATIVE relocations so the dynamic linker calls the resolver at startup.
+    for (name, gsym) in globals.iter() {
+        if (gsym.info & 0xf) == STT_GNU_IFUNC && gsym.defined_in.is_some() {
+            if !plt_names.contains(name) {
+                plt_names.push(name.clone());
+            }
+        }
+    }
+
     // Mark aliases
     if !copy_reloc_lib_addrs.is_empty() {
         let alias_names: Vec<String> = globals.iter()

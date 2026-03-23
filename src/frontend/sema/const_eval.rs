@@ -483,8 +483,22 @@ impl<'a> SemaConstEval<'a> {
     }
 
     /// Check if two CTypes are compatible (for __builtin_types_compatible_p).
+    ///
+    /// Strips `_Atomic` and `restrict` qualifiers before comparison, so that
+    /// `_Atomic int` is compatible with `int`, and `restrict int*` is compatible
+    /// with `int*` (per C11 §6.2.7 qualifier-agnostic compatibility).
     fn ctypes_compatible(&self, t1: &CType, t2: &CType) -> bool {
-        // Strip qualifiers (CType doesn't carry them) and compare
+        // Strip _Atomic and restrict qualifiers before comparison
+        let t1 = match t1 {
+            CType::Atomic(inner) => inner.as_ref(),
+            CType::Restrict(inner) => inner.as_ref(),
+            other => other,
+        };
+        let t2 = match t2 {
+            CType::Atomic(inner) => inner.as_ref(),
+            CType::Restrict(inner) => inner.as_ref(),
+            other => other,
+        };
         match (t1, t2) {
             (CType::Pointer(a, _), CType::Pointer(b, _)) => self.ctypes_compatible(a, b),
             (CType::Array(a, _), CType::Array(b, _)) => self.ctypes_compatible(a, b),
@@ -514,6 +528,9 @@ impl<'a> SemaConstEval<'a> {
             IrConst::F32(_) => Some(CType::Float),
             IrConst::F64(_) => Some(CType::Double),
             IrConst::LongDouble(..) => Some(CType::LongDouble),
+            // Complex constants map to their corresponding complex CType.
+            IrConst::ComplexF32(_, _) => Some(CType::ComplexFloat),
+            IrConst::ComplexF64(_, _) => Some(CType::ComplexDouble),
             IrConst::Zero => Some(CType::Int),
         }
     }
@@ -881,6 +898,10 @@ impl<'a> SemaConstEval<'a> {
             }
             TypeSpecifier::TypedefName(name) => {
                 if let Some(ctype) = self.types.typedefs.get(name) {
+                    // VLA sizeof is a runtime operation — cannot evaluate at compile time.
+                    if ctype.is_vla() {
+                        return None;
+                    }
                     Some(ctype.size_ctx(&*self.types.borrow_struct_layouts()))
                 } else {
                     Some(8) // fallback
@@ -889,6 +910,10 @@ impl<'a> SemaConstEval<'a> {
             TypeSpecifier::TypeofType(inner) => self.sizeof_type_spec(inner),
             TypeSpecifier::Typeof(expr) => {
                 let ctype = self.infer_expr_ctype(expr)?;
+                // VLA sizeof is a runtime operation — cannot evaluate at compile time.
+                if ctype.is_vla() {
+                    return None;
+                }
                 Some(ctype.size_ctx(&*self.types.borrow_struct_layouts()))
             }
             TypeSpecifier::Vector(_, total_bytes) => Some(*total_bytes),
@@ -900,6 +925,8 @@ impl<'a> SemaConstEval<'a> {
     ///
     /// Special cases: string literals are arrays, not pointers, inside sizeof
     /// (C11 6.3.2.1p3: array-to-pointer decay does not apply to sizeof operands).
+    /// VLA sizeof cannot be evaluated at compile time (C11 §6.5.3.4p2) — returns
+    /// `None` so the lowerer can emit runtime evaluation instead.
     fn sizeof_expr(&self, expr: &Expr) -> Option<usize> {
         match expr {
             // "hello" is char[6], not char* -- sizeof gives array size.
@@ -914,6 +941,10 @@ impl<'a> SemaConstEval<'a> {
             _ => {}
         }
         let ctype = self.infer_expr_ctype(expr)?;
+        // VLA sizeof is a runtime operation — cannot be evaluated at compile time.
+        if ctype.is_vla() {
+            return None;
+        }
         Some(ctype.size_ctx(&*self.types.borrow_struct_layouts()))
     }
 
@@ -1093,6 +1124,43 @@ impl<'a> SemaConstEval<'a> {
             _ => false,
         }
     }
+
+    /// Evaluate a `_Static_assert` expression at compile time.
+    ///
+    /// Returns `Some(true)` if the assertion passes (expression is non-zero),
+    /// `Some(false)` if it fails (expression is zero), or `None` if the
+    /// expression cannot be evaluated at compile time.
+    ///
+    /// This delegates to `eval_const_expr` for the actual evaluation and then
+    /// checks the result's truthiness via `IrConst::is_nonzero()`. The caller
+    /// (typically `analysis.rs`) is responsible for emitting the appropriate
+    /// diagnostic on failure, using `format_static_assert_error` for the message.
+    pub fn eval_static_assert(&self, expr: &Expr) -> Option<bool> {
+        let val = self.eval_const_expr(expr)?;
+        Some(val.is_nonzero())
+    }
+
+    /// Format an error message for a failed `_Static_assert`.
+    ///
+    /// If a message string is provided (C11 two-argument form), it is included
+    /// in the output. If no message is given (C23 single-argument form), the
+    /// expression text is quoted as the diagnostic message.
+    ///
+    /// # Examples
+    /// ```text
+    /// // C11 form: _Static_assert(sizeof(int) == 4, "int must be 4 bytes");
+    /// // => "static assertion failed: int must be 4 bytes"
+    ///
+    /// // C23 form: _Static_assert(sizeof(int) == 4);
+    /// // => "static assertion failed: \"sizeof(int) == 4\""
+    /// ```
+    pub fn format_static_assert_error(message: Option<&str>, expr_text: &str) -> String {
+        if let Some(msg) = message {
+            format!("static assertion failed: {}", msg)
+        } else {
+            format!("static assertion failed: \"{}\"", expr_text)
+        }
+    }
 }
 
 /// Convert a TypeSpecifier to CType using the TypeContext for typedef/struct resolution.
@@ -1204,7 +1272,7 @@ fn ctype_from_type_spec_with_derived(
             DerivedDeclarator::Pointer => {
                 ty = CType::Pointer(Box::new(ty), AddressSpace::Default);
             }
-            DerivedDeclarator::Array(Some(size_expr)) => {
+            DerivedDeclarator::Array { size: Some(size_expr), .. } => {
                 let expr: &Expr = size_expr;
                 let size = match expr {
                     Expr::IntLiteral(n, _) | Expr::LongLiteral(n, _) | Expr::LongLongLiteral(n, _) => Some(*n as usize),
@@ -1213,7 +1281,7 @@ fn ctype_from_type_spec_with_derived(
                 };
                 ty = CType::Array(Box::new(ty), size);
             }
-            DerivedDeclarator::Array(None) => {
+            DerivedDeclarator::Array { size: None, .. } => {
                 ty = CType::Array(Box::new(ty), None);
             }
             DerivedDeclarator::Function(_, _) | DerivedDeclarator::FunctionPointer(_, _) => {

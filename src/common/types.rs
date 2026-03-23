@@ -216,6 +216,23 @@ pub enum CType {
     /// E.g., `typedef int v4si __attribute__((vector_size(16)))` -> Vector(Int, 16)
     /// has 4 elements of type int, total size 16 bytes.
     Vector(Box<CType>, usize),
+    /// C11 _Atomic type qualifier wrapper. `_Atomic(T)` wraps any type T.
+    /// Size equals sizeof(T); alignment is at least alignof(T) (may be upgraded
+    /// to natural alignment for lock-free atomics). Two types are compatible
+    /// only if both have or both lack the _Atomic qualifier.
+    Atomic(Box<CType>),
+    /// C99 restrict qualifier for pointer types. Wraps a Pointer type to indicate
+    /// that the pointer is the sole means of accessing the pointed-to object.
+    /// Used by optimization passes (GVN, LICM) for alias analysis.
+    /// Must ONLY wrap a CType::Pointer variant. Semantically transparent for
+    /// size/alignment (delegates to inner pointer).
+    Restrict(Box<CType>),
+    /// C11 variable-length array type. Unlike Array(elem, None) which represents
+    /// an incomplete array (flexible array member), Vla represents an array whose
+    /// size is determined at runtime. The element type is stored; the actual runtime
+    /// size expression is tracked during parsing/lowering, not in CType.
+    /// sizeof(VLA) requires runtime evaluation.
+    Vla(Box<CType>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -824,6 +841,24 @@ impl StructLayout {
                     }
                 }
             }
+            // Atomic types: classify based on inner type
+            CType::Atomic(inner) => {
+                Self::classify_field_type(inner, base_offset, classes, n_eightbytes, ctx);
+            }
+            // Restrict pointers: classify as pointer (INTEGER)
+            CType::Restrict(_) => {
+                let eb_idx = base_offset / 8;
+                if eb_idx < n_eightbytes {
+                    classes[eb_idx] = classes[eb_idx].merge(EightbyteClass::Integer);
+                }
+            }
+            // VLA: treated as pointer
+            CType::Vla(_) => {
+                let eb_idx = base_offset / 8;
+                if eb_idx < n_eightbytes {
+                    classes[eb_idx] = classes[eb_idx].merge(EightbyteClass::Integer);
+                }
+            }
             // All other types (integers, pointers, enums, etc.) -> INTEGER
             _ => {
                 let eb_idx = base_offset / 8;
@@ -981,7 +1016,20 @@ impl StructLayout {
                 }
                 // Zero-size arrays or VLAs don't contribute
                 CType::Array(_, None) => {}
-                // All other scalar types: integer-class
+                // Atomic types: unwrap and re-dispatch based on inner type
+                CType::Atomic(inner) => {
+                    match inner.as_ref() {
+                        CType::Float => float_fields.push((offset, 4)),
+                        CType::Double => float_fields.push((offset, 8)),
+                        _ => {
+                            let size = inner.size();
+                            if size > 0 {
+                                int_fields.push((offset, size));
+                            }
+                        }
+                    }
+                }
+                // All other scalar types (including Restrict, Vla): integer-class
                 _ => {
                     let size = field.ty.size();
                     if size > 0 {
@@ -1290,6 +1338,15 @@ impl std::fmt::Display for CType {
                 // GCC-style vector type display
                 write!(f, "__attribute__((vector_size({}))) {}", total_size, elem)
             }
+            CType::Atomic(inner) => write!(f, "_Atomic {}", inner),
+            CType::Restrict(inner) => {
+                // For restrict pointer: show as "T * restrict"
+                match inner.as_ref() {
+                    CType::Pointer(pointee, _addr_space) => write!(f, "{} * restrict", pointee),
+                    other => write!(f, "{} restrict", other),
+                }
+            }
+            CType::Vla(elem) => write!(f, "{}[*]", elem),
         }
     }
 }
@@ -1327,6 +1384,12 @@ impl CType {
             }
             CType::Enum(e) => e.packed_size(),
             CType::Vector(_, total_size) => *total_size,
+            // Atomic types have the same size as their inner type
+            CType::Atomic(inner) => inner.size_ctx(ctx),
+            // Restrict-qualified pointer has the same size as the inner pointer
+            CType::Restrict(inner) => inner.size_ctx(ctx),
+            // VLA size is not known at compile time; return 0 (runtime evaluation needed)
+            CType::Vla(_) => 0,
         }
     }
 
@@ -1361,6 +1424,24 @@ impl CType {
             CType::Enum(e) => e.packed_size(),
             // GCC caps vector alignment at 16 bytes on x86-64
             CType::Vector(_, total_size) => (*total_size).min(16),
+            // Atomic types: alignment is at least the natural alignment of the inner type.
+            // For lock-free atomics, alignment may be upgraded to the size of the type
+            // (e.g., _Atomic struct with size <= 16 gets aligned to its size).
+            CType::Atomic(inner) => {
+                let inner_align = inner.align_ctx(ctx);
+                let inner_size = inner.size_ctx(ctx);
+                // Upgrade alignment to power-of-two >= size for potential lock-free access,
+                // but only for small types (up to 16 bytes)
+                if inner_size <= 16 && inner_size.is_power_of_two() {
+                    inner_align.max(inner_size)
+                } else {
+                    inner_align
+                }
+            }
+            // Restrict-qualified pointer has the same alignment as the inner pointer
+            CType::Restrict(inner) => inner.align_ctx(ctx),
+            // VLA element alignment
+            CType::Vla(elem) => elem.align_ctx(ctx),
         }
     }
 
@@ -1378,6 +1459,9 @@ impl CType {
             CType::LongLong | CType::ULongLong => 8,
             CType::Double => 8,
             CType::ComplexDouble => 8,
+            CType::Atomic(inner) => inner.preferred_align_ctx(ctx).max(inner.align_ctx(ctx)),
+            CType::Restrict(inner) => inner.preferred_align_ctx(ctx),
+            CType::Vla(elem) => elem.preferred_align_ctx(ctx),
             _ => self.align_ctx(ctx),
         }
     }
@@ -1397,24 +1481,36 @@ impl CType {
 
 
     pub fn is_integer(&self) -> bool {
-        matches!(self, CType::Bool | CType::Char | CType::UChar | CType::Short | CType::UShort |
-                       CType::Int | CType::UInt | CType::Long | CType::ULong |
-                       CType::LongLong | CType::ULongLong |
-                       CType::Int128 | CType::UInt128 | CType::Enum(_))
+        match self {
+            CType::Atomic(inner) => inner.is_integer(),
+            _ => matches!(self, CType::Bool | CType::Char | CType::UChar | CType::Short | CType::UShort |
+                           CType::Int | CType::UInt | CType::Long | CType::ULong |
+                           CType::LongLong | CType::ULongLong |
+                           CType::Int128 | CType::UInt128 | CType::Enum(_))
+        }
     }
 
     pub fn is_signed(&self) -> bool {
-        matches!(self, CType::Char | CType::Short | CType::Int | CType::Long | CType::LongLong | CType::Int128)
+        match self {
+            CType::Atomic(inner) => inner.is_signed(),
+            _ => matches!(self, CType::Char | CType::Short | CType::Int | CType::Long | CType::LongLong | CType::Int128)
+        }
     }
 
     /// Whether this is a complex type (_Complex float/double/long double).
     pub fn is_complex(&self) -> bool {
-        matches!(self, CType::ComplexFloat | CType::ComplexDouble | CType::ComplexLongDouble)
+        match self {
+            CType::Atomic(inner) => inner.is_complex(),
+            _ => matches!(self, CType::ComplexFloat | CType::ComplexDouble | CType::ComplexLongDouble)
+        }
     }
 
     /// Whether this is a floating-point type (float, double, long double).
     pub fn is_floating(&self) -> bool {
-        matches!(self, CType::Float | CType::Double | CType::LongDouble)
+        match self {
+            CType::Atomic(inner) => inner.is_floating(),
+            _ => matches!(self, CType::Float | CType::Double | CType::LongDouble)
+        }
     }
 
     /// Whether this is an arithmetic type (integer, floating-point, or complex).
@@ -1424,13 +1520,17 @@ impl CType {
 
     /// Whether this is a GCC vector extension type.
     pub fn is_vector(&self) -> bool {
-        matches!(self, CType::Vector(_, _))
+        match self {
+            CType::Atomic(inner) => inner.is_vector(),
+            _ => matches!(self, CType::Vector(_, _))
+        }
     }
 
     /// For a vector type, returns (element_type, num_elements).
     /// Returns None for non-vector types.
     pub fn vector_info(&self) -> Option<(&CType, usize)> {
         match self {
+            CType::Atomic(inner) => inner.vector_info(),
             CType::Vector(elem, total_size) => {
                 let elem_size = elem.size();
                 if elem_size > 0 {
@@ -1449,6 +1549,7 @@ impl CType {
     /// Short/UShort all fit in int).
     pub fn integer_promoted(&self) -> CType {
         match self {
+            CType::Atomic(inner) => inner.integer_promoted(),
             CType::Bool | CType::Char | CType::UChar
             | CType::Short | CType::UShort => CType::Int,
             other => other.clone(),
@@ -1458,6 +1559,7 @@ impl CType {
     /// Get the component type for a complex type (e.g., ComplexFloat -> Float).
     pub fn complex_component_type(&self) -> CType {
         match self {
+            CType::Atomic(inner) => inner.complex_component_type(),
             CType::ComplexFloat => CType::Float,
             CType::ComplexDouble => CType::Double,
             CType::ComplexLongDouble => CType::LongDouble,
@@ -1469,14 +1571,18 @@ impl CType {
     /// Whether this is an unsigned integer type.
     /// Used by usual arithmetic conversions (C11 6.3.1.8).
     pub fn is_unsigned(&self) -> bool {
-        matches!(self, CType::Bool | CType::UChar | CType::UShort | CType::UInt
-            | CType::ULong | CType::ULongLong | CType::UInt128)
+        match self {
+            CType::Atomic(inner) => inner.is_unsigned(),
+            _ => matches!(self, CType::Bool | CType::UChar | CType::UShort | CType::UInt
+                | CType::ULong | CType::ULongLong | CType::UInt128)
+        }
     }
 
     /// Integer conversion rank for C types (C11 6.3.1.1).
     /// Higher rank = larger type. Used by usual arithmetic conversions.
     pub fn integer_rank(&self) -> u32 {
         match self {
+            CType::Atomic(inner) => inner.integer_rank(),
             CType::Bool => 0,
             CType::Char | CType::UChar => 1,
             CType::Short | CType::UShort => 2,
@@ -1640,14 +1746,24 @@ impl CType {
         }
     }
 
-    /// Whether this is a pointer type (including arrays which decay to pointers).
+    /// Whether this is a pointer type (including arrays which decay to pointers,
+    /// restrict-qualified pointers, and _Atomic-qualified pointer types).
     pub fn is_pointer_like(&self) -> bool {
-        matches!(self, CType::Pointer(_, _) | CType::Array(_, _))
+        match self {
+            CType::Pointer(_, _) | CType::Array(_, _) | CType::Restrict(_) => true,
+            CType::Atomic(inner) => inner.is_pointer_like(),
+            _ => false,
+        }
     }
 
-    /// Whether this is a function pointer type: Pointer(Function(_)).
+    /// Whether this is a function pointer type: Pointer(Function(_)),
+    /// or a restrict-qualified function pointer.
     pub fn is_function_pointer(&self) -> bool {
-        matches!(self, CType::Pointer(inner, _) if matches!(inner.as_ref(), CType::Function(_)))
+        match self {
+            CType::Pointer(inner, _) => matches!(inner.as_ref(), CType::Function(_)),
+            CType::Restrict(inner) => inner.is_function_pointer(),
+            _ => false,
+        }
     }
 
     /// Extract the FunctionType from a function pointer or function type.
@@ -1656,6 +1772,7 @@ impl CType {
     /// Returns None if this is not a function or function pointer type.
     pub fn get_function_type(&self) -> Option<&FunctionType> {
         match self {
+            CType::Restrict(inner) => inner.get_function_type(),
             CType::Function(ft) => Some(ft),
             CType::Pointer(inner, _) => match inner.as_ref() {
                 CType::Function(ft) => Some(ft),
@@ -1683,6 +1800,7 @@ impl CType {
     ///   - strict=false: returns Some(X) (used when typedef fallback is acceptable)
     pub fn func_ptr_return_type(&self, strict: bool) -> Option<CType> {
         match self {
+            CType::Restrict(inner) => inner.func_ptr_return_type(strict),
             CType::Pointer(inner, _) => match inner.as_ref() {
                 CType::Function(ft) => Some(ft.return_type.clone()),
                 CType::Pointer(inner2, _) => match inner2.as_ref() {
@@ -1698,7 +1816,89 @@ impl CType {
 
     /// Whether this is a struct or union type.
     pub fn is_struct_or_union(&self) -> bool {
-        matches!(self, CType::Struct(_) | CType::Union(_))
+        match self {
+            CType::Struct(_) | CType::Union(_) => true,
+            CType::Atomic(inner) => inner.is_struct_or_union(),
+            _ => false,
+        }
+    }
+
+    // ---- _Atomic qualifier helpers ----
+
+    /// Wrap this type with the _Atomic qualifier.
+    /// Returns `Atomic(Box::new(self))`. If already atomic, returns self unchanged.
+    pub fn with_atomic(self) -> CType {
+        if self.is_atomic() {
+            self
+        } else {
+            CType::Atomic(Box::new(self))
+        }
+    }
+
+    /// Strip the outermost _Atomic qualifier, if present.
+    /// Returns the inner type if atomic, or self if not.
+    pub fn strip_atomic(&self) -> &CType {
+        match self {
+            CType::Atomic(inner) => inner.as_ref(),
+            other => other,
+        }
+    }
+
+    /// Strip _Atomic qualifier, returning owned type.
+    pub fn into_strip_atomic(self) -> CType {
+        match self {
+            CType::Atomic(inner) => *inner,
+            other => other,
+        }
+    }
+
+    /// Whether this type has the _Atomic qualifier.
+    pub fn is_atomic(&self) -> bool {
+        matches!(self, CType::Atomic(_))
+    }
+
+    // ---- restrict qualifier helpers ----
+
+    /// Wrap this pointer type with the restrict qualifier.
+    /// Panics in debug mode if self is not a Pointer type.
+    /// If already restrict-qualified, returns self unchanged.
+    pub fn with_restrict(self) -> CType {
+        if self.is_restrict() {
+            return self;
+        }
+        debug_assert!(
+            matches!(self, CType::Pointer(_, _)),
+            "restrict qualifier can only be applied to pointer types"
+        );
+        CType::Restrict(Box::new(self))
+    }
+
+    /// Strip the outermost restrict qualifier, if present.
+    pub fn strip_restrict(&self) -> &CType {
+        match self {
+            CType::Restrict(inner) => inner.as_ref(),
+            other => other,
+        }
+    }
+
+    /// Whether this type has the restrict qualifier (is a Restrict-wrapped pointer).
+    pub fn is_restrict(&self) -> bool {
+        matches!(self, CType::Restrict(_))
+    }
+
+    // ---- VLA helpers ----
+
+    /// Whether this is a variable-length array type.
+    pub fn is_vla(&self) -> bool {
+        matches!(self, CType::Vla(_))
+    }
+
+    /// Get the element type of a VLA, if this is a VLA type.
+    pub fn vla_element_type(&self) -> Option<&CType> {
+        match self {
+            CType::Vla(elem) => Some(elem.as_ref()),
+            _ => None,
+        }
     }
 }
 
@@ -1885,6 +2085,13 @@ impl IrType {
             CType::Struct(_) | CType::Union(_) => IrType::Ptr,
             // Vectors are treated as aggregate types (pointer to stack slot)
             CType::Vector(_, _) => IrType::Ptr,
+            // Atomic types: IR type is the same as the inner type
+            CType::Atomic(inner) => IrType::from_ctype(inner),
+            // Restrict-qualified pointers: delegate to inner (always a Pointer)
+            CType::Restrict(inner) => IrType::from_ctype(inner),
+            // VLA: treated as pointer (runtime-allocated stack memory)
+            CType::Vla(_) => IrType::Ptr,
         }
     }
 }
+

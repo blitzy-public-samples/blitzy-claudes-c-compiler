@@ -46,7 +46,10 @@ const INTERP: &[u8] = b"/lib/ld-linux-riscv64-lp64d.so.1\0";
 /// `tls_got_symbols`: subset of got_symbols that are TLS
 /// `local_got_sym_info`: local GOT entries: key -> (obj_idx, sym_idx, addend)
 /// `plt_symbols`: symbols needing PLT entries (dynamic linking only)
-/// `copy_symbols`: symbols needing R_COPY relocations: (name, size)
+/// `copy_symbols`: symbols needing R_COPY relocations: (name, size, shlib_value).
+///   The shlib_value is the symbol's address in the shared library, used to
+///   coalesce aliases (e.g. `environ` and `__environ` in glibc share the same
+///   address and must share a single BSS allocation to preserve aliasing).
 /// `sec_indices`: section layout ordering
 /// `actual_needed_libs`: NEEDED sonames for .dynamic
 /// `is_static`: true for static linking (no PLT/GOT/.dynamic)
@@ -61,7 +64,7 @@ pub fn emit_executable(
     tls_got_symbols: &HashSet<String>,
     local_got_sym_info: &HashMap<String, (usize, usize, i64)>,
     plt_symbols: &[String],
-    copy_symbols: &[(String, u64)],
+    copy_symbols: &[(String, u64, u64)],
     sec_indices: &[usize],
     actual_needed_libs: &[String],
     is_static: bool,
@@ -117,9 +120,26 @@ pub fn emit_executable(
     let phdr_size = num_phdrs * 56u64;
     let headers_size = 64 + phdr_size;
 
+    // Pre-scan for linker script text address: if any executable section
+    // has a script-assigned vaddr, use it as the effective base address
+    // for the entire executable. This prevents a vaddr gap between the
+    // headers and the code sections that would create invalid non-writable
+    // BSS in the RX LOAD segment.
+    let effective_base: u64 = {
+        let mut min_addr: Option<u64> = None;
+        for ms in merged_sections.iter() {
+            if ms.vaddr != 0 && ms.sh_flags & SHF_ALLOC != 0 && ms.sh_flags & SHF_WRITE == 0 {
+                if min_addr.is_none() || ms.vaddr < min_addr.unwrap() {
+                    min_addr = Some(ms.vaddr);
+                }
+            }
+        }
+        min_addr.unwrap_or(BASE_ADDR)
+    };
+
     // Start laying out the RX segment
     let mut file_offset = headers_size;
-    let mut vaddr = BASE_ADDR + headers_size;
+    let mut vaddr = effective_base + headers_size;
 
     // Dynamic linking section addresses (only used when !is_static)
     let mut interp_offset = 0u64;
@@ -148,7 +168,7 @@ pub fn emit_executable(
     let verneed_data: Vec<u8> = Vec::new();
     let mut needed_lib_offsets: Vec<u32> = Vec::new();
     let mut dynsym_names: Vec<String> = Vec::new();
-    let copy_sym_names: Vec<String> = copy_symbols.iter().map(|(n, _)| n.clone()).collect();
+    let copy_sym_names: Vec<String> = copy_symbols.iter().map(|(n, _, _)| n.clone()).collect();
 
     if !is_static {
         // .interp
@@ -270,6 +290,25 @@ pub fn emit_executable(
     let mut section_vaddrs: Vec<u64> = vec![0; merged_sections.len()];
     let mut section_offsets: Vec<u64> = vec![0; merged_sections.len()];
 
+    // Linker script text address adjustment: if any RX section has a
+    // script-assigned virtual address (ms.vaddr != 0), use it as the
+    // effective base for the entire executable. This avoids creating a
+    // gap between BASE_ADDR and the script address in the RX LOAD
+    // segment (which would cause QEMU to reject the ELF due to
+    // non-writable BSS in the memsz > filesz region).
+    let _text_script_base: Option<u64> = {
+        let mut min_addr: Option<u64> = None;
+        for &si in sec_indices {
+            let ms = &merged_sections[si];
+            if ms.vaddr != 0 && ms.sh_flags & SHF_ALLOC != 0 && ms.sh_flags & SHF_WRITE == 0 {
+                if min_addr.is_none() || ms.vaddr < min_addr.unwrap() {
+                    min_addr = Some(ms.vaddr);
+                }
+            }
+        }
+        min_addr
+    };
+
     for &si in sec_indices {
         let ms = &merged_sections[si];
         if ms.sh_flags & SHF_ALLOC == 0 { continue; }
@@ -294,6 +333,25 @@ pub fn emit_executable(
     vaddr = align_up(vaddr, PAGE_SIZE);
     if (vaddr % PAGE_SIZE) != (file_offset % PAGE_SIZE) {
         vaddr = align_up(vaddr, PAGE_SIZE) + (file_offset % PAGE_SIZE);
+    }
+
+    // Linker script RW address adjustment: if any writable data section has
+    // a script-assigned address (ms.vaddr != 0), shift the RW segment's
+    // virtual address to start at that address.
+    let rw_script_base: Option<u64> = {
+        let mut min_addr: Option<u64> = None;
+        for &si in sec_indices {
+            let ms = &merged_sections[si];
+            if ms.vaddr != 0 && ms.sh_flags & SHF_ALLOC != 0 && ms.sh_flags & SHF_WRITE != 0 {
+                if min_addr.is_none() || ms.vaddr < min_addr.unwrap() {
+                    min_addr = Some(ms.vaddr);
+                }
+            }
+        }
+        min_addr
+    };
+    if let Some(rw_base) = rw_script_base {
+        vaddr = rw_base;
     }
 
     let rw_segment_start_vaddr = vaddr;
@@ -446,20 +504,43 @@ pub fn emit_executable(
         vaddr += ms.data.len() as u64;
     }
 
-    // Allocate COPY-relocated symbols in .bss
+    // Allocate COPY-relocated symbols in .bss.
+    // Symbols that are aliases in the shared library (same shlib_value) share a
+    // single BSS slot. This is critical for correctness: glibc defines `environ`
+    // (WEAK) and `__environ` (GLOBAL) at the same address. If they get separate
+    // BSS copies, `__libc_start_main` sets only `__environ`, leaving `environ`
+    // as NULL — causing programs like dash to crash on startup.
     let mut copy_sym_addrs: HashMap<String, (u64, u64)> = HashMap::new();
-    for (name, size) in copy_symbols {
+    let mut alias_addr_map: HashMap<u64, u64> = HashMap::new(); // shlib_value -> bss_vaddr
+    for (name, size, shlib_value) in copy_symbols {
         let sz = if *size > 0 { *size } else { 8 };
-        let align = sz.min(8);
-        vaddr = align_up(vaddr, align);
-        copy_sym_addrs.insert(name.clone(), (vaddr, sz));
+        let addr = if *shlib_value != 0 {
+            if let Some(&existing_bss_addr) = alias_addr_map.get(shlib_value) {
+                // Reuse existing BSS slot for alias — both symbols share the same address
+                existing_bss_addr
+            } else {
+                let align = sz.min(8);
+                vaddr = align_up(vaddr, align);
+                let new_addr = vaddr;
+                alias_addr_map.insert(*shlib_value, new_addr);
+                vaddr += sz;
+                new_addr
+            }
+        } else {
+            // shlib_value is 0 (unusual): allocate a fresh slot
+            let align = sz.min(8);
+            vaddr = align_up(vaddr, align);
+            let new_addr = vaddr;
+            vaddr += sz;
+            new_addr
+        };
+        copy_sym_addrs.insert(name.clone(), (addr, sz));
         if let Some(gs) = global_syms.get_mut(name) {
             gs.defined = true;
-            gs.value = vaddr;
+            gs.value = addr;
             gs.size = sz;
             gs.sym_type = STT_OBJECT;
         }
-        vaddr += sz;
     }
 
     if !copy_symbols.is_empty() {
@@ -500,7 +581,7 @@ pub fn emit_executable(
     let preinit_end = init_array_vaddrs.get(".preinit_array").map(|&(v, s)| v + s).unwrap_or(0);
 
     let linker_addrs = LinkerSymbolAddresses {
-        base_addr: BASE_ADDR,
+        base_addr: effective_base,
         got_addr: got_plt_vaddr,
         dynamic_addr: dynamic_vaddr,
         bss_addr: bss_vaddr,
@@ -690,7 +771,7 @@ pub fn emit_executable(
     // ── Phase 9b: Build .rela.dyn (COPY relocations) ───────────────────
 
     let mut rela_dyn_data = Vec::with_capacity(rela_dyn_size as usize);
-    for (name, _size) in copy_symbols {
+    for (name, _size, _shlib_value) in copy_symbols {
         if let Some(&(addr, _sz)) = copy_sym_addrs.get(name) {
             let sym_idx = dynsym_names.iter().position(|n| n == name).unwrap_or(0) + 1;
             let r_info = ((sym_idx as u64) << 32) | 4; // R_RISCV_COPY
@@ -769,7 +850,7 @@ pub fn emit_executable(
     } else if let Some(gs) = global_syms.get("main") {
         gs.value
     } else {
-        merged_map.get(".text").map(|&i| section_vaddrs[i]).unwrap_or(BASE_ADDR)
+        merged_map.get(".text").map(|&i| section_vaddrs[i]).unwrap_or(effective_base)
     };
 
     // ── Phase 13: .riscv.attributes data ────────────────────────────────
@@ -797,15 +878,15 @@ pub fn emit_executable(
     assert_eq!(elf.len(), 64);
 
     let rx_filesz = rx_segment_end_offset;
-    let rx_memsz = rx_segment_end_vaddr - BASE_ADDR;
+    let rx_memsz = rx_segment_end_vaddr - effective_base;
 
     if !is_static {
-        write_phdr(&mut elf, 6 /* PT_PHDR */, PF_R, 64, BASE_ADDR + 64, BASE_ADDR + 64, phdr_size, phdr_size, 8);
+        write_phdr(&mut elf, 6 /* PT_PHDR */, PF_R, 64, effective_base + 64, effective_base + 64, phdr_size, phdr_size, 8);
         write_phdr(&mut elf, PT_INTERP, PF_R, interp_offset, interp_vaddr, interp_vaddr, interp_size, interp_size, 1);
     }
 
     write_phdr(&mut elf, PT_RISCV_ATTRIBUTES, PF_R, riscv_attr_offset, 0, 0, riscv_attr_size, riscv_attr_size, 1);
-    write_phdr(&mut elf, PT_LOAD, PF_R | PF_X, 0, BASE_ADDR, BASE_ADDR, rx_filesz, rx_memsz, PAGE_SIZE);
+    write_phdr(&mut elf, PT_LOAD, PF_R | PF_X, 0, effective_base, effective_base, rx_filesz, rx_memsz, PAGE_SIZE);
     write_phdr(&mut elf, PT_LOAD, PF_R | PF_W, rw_segment_start_offset, rw_segment_start_vaddr, rw_segment_start_vaddr, rw_segment_filesz, rw_segment_memsz, PAGE_SIZE);
 
     if !is_static {
@@ -974,15 +1055,29 @@ pub fn emit_executable(
                    dynstr_vaddr, dynstr_offset, dynstr_data.len() as u64, 0, 0, 1, 0);
         section_count += 1;
 
-        write_shdr(&mut elf, get_name(".gnu.version"), 0x6fffffff, SHF_ALLOC,
-                   versym_vaddr, versym_offset, versym_data.len() as u64,
-                   _dynsym_shidx, 0, 2, 2);
-        section_count += 1;
+        // Only emit .gnu.version and .gnu.version_r section headers when
+        // version data has been populated. Empty version sections with zero
+        // size cause their offsets to alias the next section (.rela.dyn),
+        // which corrupts the dynamic linker's symbol version lookup at
+        // runtime — the dynamic linker reads relocation bytes as version
+        // indices, leading to incorrect symbol resolution and segfaults
+        // in non-trivial programs (e.g. dash shell). Omitting the section
+        // headers when empty is safe because the corresponding DT_VERSYM /
+        // DT_VERNEED entries in .dynamic are already conditionally skipped.
+        let dynstr_shidx = section_count - 1; // .dynstr section index
+        if !versym_data.is_empty() {
+            write_shdr(&mut elf, get_name(".gnu.version"), 0x6fffffff, SHF_ALLOC,
+                       versym_vaddr, versym_offset, versym_data.len() as u64,
+                       _dynsym_shidx, 0, 2, 2);
+            section_count += 1;
+        }
 
-        write_shdr(&mut elf, get_name(".gnu.version_r"), 0x6ffffffe, SHF_ALLOC,
-                   verneed_vaddr, verneed_offset, verneed_data.len() as u64,
-                   section_count - 2, 1, 8, 0);
-        section_count += 1;
+        if !verneed_data.is_empty() {
+            write_shdr(&mut elf, get_name(".gnu.version_r"), 0x6ffffffe, SHF_ALLOC,
+                       verneed_vaddr, verneed_offset, verneed_data.len() as u64,
+                       dynstr_shidx, 1, 8, 0);
+            section_count += 1;
+        }
 
         if rela_dyn_size > 0 {
             write_shdr(&mut elf, get_name(".rela.dyn"), SHT_RELA, SHF_ALLOC,

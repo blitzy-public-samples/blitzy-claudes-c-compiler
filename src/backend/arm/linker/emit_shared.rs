@@ -880,11 +880,11 @@ pub(super) fn emit_shared_library(
                         let sa_val = (s as i64 + a) as u64;
                         reloc::encode_movw(&mut out, fp, (sa_val & 0xffff) as u32);
                     }
-                    R_AARCH64_MOVW_UABS_G1_NC => {
+                    R_AARCH64_MOVW_UABS_G1 | R_AARCH64_MOVW_UABS_G1_NC => {
                         let sa_val = (s as i64 + a) as u64;
                         reloc::encode_movw(&mut out, fp, ((sa_val >> 16) & 0xffff) as u32);
                     }
-                    R_AARCH64_MOVW_UABS_G2_NC => {
+                    R_AARCH64_MOVW_UABS_G2 | R_AARCH64_MOVW_UABS_G2_NC => {
                         let sa_val = (s as i64 + a) as u64;
                         reloc::encode_movw(&mut out, fp, ((sa_val >> 32) & 0xffff) as u32);
                     }

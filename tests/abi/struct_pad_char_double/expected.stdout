@@ -1,0 +1,6 @@
+sizeof_PadCharDouble: OK
+offsetof_a: OK
+offsetof_b: OK
+alignof_PadCharDouble: OK
+value_check: OK
+All struct_pad_char_double tests passed

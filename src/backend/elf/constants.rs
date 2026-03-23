@@ -67,6 +67,7 @@ pub const SHF_EXECINSTR: u64 = 0x4;
 pub const SHF_MERGE: u64 = 0x10;
 pub const SHF_STRINGS: u64 = 0x20;
 pub const SHF_INFO_LINK: u64 = 0x40;
+pub const SHF_LINK_ORDER: u64 = 0x80;
 pub const SHF_GROUP: u64 = 0x200;
 pub const SHF_TLS: u64 = 0x400;
 pub const SHF_EXCLUDE: u64 = 0x8000_0000;

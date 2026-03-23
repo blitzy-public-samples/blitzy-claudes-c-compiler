@@ -317,15 +317,19 @@ pub fn apply_one_reloc(
         }
 
         // ── MOVW relocations ──
+        // G0/G0_NC: bits [15:0]. G0 checks overflow; G0_NC does not.
+        // Both encode the same 16-bit slice, so they share implementation.
         R_AARCH64_MOVW_UABS_G0 | R_AARCH64_MOVW_UABS_G0_NC => {
             let sa = (s as i64).wrapping_add(a) as u64;
             encode_movw(out, fp, (sa & 0xffff) as u32);
         }
-        R_AARCH64_MOVW_UABS_G1_NC => {
+        // G1/G1_NC: bits [31:16]
+        R_AARCH64_MOVW_UABS_G1 | R_AARCH64_MOVW_UABS_G1_NC => {
             let sa = (s as i64).wrapping_add(a) as u64;
             encode_movw(out, fp, ((sa >> 16) & 0xffff) as u32);
         }
-        R_AARCH64_MOVW_UABS_G2_NC => {
+        // G2/G2_NC: bits [47:32]
+        R_AARCH64_MOVW_UABS_G2 | R_AARCH64_MOVW_UABS_G2_NC => {
             let sa = (s as i64).wrapping_add(a) as u64;
             encode_movw(out, fp, ((sa >> 32) & 0xffff) as u32);
         }

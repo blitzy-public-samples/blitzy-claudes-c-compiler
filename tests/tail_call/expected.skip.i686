@@ -1,0 +1,7 @@
+i686 tail call optimization for functions with stack-based arguments (cdecl)
+requires argument rearrangement that exceeds peephole pattern matching.
+The i686 codegen emits caller-cleanup (addl $N, %esp) and return value
+store/reload between the call and epilogue. Converting this to a tail jump
+would require semantic understanding of the stack layout to correctly place
+arguments for the recursive call — a codegen-level optimization rather than
+a peephole transformation.

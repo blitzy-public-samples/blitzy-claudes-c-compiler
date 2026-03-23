@@ -1,0 +1,8 @@
+verify_s: OK
+verify_s4: OK
+verify_s12: OK
+verify_s16: OK
+s_with_scalars: OK
+sum_s: OK
+modify_copy: OK
+All small struct param tests passed

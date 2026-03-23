@@ -30,6 +30,10 @@ pub struct LinkerArgs {
     pub gc_sections: bool,
     /// Whether `-static` was passed.
     pub is_static: bool,
+    /// Path to a linker script specified via `-T <path>`.
+    /// The linker script controls section placement, memory layout,
+    /// and symbol generation. Used by kernel and embedded builds.
+    pub linker_script: Option<String>,
 }
 
 /// Parse user linker arguments into a structured `LinkerArgs`.
@@ -53,6 +57,17 @@ pub fn parse_linker_args(user_args: &[String]) -> LinkerArgs {
         } else if let Some(lib) = arg.strip_prefix("-l") {
             let l = if lib.is_empty() && i + 1 < args.len() { i += 1; args[i] } else { lib };
             result.libs_to_load.push(l.to_string());
+        } else if arg == "-T" {
+            // -T <path>: linker script (two-argument form)
+            if i + 1 < args.len() {
+                i += 1;
+                result.linker_script = Some(args[i].to_string());
+            }
+        } else if let Some(path) = arg.strip_prefix("-T") {
+            // -T<path>: linker script (joined form, e.g., -Tscript.ld)
+            if !path.is_empty() {
+                result.linker_script = Some(path.to_string());
+            }
         } else if let Some(wl_arg) = arg.strip_prefix("-Wl,") {
             let parts: Vec<&str> = wl_arg.split(',').collect();
             // Handle -Wl,-rpath -Wl,/path two-arg form
@@ -104,6 +119,15 @@ pub fn parse_linker_args(user_args: &[String]) -> LinkerArgs {
                     result.gc_sections = true;
                 } else if part == "--no-gc-sections" {
                     result.gc_sections = false;
+                } else if part == "-T" && j + 1 < parts.len() {
+                    // -Wl,-T,<path>: linker script (comma-separated two-arg form)
+                    j += 1;
+                    result.linker_script = Some(parts[j].to_string());
+                } else if let Some(script) = part.strip_prefix("-T") {
+                    // -Wl,-T<path>: linker script (joined form inside -Wl,)
+                    if !script.is_empty() {
+                        result.linker_script = Some(script.to_string());
+                    }
                 } else if part == "-static" {
                     result.is_static = true;
                 }

@@ -1,0 +1,8 @@
+sizeof_enum: OK
+sizeof_struct: OK
+offset_a: OK
+offset_c: OK
+offset_b: OK
+enum_values: OK
+store_load: OK
+All struct enum member tests passed

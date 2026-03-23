@@ -354,3 +354,100 @@ pub(super) fn collect_ifunc_symbols(
     ifunc_symbols.sort();
     ifunc_symbols
 }
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Linker script PROVIDE / ENTRY support
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// Apply `PROVIDE(symbol = expr)` directives from a linker script.
+///
+/// PROVIDE creates a symbol definition **only** if the symbol is currently
+/// undefined (or absent) in the global symbol table. If the symbol already
+/// has a definition from an object file or library, the PROVIDE directive
+/// is silently ignored — this matches GNU ld semantics.
+///
+/// `provide_directives` is a list of `(symbol_name, address)` pairs where
+/// the address has already been evaluated from the linker script expression.
+/// For address-relative expressions whose value depends on final layout
+/// (e.g., `PROVIDE(__data_end = .)`), the caller should pass 0 here and
+/// perform deferred resolution during the layout phase in `emit.rs`.
+///
+/// Each provided symbol is inserted as a globally-bound, defined symbol
+/// with `output_section = usize::MAX` (address TBD at layout time).
+pub(super) fn apply_provide_symbols(
+    global_symbols: &mut HashMap<String, LinkerSymbol>,
+    provide_directives: &[(String, u64)],
+) {
+    for (name, address) in provide_directives {
+        // PROVIDE semantics: only define the symbol if it is NOT already
+        // defined. An existing entry that is merely referenced (undefined)
+        // counts as "not defined" and will be replaced.
+        let already_defined = global_symbols
+            .get(name)
+            .map_or(false, |sym| sym.is_defined);
+
+        if already_defined {
+            continue;
+        }
+
+        // STT_NOTYPE is the standard type for linker-generated symbols
+        // that do not correspond to a function or data object in any input
+        // file. This matches GNU ld behavior for PROVIDE symbols.
+        // Imported from crate::backend::elf::constants via types.rs.
+        let provided_sym = LinkerSymbol {
+            address: *address as u32,
+            size: 0,
+            sym_type: STT_NOTYPE,
+            binding: STB_GLOBAL,
+            visibility: STV_DEFAULT,
+            is_defined: true,
+            needs_plt: false,
+            needs_got: false,
+            output_section: usize::MAX,
+            section_offset: 0,
+            plt_index: 0,
+            got_index: 0,
+            is_dynamic: false,
+            dynlib: String::new(),
+            needs_copy: false,
+            copy_addr: 0,
+            version: None,
+            uses_textrel: false,
+        };
+
+        global_symbols.insert(name.clone(), provided_sym);
+    }
+}
+
+/// Validate that the `ENTRY(symbol)` directive references a known symbol.
+///
+/// After symbol resolution, this function checks whether the entry point
+/// symbol specified in a linker script exists in the global symbol table.
+/// Following GNU ld behavior, a missing ENTRY symbol is **not** a hard
+/// error — the linker falls back to `_start` or `main` in `emit.rs`.
+/// Instead, a warning is emitted to stderr so the user is informed.
+///
+/// Returns `Ok(())` unconditionally. The warning is purely informational
+/// and does not prevent linking from proceeding.
+pub(super) fn validate_entry_symbol(
+    global_symbols: &HashMap<String, LinkerSymbol>,
+    entry_name: &str,
+) -> Result<(), String> {
+    if let Some(sym) = global_symbols.get(entry_name) {
+        if !sym.is_defined {
+            // Symbol exists but is not defined (only referenced) — warn
+            eprintln!(
+                "warning: ENTRY symbol '{}' is undefined; falling back to default entry point",
+                entry_name
+            );
+        }
+        // Symbol is present and defined — all good
+    } else {
+        // Symbol not found at all — warn and let emit.rs fall back
+        eprintln!(
+            "warning: ENTRY symbol '{}' not found; falling back to default entry point",
+            entry_name
+        );
+    }
+    Ok(())
+}

@@ -1,6 +1,6 @@
 //! X86Codegen: prologue, epilogue, parameter storage.
 
-use crate::ir::reexports::{IrFunction, Instruction, Value};
+use crate::ir::reexports::{IrFunction, Instruction, Operand, Value};
 use crate::common::types::IrType;
 use crate::backend::call_abi::{ParamClass, classify_params};
 use crate::backend::generation::{calculate_stack_space_common, find_param_alloca};
@@ -417,5 +417,55 @@ impl X86Codegen {
 
     pub(super) fn load_instr_for_type_impl(&self, ty: IrType) -> &'static str {
         Self::mov_load_for_type(ty)
+    }
+
+    // ---- VLA dynamic stack management ----
+
+    /// Save the current stack pointer to a stack slot before VLA allocation.
+    /// This records rsp so it can be restored at VLA scope exit, deallocating
+    /// all dynamically allocated VLA stack space.
+    ///
+    /// On x86-64, rbp is always the frame pointer, so the epilogue already
+    /// restores rsp from rbp. This save/restore pair handles *mid-function*
+    /// scope exits where the epilogue has not yet run.
+    pub(super) fn emit_vla_save_sp_impl(&mut self, save_slot: &Value) {
+        // Move current rsp into rax, then store to the designated slot.
+        self.state.emit("    movq %rsp, %rax");
+        self.store_rax_to(save_slot);
+    }
+
+    /// Restore the stack pointer from a previously saved value at VLA scope
+    /// exit. This deallocates all VLA stack space allocated since the
+    /// corresponding `emit_vla_save_sp` call.
+    pub(super) fn emit_vla_restore_sp_impl(&mut self, save_slot: &Value) {
+        // Load the saved stack pointer into rax, then restore rsp.
+        // We construct an Operand::Value to reuse the standard operand_to_rax
+        // helper which handles both register-allocated and stack-spilled values.
+        self.operand_to_rax(&Operand::Value(*save_slot));
+        self.state.emit("    movq %rax, %rsp");
+        // Invalidate the register cache since the stack frame changed.
+        self.state.reg_cache.invalidate_all();
+    }
+
+    /// Emit dynamic stack allocation for a VLA (variable-length array).
+    ///
+    /// The `size` operand contains the runtime byte count to allocate.
+    /// The result is stored in `dest` as a pointer to the beginning of
+    /// the allocated region. The allocation maintains x86-64's mandatory
+    /// 16-byte stack alignment.
+    ///
+    /// On x86-64 the stack grows downward, so we subtract the rounded-up
+    /// size from rsp and return the new rsp value as the allocation pointer.
+    pub(super) fn emit_vla_alloc_impl(&mut self, dest: &Value, size: &Operand) {
+        // Load the runtime size into the accumulator.
+        self.operand_to_rax(size);
+        // Round up to 16-byte alignment: (size + 15) & ~15
+        self.state.emit("    addq $15, %rax");
+        self.state.emit("    andq $-16, %rax");
+        // Subtract from stack pointer to allocate.
+        self.state.emit("    subq %rax, %rsp");
+        // The allocated region starts at the new rsp.
+        self.state.emit("    movq %rsp, %rax");
+        self.store_rax_to(dest);
     }
 }

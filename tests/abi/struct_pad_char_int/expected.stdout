@@ -1,0 +1,6 @@
+sizeof_PadCharInt: OK
+offsetof_a: OK
+offsetof_b: OK
+alignof_PadCharInt: OK
+value_check: OK
+All struct_pad_char_int tests passed

@@ -1,0 +1,3 @@
+sizeof_fam: OK
+offsetof_data: OK
+All flexible array member tests passed

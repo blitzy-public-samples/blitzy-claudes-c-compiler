@@ -107,8 +107,19 @@ pub fn discover_shared_lib_symbols(
                     }
                 }
             }
-            let versioned = find_versioned_soname(dir, libname);
-            if let Some(soname) = versioned {
+            // Search all library paths for the versioned soname (e.g.,
+            // libgcc_s.so.1). The linker script may reside in a different
+            // directory than the actual shared object, so check every path.
+            let mut found_soname = find_versioned_soname(dir, libname);
+            if found_soname.is_none() {
+                for search_dir in lib_search_paths {
+                    if let Some(s) = find_versioned_soname(search_dir, libname) {
+                        found_soname = Some(s);
+                        break;
+                    }
+                }
+            }
+            if let Some(soname) = found_soname {
                 if !actual_needed_libs.contains(&soname) {
                     actual_needed_libs.push(soname);
                 }

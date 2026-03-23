@@ -41,6 +41,18 @@ impl X86Codegen {
             AtomicRmwOp::Nand => {
                 self.emit_x86_atomic_op_loop(ty, "nand");
             }
+            AtomicRmwOp::Min => {
+                self.emit_x86_atomic_op_loop(ty, "smin");
+            }
+            AtomicRmwOp::Max => {
+                self.emit_x86_atomic_op_loop(ty, "smax");
+            }
+            AtomicRmwOp::UMin => {
+                self.emit_x86_atomic_op_loop(ty, "umin");
+            }
+            AtomicRmwOp::UMax => {
+                self.emit_x86_atomic_op_loop(ty, "umax");
+            }
         }
         self.store_rax_to(dest);
     }
@@ -89,5 +101,35 @@ impl X86Codegen {
             AtomicOrdering::Relaxed => {}
             _ => self.state.emit("    mfence"),
         }
+    }
+
+    /// Emit weak compare-and-exchange. On x86-64, this is identical to strong CAS
+    /// because the LOCK CMPXCHG instruction never fails spuriously — it is a
+    /// single hardware instruction that atomically succeeds or reports the current
+    /// value. The `weak` flag is accepted for API compatibility but has no effect
+    /// on the generated code.
+    pub(super) fn emit_atomic_cmpxchg_weak_impl(
+        &mut self,
+        dest: &Value,
+        ptr: &Operand,
+        expected: &Operand,
+        desired: &Operand,
+        ty: IrType,
+        success_ordering: AtomicOrdering,
+        failure_ordering: AtomicOrdering,
+        returns_bool: bool,
+    ) {
+        // On x86-64, weak CAS is the same as strong CAS.
+        // LOCK CMPXCHG is a single instruction that never fails spuriously.
+        self.emit_atomic_cmpxchg_impl(
+            dest,
+            ptr,
+            expected,
+            desired,
+            ty,
+            success_ordering,
+            failure_ordering,
+            returns_bool,
+        );
     }
 }

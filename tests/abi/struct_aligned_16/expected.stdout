@@ -1,0 +1,9 @@
+sizeof_aligned16: OK
+alignof_aligned16: OK
+offsetof_a: OK
+offsetof_b: OK
+sizeof_larger: OK
+sizeof_default: OK
+value_correctness: OK
+alignof_larger: OK
+All aligned(16) tests passed

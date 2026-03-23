@@ -1,0 +1,14 @@
+int_arg: OK
+long_arg: OK
+char_arg: OK
+float_arg: OK
+double_arg: OK
+multi_int_args: OK
+multi_float_args: OK
+mixed_int_float_args: OK
+small_struct: OK
+large_struct: OK
+return_int: OK
+return_float: OK
+return_struct: OK
+All tests passed

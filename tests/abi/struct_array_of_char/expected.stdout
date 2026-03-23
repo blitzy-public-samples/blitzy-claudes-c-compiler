@@ -1,0 +1,8 @@
+sizeof_struct: OK
+offsetof_data: OK
+offsetof_x: OK
+char_array_align: OK
+struct_align: OK
+sizeof_data_member: OK
+value_correctness: OK
+All struct array of char tests passed

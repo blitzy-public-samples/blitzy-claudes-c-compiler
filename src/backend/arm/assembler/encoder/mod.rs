@@ -88,6 +88,26 @@ pub enum RelocType {
     Prel64,
     /// R_AARCH64_LD_PREL_LO19 - LDR literal, 19-bit PC-relative
     Ldr19,
+    /// R_AARCH64_MOVW_UABS_G0 (263) - MOVZ bits [15:0], with overflow check
+    MovwUabsG0,
+    /// R_AARCH64_MOVW_UABS_G0_NC (264) - MOVZ/MOVK bits [15:0], no overflow check
+    MovwUabsG0Nc,
+    /// R_AARCH64_MOVW_UABS_G1 (265) - MOVZ bits [31:16], with overflow check
+    MovwUabsG1,
+    /// R_AARCH64_MOVW_UABS_G1_NC (266) - MOVZ/MOVK bits [31:16], no overflow check
+    MovwUabsG1Nc,
+    /// R_AARCH64_MOVW_UABS_G2 (267) - MOVZ bits [47:32], with overflow check
+    MovwUabsG2,
+    /// R_AARCH64_MOVW_UABS_G2_NC (268) - MOVZ/MOVK bits [47:32], no overflow check
+    MovwUabsG2Nc,
+    /// R_AARCH64_MOVW_UABS_G3 (269) - MOVZ bits [63:48]
+    MovwUabsG3,
+    /// R_AARCH64_MOVW_SABS_G0 (270) - MOVN/MOVZ bits [15:0], signed
+    MovwSabsG0,
+    /// R_AARCH64_MOVW_SABS_G1 (271) - MOVN/MOVZ bits [31:16], signed
+    MovwSabsG1,
+    /// R_AARCH64_MOVW_SABS_G2 (272) - MOVN/MOVZ bits [47:32], signed
+    MovwSabsG2,
 }
 
 impl RelocType {
@@ -115,6 +135,16 @@ impl RelocType {
             RelocType::CondBr19 => 280,        // R_AARCH64_CONDBR19
             RelocType::TstBr14 => 279,         // R_AARCH64_TSTBR14
             RelocType::Ldr19 => 273,             // R_AARCH64_LD_PREL_LO19
+            RelocType::MovwUabsG0 => 263,    // R_AARCH64_MOVW_UABS_G0
+            RelocType::MovwUabsG0Nc => 264,  // R_AARCH64_MOVW_UABS_G0_NC
+            RelocType::MovwUabsG1 => 265,    // R_AARCH64_MOVW_UABS_G1
+            RelocType::MovwUabsG1Nc => 266,  // R_AARCH64_MOVW_UABS_G1_NC
+            RelocType::MovwUabsG2 => 267,    // R_AARCH64_MOVW_UABS_G2
+            RelocType::MovwUabsG2Nc => 268,  // R_AARCH64_MOVW_UABS_G2_NC
+            RelocType::MovwUabsG3 => 269,    // R_AARCH64_MOVW_UABS_G3
+            RelocType::MovwSabsG0 => 270,    // R_AARCH64_MOVW_SABS_G0
+            RelocType::MovwSabsG1 => 271,    // R_AARCH64_MOVW_SABS_G1
+            RelocType::MovwSabsG2 => 272,    // R_AARCH64_MOVW_SABS_G2
         }
     }
 }
@@ -920,6 +950,7 @@ pub fn encode_instruction(mnemonic: &str, operands: &[Operand], raw_operands: &s
         "cas" | "casa" | "casal" | "casl"
         | "casb" | "casab" | "casalb" | "caslb"
         | "cash" | "casah" | "casalh" | "caslh" => encode_cas(mnemonic, operands),
+        "casp" | "caspa" | "caspal" | "caspl" => encode_casp(mnemonic, operands),
         "swp" | "swpa" | "swpal" | "swpl"
         | "swpb" | "swpab" | "swpalb" | "swplb"
         | "swph" | "swpah" | "swpalh" | "swplh" => encode_swp(mnemonic, operands),

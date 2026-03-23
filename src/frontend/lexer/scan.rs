@@ -1014,7 +1014,15 @@ impl Lexer {
             b',' => TokenKind::Comma,
             b'~' => TokenKind::Tilde,
             b'?' => TokenKind::Question,
-            b':' => TokenKind::Colon,
+            b':' => {
+                // C11 §6.4.6 digraph: :> maps to ]
+                if self.pos < self.input.len() && self.input[self.pos] == b'>' {
+                    self.pos += 1;
+                    TokenKind::RBracket
+                } else {
+                    TokenKind::Colon
+                }
+            }
             b'#' => {
                 if self.pos < self.input.len() && self.input[self.pos] == b'#' {
                     self.pos += 1;
@@ -1071,9 +1079,26 @@ impl Lexer {
                 }
             }
             b'%' => {
-                if self.pos < self.input.len() && self.input[self.pos] == b'=' {
-                    self.pos += 1;
-                    TokenKind::PercentAssign
+                if self.pos < self.input.len() {
+                    match self.input[self.pos] {
+                        b'=' => { self.pos += 1; TokenKind::PercentAssign }
+                        // C11 §6.4.6 digraph: %> maps to }
+                        b'>' => { self.pos += 1; TokenKind::RBrace }
+                        // C11 §6.4.6 digraph: %: maps to #, %:%: maps to ##
+                        b':' => {
+                            self.pos += 1;
+                            if self.pos + 1 < self.input.len()
+                                && self.input[self.pos] == b'%'
+                                && self.input[self.pos + 1] == b':'
+                            {
+                                self.pos += 2;
+                                TokenKind::HashHash
+                            } else {
+                                TokenKind::Hash
+                            }
+                        }
+                        _ => TokenKind::Percent,
+                    }
                 } else {
                     TokenKind::Percent
                 }
@@ -1137,6 +1162,10 @@ impl Lexer {
                             }
                         }
                         b'=' => { self.pos += 1; TokenKind::LessEqual }
+                        // C11 §6.4.6 digraph: <: maps to [
+                        b':' => { self.pos += 1; TokenKind::LBracket }
+                        // C11 §6.4.6 digraph: <% maps to {
+                        b'%' => { self.pos += 1; TokenKind::LBrace }
                         _ => TokenKind::Less,
                     }
                 } else {

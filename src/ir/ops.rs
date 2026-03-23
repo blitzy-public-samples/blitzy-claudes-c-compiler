@@ -2,6 +2,9 @@
 //!
 //! Each enum carries its own evaluation methods (eval_i64, eval_i128, eval_f64)
 //! for use by constant folding and simplification passes.
+//!
+//! The atomic operation enums (`AtomicRmwOp`, `AtomicOrdering`) cover all C11
+//! atomic operations (§7.17) plus GCC `__atomic_*` and `__sync_*` builtins.
 
 /// Atomic read-modify-write operations.
 #[derive(Debug, Clone, Copy)]
@@ -22,12 +25,25 @@ pub enum AtomicRmwOp {
     Xchg,
     /// Test and set: *ptr = 1 (returns old value)
     TestAndSet,
+    /// Min: *ptr = min(*ptr, val) (returns old value)
+    /// Used by GCC __atomic_fetch_min / __sync_fetch_and_min
+    Min,
+    /// Max: *ptr = max(*ptr, val) (returns old value)
+    /// Used by GCC __atomic_fetch_max / __sync_fetch_and_max
+    Max,
+    /// Unsigned Min: *ptr = min(*ptr, val) treating operands as unsigned
+    UMin,
+    /// Unsigned Max: *ptr = max(*ptr, val) treating operands as unsigned
+    UMax,
 }
 
 /// Memory ordering for atomic operations.
 #[derive(Debug, Clone, Copy)]
 pub enum AtomicOrdering {
     Relaxed,
+    /// C11 memory_order_consume: data-dependent acquire.
+    /// Backends should treat as Acquire (following GCC/Clang convention).
+    Consume,
     Acquire,
     Release,
     AcqRel,

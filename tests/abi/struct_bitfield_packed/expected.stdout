@@ -1,0 +1,9 @@
+sizeof_packed_bf: OK
+alignof_packed_bf: OK
+offsetof_c: OK
+store_load_all: OK
+negative_values: OK
+c_no_corrupt: OK
+a_no_corrupt: OK
+extremes: OK
+All packed bitfield tests passed

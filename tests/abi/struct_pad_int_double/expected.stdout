@@ -1,0 +1,6 @@
+sizeof_PadIntDouble: OK
+offsetof_a: OK
+offsetof_b: OK
+alignof_PadIntDouble: OK
+value_check: OK
+All struct_pad_int_double tests passed

@@ -344,3 +344,90 @@ pub fn eval_binop_with_types(
     const_arith::eval_const_binop(op, lhs, rhs, is_32bit, is_unsigned, lhs_unsigned, rhs_unsigned)
 }
 
+/// Evaluate a `_Static_assert` constant expression and determine whether the
+/// assertion passes, fails, or cannot be evaluated at compile time.
+///
+/// This is a thin wrapper around the caller's recursive constant expression
+/// evaluator. The actual evaluation of sub-expressions (literals, builtins,
+/// binary ops, casts, sizeof, etc.) is performed by `eval_fn`, which is
+/// provided by the calling context (sema or IR lowering). This function only
+/// interprets the resulting `IrConst` value as a boolean assertion result.
+///
+/// # C11 §6.7.10 — `_Static_assert` semantics:
+/// - The constant expression shall be an integer constant expression.
+/// - If the value of the constant expression compares unequal to 0, the
+///   declaration has no effect. Otherwise, the constraint is violated and
+///   the implementation shall produce a diagnostic message that includes the
+///   text of the string literal (handled by the caller, not here).
+///
+/// # Parameters
+/// - `expr`: The AST expression from the `_Static_assert` declaration.
+/// - `eval_fn`: The caller's recursive `eval_const_expr` function, which
+///   resolves the expression to an `IrConst` if it is a constant expression.
+///
+/// # Returns
+/// - `Ok(true)` if the expression evaluates to a non-zero value (assertion passes).
+/// - `Ok(false)` if the expression evaluates to zero (assertion fails — the
+///   caller should emit a diagnostic including the user-provided message string).
+/// - `Err("expression is not a constant expression")` if `eval_fn` returns `None`,
+///   indicating the expression could not be folded at compile time.
+pub fn eval_static_assert_expr(
+    expr: &Expr,
+    eval_fn: &dyn Fn(&Expr) -> Option<IrConst>,
+) -> Result<bool, &'static str> {
+    match eval_fn(expr) {
+        Some(val) => Ok(val.is_nonzero()),
+        None => Err("expression is not a constant expression"),
+    }
+}
+
+/// Evaluate a `_Generic` selection by matching a controlling type against a list
+/// of type associations, with an optional default fallback.
+///
+/// `_Generic` is primarily a type-level operation (C11 §6.5.1.1): the controlling
+/// expression's type is matched against each association's type at compile time,
+/// and the result expression of the matching association is selected. This function
+/// encapsulates the matching logic so that both sema (using `CType`) and IR lowering
+/// (using `IrType`) can share the same selection algorithm.
+///
+/// # C11 §6.5.1.1 — `_Generic` selection semantics:
+/// - The controlling expression's type is compared against each association's type.
+/// - At most one association (excluding `default`) shall be compatible with the
+///   controlling expression's type.
+/// - If no association's type is compatible, the `default` association is selected.
+/// - If no association matches and no `default` is present, the constraint is violated.
+///
+/// # Parameters
+/// - `controlling_type`: The type of the controlling expression.
+/// - `associations`: A slice of `(type, optional_index)` pairs. Each entry represents
+///   a type association from the `_Generic` expression. The `Option<usize>` is the
+///   index of the result expression for that association; entries with `None` are
+///   skipped during matching (e.g., placeholder entries).
+/// - `default_idx`: The index of the `default` association's result expression,
+///   or `None` if no `default` association was provided.
+/// - `type_compatible_fn`: A caller-provided function that determines whether two
+///   types are compatible. For sema this performs C11 type compatibility checks on
+///   `CType`; for IR lowering this checks `IrType` equivalence.
+///
+/// # Returns
+/// - `Some(index)` with the index of the selected association's result expression.
+/// - `None` if no type matched and no default association was provided, indicating
+///   a constraint violation that the caller should diagnose.
+pub fn eval_generic_selection<'a, T>(
+    controlling_type: &T,
+    associations: &'a [(T, Option<usize>)],
+    default_idx: Option<usize>,
+    type_compatible_fn: &dyn Fn(&T, &T) -> bool,
+) -> Option<usize> {
+    // First pass: find an exact type match among the non-default associations.
+    for (assoc_type, idx) in associations {
+        if let Some(result_idx) = idx {
+            if type_compatible_fn(controlling_type, assoc_type) {
+                return Some(*result_idx);
+            }
+        }
+    }
+    // No exact match found — fall back to the default association if present.
+    default_idx
+}
+

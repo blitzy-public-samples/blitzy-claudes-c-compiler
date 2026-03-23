@@ -1,0 +1,2 @@
+-Werror=return-type
+-Wno-error=return-type

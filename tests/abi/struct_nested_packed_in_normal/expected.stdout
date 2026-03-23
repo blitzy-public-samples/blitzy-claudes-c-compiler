@@ -1,0 +1,9 @@
+sizeof_inner: OK
+alignof_inner: OK
+offsetof_inner_b: OK
+sizeof_outer: OK
+alignof_outer: OK
+offsetof_outer_y: OK
+offsetof_outer_x: OK
+value_correctness: OK
+All nested packed in normal tests passed

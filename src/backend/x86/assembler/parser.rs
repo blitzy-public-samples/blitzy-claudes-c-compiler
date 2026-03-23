@@ -110,6 +110,9 @@ pub enum SymbolKind {
     Object,
     TlsObject,
     NoType,
+    /// GNU indirect function (IFUNC) — the symbol points to a resolver function
+    /// that returns the actual implementation address at runtime.
+    GnuIndirectFunction,
 }
 
 /// Size expression: either a constant or `.-name` (current position minus symbol).
@@ -794,6 +797,7 @@ fn parse_type_directive(args: &str) -> Result<AsmItem, String> {
         "@object" | "%object" | "STT_OBJECT" => SymbolKind::Object,
         "@tls_object" | "%tls_object" | "STT_TLS" => SymbolKind::TlsObject,
         "@notype" | "%notype" | "STT_NOTYPE" => SymbolKind::NoType,
+        "@gnu_indirect_function" | "%gnu_indirect_function" | "STT_GNU_IFUNC" => SymbolKind::GnuIndirectFunction,
         _ => return Err(format!("unknown symbol type: {}", kind_str)),
     };
     Ok(AsmItem::SymbolType(name, kind))
@@ -1439,6 +1443,28 @@ fn strip_sym_parens(s: &str) -> &str {
     }
 }
 
+/// Find the position of " - " in a string, but only at the top level
+/// (not inside parenthesized subexpressions). This prevents splitting
+/// expressions like `symbol + (N << 12)` at a minus inside the parens.
+fn find_top_level_minus(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut depth = 0i32;
+    let mut i = 0;
+    while i + 2 < bytes.len() {
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => { if depth > 0 { depth -= 1; } }
+            b' ' if depth == 0 && i + 2 < bytes.len()
+                && bytes[i + 1] == b'-' && bytes[i + 2] == b' ' => {
+                return Some(i);
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
 /// Parse data values (integers or symbol references).
 fn parse_data_values(s: &str) -> Result<Vec<DataValue>, String> {
     let mut vals = Vec::new();
@@ -1448,8 +1474,19 @@ fn parse_data_values(s: &str) -> Result<Vec<DataValue>, String> {
             continue;
         }
 
+        // Try integer first — handles pure arithmetic expressions including those
+        // with parentheses, shifts, and subtraction (e.g., (5 - 3), (N << 12)).
+        // Must come before the " - " symbol-diff check to avoid misinterpreting
+        // arithmetic expressions like "5 - 3" as symbol differences.
+        if let Ok(val) = parse_integer_expr(trimmed) {
+            vals.push(DataValue::Integer(val));
+            continue;
+        }
+
         // Check for symbol difference: .LBB3 - .Ljt_0, or with addend: tr_gdt_end - tr_gdt - 1
-        if let Some(minus_pos) = trimmed.find(" - ") {
+        // Use parenthesis-aware search to avoid splitting inside subexpressions
+        // like `symbol + (N << 12)`.
+        if let Some(minus_pos) = find_top_level_minus(trimmed) {
             let lhs = strip_sym_parens(trimmed[..minus_pos].trim()).to_string();
             let rhs_full = trimmed[minus_pos + 3..].trim();
             // Check if rhs has an addend: "sym - N" or "sym + N"
@@ -1477,12 +1514,6 @@ fn parse_data_values(s: &str) -> Result<Vec<DataValue>, String> {
             continue;
         }
 
-        // Try integer
-        if let Ok(val) = parse_integer_expr(trimmed) {
-            vals.push(DataValue::Integer(val));
-            continue;
-        }
-
         // Check for label diff without spaces (e.g., 663b-661b)
         if let Some(val) = parse_label_diff(trimmed) {
             vals.push(val);
@@ -1502,7 +1533,9 @@ fn parse_data_values(s: &str) -> Result<Vec<DataValue>, String> {
 }
 
 /// Parse symbol+offset or symbol-offset expressions (e.g., GD_struct+128).
-/// Also handles offset+symbol (e.g., 0x9b000000 + pa_real_mode_base).
+/// Also handles offset+symbol (e.g., 0x9b000000 + pa_real_mode_base) and
+/// complex expressions like symbol + (N << 12) where the right side is a
+/// parenthesized arithmetic expression.
 /// Returns a DataValue::SymbolOffset if the string matches this pattern.
 fn parse_symbol_offset(s: &str) -> Option<DataValue> {
     // Look for + or - that separates symbol from offset
@@ -1515,6 +1548,17 @@ fn parse_symbol_offset(s: &str) -> Option<DataValue> {
             // Case 1: symbol+offset or symbol-offset (e.g., "GD_struct+128")
             if let Ok(offset) = parse_integer_expr(right_with_sign) {
                 if !left.is_empty() && !left.contains(' ') {
+                    return Some(DataValue::SymbolOffset(left.to_string(), offset));
+                }
+            }
+
+            // Case 1b: symbol + (complex_expr) — try parsing just the right-hand side
+            // without the sign as a full expression (handles parenthesized shifts, etc.)
+            // e.g., "level1_fixmap_pgt + (0 << 12)"
+            if !left.is_empty() && !left.contains(' ') && is_label_like(left) {
+                let rhs = right_with_sign[1..].trim();
+                if let Ok(rhs_val) = parse_integer_expr(rhs) {
+                    let offset = if c == '+' { rhs_val } else { -rhs_val };
                     return Some(DataValue::SymbolOffset(left.to_string(), offset));
                 }
             }
@@ -1610,7 +1654,19 @@ fn expand_gas_macros_with_state(
                 let expr_str = rest[comma_pos+1..].trim();
                 // Try to evaluate expression with current symbol values
                 let resolved = resolve_set_expr(expr_str, symbols);
-                if let Ok(val) = parse_integer_expr(&resolved) {
+                let resolved_val = parse_integer_expr(&resolved).or_else(|_| {
+                    // Fallback: strip outer parentheses and try again.
+                    // Handles cases where macro expansion produces expressions
+                    // like "((5))" or "(val)" that have redundant outer parens
+                    // causing parse failures with nested arithmetic.
+                    let stripped = strip_outer_parens(&resolved);
+                    if stripped != resolved {
+                        parse_integer_expr(stripped)
+                    } else {
+                        Err(String::new())
+                    }
+                });
+                if let Ok(val) = resolved_val {
                     symbols.insert(sym_name.clone(), val);
                     // For local symbols (.L*), don't emit the .set - we handle them internally
                     if sym_name.starts_with(".L") {
@@ -1800,6 +1856,67 @@ fn expand_gas_macros_with_state(
             continue;
         }
 
+        // .ifnb arg / .endif - execute block if arg is NOT blank
+        // .ifb arg / .endif - execute block if arg IS blank
+        // Used by Linux kernel macros (e.g., IBRS_ENTER) to conditionally emit
+        // instructions based on whether a macro argument was provided.
+        // When a macro argument is blank, `.ifnb \arg` expands to `.ifnb` (no trailing space
+        // after trim), so we also match the bare directive name without trailing content.
+        if trimmed.starts_with(".ifnb ") || trimmed.starts_with(".ifnb\t") || trimmed == ".ifnb"
+            || trimmed.starts_with(".ifb ") || trimmed.starts_with(".ifb\t") || trimmed == ".ifb"
+        {
+            let is_ifnb = trimmed.starts_with(".ifnb");
+            let directive_len = if is_ifnb { ".ifnb".len() } else { ".ifb".len() };
+            let arg = trimmed[directive_len..].trim();
+            // .ifnb: true if arg is non-empty after trimming
+            // .ifb: true if arg is empty after trimming
+            let cond = if is_ifnb {
+                !arg.is_empty()
+            } else {
+                arg.is_empty()
+            };
+            let mut branches: Vec<(bool, Vec<String>)> = vec![(cond, Vec::new())];
+            let mut current_idx = 0;
+            let mut depth = 1;
+            i += 1;
+            while i < lines.len() {
+                let inner = strip_comment(&lines[i]).trim().to_string();
+                if is_if_start(&inner) {
+                    depth += 1;
+                    branches[current_idx].1.push(lines[i].clone());
+                } else if inner == ".endif" {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                    branches[current_idx].1.push(lines[i].clone());
+                } else if depth == 1 && (inner.starts_with(".elseif ") || inner.starts_with(".elseif\t")) {
+                    let elseif_rest = inner[".elseif".len()..].trim();
+                    let elseif_cond = eval_if_expr(elseif_rest, symbols);
+                    branches.push((elseif_cond, Vec::new()));
+                    current_idx += 1;
+                } else if inner == ".else" && depth == 1 {
+                    branches.push((true, Vec::new()));
+                    current_idx += 1;
+                } else {
+                    branches[current_idx].1.push(lines[i].clone());
+                }
+                i += 1;
+            }
+            let empty: Vec<String> = Vec::new();
+            let mut chosen_lines: &Vec<String> = &empty;
+            for (bcond, blines) in &branches {
+                if *bcond {
+                    chosen_lines = blines;
+                    break;
+                }
+            }
+            let expanded = expand_gas_macros_with_state(chosen_lines, macros, symbols)?;
+            result.extend(expanded);
+            i += 1;
+            continue;
+        }
+
         // .error "message" - assembler error directive
         if trimmed.starts_with(".error ") || trimmed.starts_with(".error\t") {
             return Err(format!("assembler error: {}", trimmed[".error".len()..].trim()));
@@ -1860,6 +1977,10 @@ fn expand_gas_macros_with_state(
                 l
             }).collect();
             // Recursively expand the body (handles nested .irp, .set, .if, etc.)
+            // Note: Numeric labels (0:, 1:, etc.) and their forward/backward references
+            // (0f, 1b, etc.) are preserved as-is through textual expansion. They are
+            // resolved later by parse_asm's label handling and the ELF writer's numeric
+            // label support, NOT during macro expansion.
             expanded_body = expand_gas_macros_with_state(&expanded_body, macros, symbols)?;
             result.extend(expanded_body);
             // Emit remaining semicolon-separated parts as separate lines
@@ -2060,6 +2181,9 @@ fn eval_ifc(rest: &str) -> bool {
 /// Resolve symbols in a .set expression string.
 /// Uses whole-word matching to avoid replacing substrings inside identifiers,
 /// register names, or instruction mnemonics (e.g., replacing `i` inside `rip`).
+/// After symbol substitution, tries to fold the expression to a simple integer
+/// when all symbols have been resolved, which prevents expression fragments
+/// from leaking through nested macro arithmetic (e.g., alt_max_2/alt_max_3).
 fn resolve_set_expr(expr: &str, symbols: &std::collections::HashMap<String, i64>) -> String {
     let mut result = expr.to_string();
     // Sort by length (longest first) to avoid partial replacements
@@ -2067,6 +2191,19 @@ fn resolve_set_expr(expr: &str, symbols: &std::collections::HashMap<String, i64>
     sym_list.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
     for (name, val) in sym_list {
         result = replace_whole_word(&result, name, &val.to_string());
+    }
+    // Try to fold the fully-resolved expression to a simple integer.
+    // This handles cases where nested macro expansion produces expressions
+    // like "((5) + (3 << 12))" that are pure arithmetic after symbol resolution.
+    if let Ok(val) = parse_integer_expr(&result) {
+        return val.to_string();
+    }
+    // Fallback: try stripping outer parentheses and re-evaluating.
+    let stripped = strip_outer_parens(&result);
+    if stripped != result {
+        if let Ok(val) = parse_integer_expr(stripped) {
+            return val.to_string();
+        }
     }
     result
 }
@@ -2111,11 +2248,13 @@ fn is_ident_char(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
-/// Check if a line starts a new conditional assembly block (.if, .ifc, .ifdef, .ifndef).
+/// Check if a line starts a new conditional assembly block (.if, .ifc, .ifdef, .ifndef, .ifnb, .ifb).
 fn is_if_start(trimmed: &str) -> bool {
     trimmed.starts_with(".if ") || trimmed.starts_with(".if\t") || trimmed.starts_with(".if(")
         || trimmed.starts_with(".ifc ") || trimmed.starts_with(".ifc\t")
         || trimmed.starts_with(".ifdef ") || trimmed.starts_with(".ifndef ")
+        || trimmed.starts_with(".ifnb ") || trimmed.starts_with(".ifnb\t")
+        || trimmed.starts_with(".ifb ") || trimmed.starts_with(".ifb\t")
 }
 
 /// Evaluate a `.if` expression for the x86 assembler.
@@ -2176,5 +2315,231 @@ main:
         assert_eq!(parse_integer_expr("-1").unwrap(), -1);
         assert_eq!(parse_integer_expr("0xff").unwrap(), 255);
         assert_eq!(parse_integer_expr("0").unwrap(), 0);
+    }
+
+    // --- Bug Fix 1: .ifnb / .ifb conditional assembly directives ---
+
+    #[test]
+    fn test_ifnb_with_nonempty_arg() {
+        let asm = ".macro T reg\n.ifnb \\reg\n    movq %rax, \\reg\n.endif\n.endm\nT %rbx\n";
+        let items = parse_asm(asm).unwrap();
+        let instrs: Vec<_> = items.iter().filter(|i| matches!(i, AsmItem::Instruction(_))).collect();
+        assert_eq!(instrs.len(), 1, ".ifnb with non-blank arg should execute block");
+    }
+
+    #[test]
+    fn test_ifnb_with_empty_arg() {
+        let asm = ".macro T reg\n.ifnb \\reg\n    movq %rax, %rbx\n.endif\n    ret\n.endm\nT\n";
+        let items = parse_asm(asm).unwrap();
+        let instrs: Vec<_> = items.iter().filter_map(|i| {
+            if let AsmItem::Instruction(inst) = i { Some(inst.mnemonic.as_str()) } else { None }
+        }).collect();
+        assert_eq!(instrs, vec!["ret"], ".ifnb with blank arg should skip block");
+    }
+
+    #[test]
+    fn test_ifb_with_empty_arg() {
+        let asm = ".macro T reg\n.ifb \\reg\n    movq %rax, %rbx\n.endif\n.endm\nT\n";
+        let items = parse_asm(asm).unwrap();
+        let instrs: Vec<_> = items.iter().filter(|i| matches!(i, AsmItem::Instruction(_))).collect();
+        assert_eq!(instrs.len(), 1, ".ifb with blank arg should execute block");
+    }
+
+    #[test]
+    fn test_ifb_with_nonempty_arg() {
+        let asm = ".macro T reg\n.ifb \\reg\n    movq %rax, %rbx\n.endif\n    ret\n.endm\nT %rcx\n";
+        let items = parse_asm(asm).unwrap();
+        let instrs: Vec<_> = items.iter().filter_map(|i| {
+            if let AsmItem::Instruction(inst) = i { Some(inst.mnemonic.as_str()) } else { None }
+        }).collect();
+        assert_eq!(instrs, vec!["ret"], ".ifb with non-blank arg should skip block");
+    }
+
+    #[test]
+    fn test_ifnb_with_else_blank() {
+        let asm = ".macro T reg\n.ifnb \\reg\n    movq %rax, %rbx\n.else\n    ret\n.endif\n.endm\nT\n";
+        let items = parse_asm(asm).unwrap();
+        let instrs: Vec<_> = items.iter().filter_map(|i| {
+            if let AsmItem::Instruction(inst) = i { Some(inst.mnemonic.as_str()) } else { None }
+        }).collect();
+        assert_eq!(instrs, vec!["ret"], ".ifnb blank should take .else branch");
+    }
+
+    #[test]
+    fn test_ifnb_with_else_nonblank() {
+        let asm = ".macro T reg\n.ifnb \\reg\n    movq %rax, \\reg\n.else\n    ret\n.endif\n.endm\nT %rbx\n";
+        let items = parse_asm(asm).unwrap();
+        let instrs: Vec<_> = items.iter().filter_map(|i| {
+            if let AsmItem::Instruction(inst) = i { Some(inst.mnemonic.as_str()) } else { None }
+        }).collect();
+        assert_eq!(instrs, vec!["movq"], ".ifnb non-blank should take true branch");
+    }
+
+    #[test]
+    fn test_ifnb_nested_conditional() {
+        let asm = ".macro T reg\n.ifnb \\reg\n    .if 1\n        movq %rax, \\reg\n    .endif\n.endif\n.endm\nT %rbx\n";
+        let items = parse_asm(asm).unwrap();
+        let instrs: Vec<_> = items.iter().filter(|i| matches!(i, AsmItem::Instruction(_))).collect();
+        assert_eq!(instrs.len(), 1, "Nested .if inside .ifnb should track depth correctly");
+    }
+
+    #[test]
+    fn test_is_if_start_recognizes_ifnb_ifb() {
+        assert!(is_if_start(".ifnb %rax"));
+        assert!(is_if_start(".ifnb\t%rax"));
+        assert!(is_if_start(".ifb "));
+        assert!(is_if_start(".ifb\t"));
+        // Existing ones still work
+        assert!(is_if_start(".if 1"));
+        assert!(is_if_start(".ifc a, b"));
+        assert!(is_if_start(".ifdef FOO"));
+        assert!(is_if_start(".ifndef FOO"));
+        // Non-matches
+        assert!(!is_if_start(".endif"));
+        assert!(!is_if_start("movq %rax, %rbx"));
+    }
+
+    // --- Bug Fix 2: parse_data_values enhancements ---
+
+    #[test]
+    fn test_parse_data_symbol_plus_parenthesized_shift() {
+        let asm = ".section .text\n.quad my_sym + (3 << 12)\n";
+        let items = parse_asm(asm).unwrap();
+        let quads: Vec<_> = items.iter().filter_map(|i| {
+            if let AsmItem::Quad(vals) = i { Some(vals) } else { None }
+        }).collect();
+        assert_eq!(quads.len(), 1);
+        assert_eq!(quads[0].len(), 1);
+        match &quads[0][0] {
+            DataValue::SymbolOffset(sym, offset) => {
+                assert_eq!(sym, "my_sym");
+                assert_eq!(*offset, 3i64 << 12);
+            }
+            other => panic!("Expected SymbolOffset, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_data_parenthesized_minus_inside_parens() {
+        // " - " inside parentheses should NOT split the expression
+        let asm = ".section .text\n.long (5 - 3)\n";
+        let items = parse_asm(asm).unwrap();
+        let longs: Vec<_> = items.iter().filter_map(|i| {
+            if let AsmItem::Long(vals) = i { Some(vals) } else { None }
+        }).collect();
+        assert_eq!(longs.len(), 1);
+        match &longs[0][0] {
+            DataValue::Integer(v) => assert_eq!(*v, 2),
+            other => panic!("Expected Integer(2), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_data_symbol_diff_still_works() {
+        // Standard symbol diff (without parens) should still work
+        let asm = ".section .text\n.long .Lstart - .Lend\n";
+        let items = parse_asm(asm).unwrap();
+        let longs: Vec<_> = items.iter().filter_map(|i| {
+            if let AsmItem::Long(vals) = i { Some(vals) } else { None }
+        }).collect();
+        assert_eq!(longs.len(), 1);
+        match &longs[0][0] {
+            DataValue::SymbolDiff(a, b) => {
+                assert_eq!(a, ".Lstart");
+                assert_eq!(b, ".Lend");
+            }
+            other => panic!("Expected SymbolDiff, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_data_symbol_plus_simple_offset() {
+        // Standard symbol+offset still works
+        let asm = ".section .text\n.quad GD_struct+128\n";
+        let items = parse_asm(asm).unwrap();
+        let quads: Vec<_> = items.iter().filter_map(|i| {
+            if let AsmItem::Quad(vals) = i { Some(vals) } else { None }
+        }).collect();
+        assert_eq!(quads.len(), 1);
+        match &quads[0][0] {
+            DataValue::SymbolOffset(sym, offset) => {
+                assert_eq!(sym, "GD_struct");
+                assert_eq!(*offset, 128);
+            }
+            other => panic!("Expected SymbolOffset, got {:?}", other),
+        }
+    }
+
+    // --- Bug Fix 2c: .set resolution ---
+
+    #[test]
+    fn test_set_resolution_nested_arithmetic() {
+        let asm = ".section .text\n.set MY_A, 5\n.set MY_B, (MY_A + 3)\n.long MY_B\n";
+        let items = parse_asm(asm).unwrap();
+        // Should parse without errors
+        assert!(!items.is_empty());
+    }
+
+    // --- Bug Fix 3: macro param prefix-matching ---
+
+    #[test]
+    fn test_macro_param_prefix_no_corruption() {
+        let asm = ".macro T orig, orig_len\n.long \\orig_len\n.long \\orig\n.endm\nT 100, 200\n";
+        let items = parse_asm(asm).unwrap();
+        let longs: Vec<_> = items.iter().filter_map(|i| {
+            if let AsmItem::Long(vals) = i { Some(vals) } else { None }
+        }).collect();
+        assert_eq!(longs.len(), 2);
+        match &longs[0][0] {
+            DataValue::Integer(v) => assert_eq!(*v, 200, "orig_len should be 200"),
+            other => panic!("Expected Integer(200) for orig_len, got {:?}", other),
+        }
+        match &longs[1][0] {
+            DataValue::Integer(v) => assert_eq!(*v, 100, "orig should be 100"),
+            other => panic!("Expected Integer(100) for orig, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_macro_param_triple_prefix() {
+        let asm = ".macro T a, ab, abc\n.long \\abc\n.long \\ab\n.long \\a\n.endm\nT 1, 2, 3\n";
+        let items = parse_asm(asm).unwrap();
+        let longs: Vec<_> = items.iter().filter_map(|i| {
+            if let AsmItem::Long(vals) = i { Some(vals) } else { None }
+        }).collect();
+        assert_eq!(longs.len(), 3);
+        match &longs[0][0] {
+            DataValue::Integer(v) => assert_eq!(*v, 3, "abc should be 3"),
+            _ => panic!("Expected Integer(3)"),
+        }
+        match &longs[1][0] {
+            DataValue::Integer(v) => assert_eq!(*v, 2, "ab should be 2"),
+            _ => panic!("Expected Integer(2)"),
+        }
+        match &longs[2][0] {
+            DataValue::Integer(v) => assert_eq!(*v, 1, "a should be 1"),
+            _ => panic!("Expected Integer(1)"),
+        }
+    }
+
+    // --- find_top_level_minus helper ---
+
+    #[test]
+    fn test_find_top_level_minus_basic() {
+        assert_eq!(find_top_level_minus("a - b"), Some(1));
+        assert_eq!(find_top_level_minus("foo - bar"), Some(3));
+    }
+
+    #[test]
+    fn test_find_top_level_minus_inside_parens() {
+        // " - " inside parens should NOT be found
+        assert_eq!(find_top_level_minus("(a - b)"), None);
+        assert_eq!(find_top_level_minus("sym + (5 - 3)"), None);
+    }
+
+    #[test]
+    fn test_find_top_level_minus_after_parens() {
+        // " - " at top level after a parenthesized expression should be found
+        assert!(find_top_level_minus("(a + b) - c").is_some());
     }
 }

@@ -133,6 +133,15 @@ pub trait TypeConvertContext {
                 let elem_ctype = self.resolve_type_spec_to_ctype(inner);
                 CType::Vector(Box::new(elem_ctype), *total_bytes)
             }
+
+            // === C11 _Atomic(type-name) specifier ===
+            // Resolve _Atomic(T) to CType::Atomic(T). The _Atomic qualifier form
+            // (without parens) is handled by the parser producing a
+            // TypeSpecifier::Atomic wrapping the base type, so both forms converge here.
+            TypeSpecifier::Atomic(inner) => {
+                let inner_type = self.resolve_type_spec_to_ctype(inner);
+                inner_type.with_atomic()
+            }
         }
     }
 }
@@ -177,7 +186,12 @@ fn convert_param_decls_to_ctypes(
     params
         .iter()
         .map(|p| {
-            let ty = ctx.resolve_type_spec_to_ctype(&p.type_spec);
+            let mut ty = ctx.resolve_type_spec_to_ctype(&p.type_spec);
+            // Apply restrict qualifier to pointer-typed parameters when declared
+            // with the `restrict` keyword (e.g., `void foo(int * restrict p)`).
+            if p.is_restrict && matches!(ty, CType::Pointer(_, _)) {
+                ty = ty.with_restrict();
+            }
             (ty, p.name.clone())
         })
         .collect()
@@ -284,7 +298,7 @@ pub fn build_full_ctype_with_base(
                     result = func_type;
                     i += 1;
                 }
-                DerivedDeclarator::Array(size_expr) => {
+                DerivedDeclarator::Array { size: size_expr, .. } => {
                     // Array declarators after the function pointer core are outer
                     // wrappers (e.g., array-of-function-pointers when inner_derived
                     // had [Pointer, Array(N)] which the parser emits as
@@ -304,7 +318,7 @@ pub fn build_full_ctype_with_base(
         // Pointer declarators in the prefix were already folded into the return type.
         let prefix = &derived[..fp_start];
         for d in prefix.iter().rev() {
-            if let DerivedDeclarator::Array(size_expr) = d {
+            if let DerivedDeclarator::Array { size: size_expr, .. } = d {
                 let size = size_expr
                     .as_ref()
                     .and_then(|e| ctx.eval_const_expr_as_usize(e));
@@ -323,17 +337,17 @@ pub fn build_full_ctype_with_base(
                     result = CType::Pointer(Box::new(result), AddressSpace::Default);
                     i += 1;
                 }
-                DerivedDeclarator::Array(_) => {
+                DerivedDeclarator::Array { .. } => {
                     // Collect consecutive array dimensions
                     let start = i;
                     while i < derived.len()
-                        && matches!(&derived[i], DerivedDeclarator::Array(_))
+                        && matches!(&derived[i], DerivedDeclarator::Array { .. })
                     {
                         i += 1;
                     }
                     // Apply in reverse: innermost (rightmost) dimension wraps first
                     for j in (start..i).rev() {
-                        if let DerivedDeclarator::Array(size_expr) = &derived[j] {
+                        if let DerivedDeclarator::Array { size: size_expr, .. } = &derived[j] {
                             let size = size_expr
                                 .as_ref()
                                 .and_then(|e| ctx.eval_const_expr_as_usize(e));
@@ -348,4 +362,42 @@ pub fn build_full_ctype_with_base(
         }
         result
     }
+}
+
+/// Validate an `_Alignas` alignment value per C11 §6.7.5.
+///
+/// C11 requires that the alignment specified by `_Alignas` be a positive power of two.
+/// This function validates that requirement and returns `Ok(alignment)` if the value
+/// is valid, or an appropriate error message if not.
+///
+/// Note: The additional C11 constraint that `_Alignas` cannot reduce alignment below
+/// the natural alignment of the declared type is enforced by semantic analysis (sema),
+/// not by this function, because it requires knowledge of the type's natural alignment.
+///
+/// # Examples
+///
+/// Valid power-of-two alignments:
+/// ```ignore
+/// assert_eq!(validate_alignas(1), Ok(1));
+/// assert_eq!(validate_alignas(4), Ok(4));
+/// assert_eq!(validate_alignas(128), Ok(128));
+/// ```
+///
+/// Rejected zero alignment:
+/// ```ignore
+/// assert_eq!(validate_alignas(0), Err("alignment must be positive"));
+/// ```
+///
+/// Rejected non-power-of-two alignment:
+/// ```ignore
+/// assert_eq!(validate_alignas(3), Err("alignment must be a power of 2"));
+/// ```
+pub fn validate_alignas(alignment: usize) -> Result<usize, &'static str> {
+    if alignment == 0 {
+        return Err("alignment must be positive");
+    }
+    if !alignment.is_power_of_two() {
+        return Err("alignment must be a power of 2");
+    }
+    Ok(alignment)
 }

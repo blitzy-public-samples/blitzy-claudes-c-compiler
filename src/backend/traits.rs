@@ -493,6 +493,11 @@ pub trait ArchCodegen {
             self.emit_call_spill_fptr(func_ptr.expect("indirect call requires func_ptr"));
         }
 
+        // Allow backends to cache per-argument struct alignment info before
+        // stack space computation and stack argument emission.  RISC-V uses this
+        // to apply 16-byte alignment for structs containing `long double` / `__int128`.
+        self.prepare_struct_stack_aligns(struct_arg_aligns);
+
         // Compute stack space needed for overflow args.
         let stack_arg_space = self.emit_call_compute_stack_space(&arg_classes, arg_types);
 
@@ -540,6 +545,20 @@ pub trait ArchCodegen {
 
     /// Return the ABI configuration for this architecture's function calls.
     fn call_abi_config(&self) -> super::call_abi::CallAbiConfig;
+
+    /// Prepare per-argument struct alignment info before stack space computation.
+    ///
+    /// Called by `emit_call` with the struct alignment data (`struct_arg_aligns`)
+    /// *before* `emit_call_compute_stack_space` and `emit_call_stack_args`. This
+    /// allows backends that need alignment information for struct stack arguments
+    /// to cache it for later use.
+    ///
+    /// RISC-V LP64D overrides this to ensure structs containing 16-byte-aligned
+    /// members (e.g. `long double` / `__int128`) receive proper alignment on
+    /// the overflow stack area. Other backends can safely ignore it.
+    ///
+    /// Default is a no-op.
+    fn prepare_struct_stack_aligns(&mut self, _struct_arg_aligns: &[Option<usize>]) { }
 
     /// Compute how much stack space to allocate for overflow arguments.
     /// x86 returns raw push bytes; ARM/RISC-V return pre-allocated SP space.
@@ -839,6 +858,42 @@ pub trait ArchCodegen {
 
     /// Emit a memory fence.
     fn emit_fence(&mut self, ordering: AtomicOrdering);
+
+    /// Emit a weak compare-and-exchange that is allowed to fail spuriously.
+    ///
+    /// A weak CAS (per C11 §7.17.7.4) may fail even when the current value
+    /// matches `expected`, which allows backends to use simpler LL/SC loops
+    /// on architectures like AArch64 and RISC-V where strong CAS requires
+    /// a retry loop.
+    ///
+    /// Default delegates to the strong `emit_atomic_cmpxchg` (correct but
+    /// potentially suboptimal on LL/SC architectures). Backends should
+    /// override this to emit a single LL/SC attempt without retry when the
+    /// target supports it.
+    fn emit_atomic_cmpxchg_weak(
+        &mut self,
+        dest: &Value,
+        ptr: &Operand,
+        expected: &Operand,
+        desired: &Operand,
+        ty: IrType,
+        success_ordering: AtomicOrdering,
+        failure_ordering: AtomicOrdering,
+        returns_bool: bool,
+    ) {
+        // Default: delegate to strong cmpxchg — correct semantics since
+        // strong CAS is a valid (non-spurious) implementation of weak CAS.
+        self.emit_atomic_cmpxchg(
+            dest,
+            ptr,
+            expected,
+            desired,
+            ty,
+            success_ordering,
+            failure_ordering,
+            returns_bool,
+        );
+    }
 
     /// Emit inline assembly.
     fn emit_inline_asm(&mut self, template: &str, outputs: &[(String, Value, Option<String>)], inputs: &[(String, Operand, Option<String>)], clobbers: &[String], operand_types: &[IrType], goto_labels: &[(String, BlockId)], input_symbols: &[Option<String>]);
@@ -1281,6 +1336,52 @@ pub trait ArchCodegen {
     /// Used by emit_stack_restore to reset SP.
     fn emit_mov_acc_to_sp(&mut self);
 
+    // ---- VLA (Variable-Length Array) stack management ----
+    //
+    // These methods support C11 variable-length arrays by providing hooks
+    // for the IR lowering layer to save/restore the stack pointer around
+    // VLA declarations and to emit dynamic stack allocation for VLA storage.
+    //
+    // All three have no-op defaults so that existing backends compile
+    // unchanged; backends must override these to enable VLA support.
+
+    /// Save the current stack pointer before VLA allocation.
+    ///
+    /// Called at VLA declaration sites to record the SP for later restoration
+    /// at scope exit. The saved value is stored into `save_slot`, which is
+    /// typically a fixed-offset stack slot allocated during stack layout.
+    ///
+    /// Default delegates to emit_stack_save; backends may override for
+    /// architecture-specific VLA SP save.
+    fn emit_vla_save_sp(&mut self, save_slot: &Value) {
+        self.emit_stack_save(save_slot);
+    }
+
+    /// Restore the stack pointer from a previously saved value at VLA scope exit.
+    ///
+    /// Called when exiting a scope that contained VLA declarations to reclaim
+    /// the dynamically allocated stack space. `save_slot` is the same value
+    /// that was written by a prior `emit_vla_save_sp` call.
+    ///
+    /// Default delegates to emit_stack_restore; backends may override for
+    /// architecture-specific VLA SP restore.
+    fn emit_vla_restore_sp(&mut self, save_slot: &Value) {
+        self.emit_stack_restore(save_slot);
+    }
+
+    /// Emit dynamic stack allocation for a VLA (variable-length array).
+    ///
+    /// The `size` operand contains the runtime byte count to allocate.
+    /// The result is stored in `dest` as a pointer to the beginning of
+    /// the allocated region. The allocation must maintain the target's
+    /// required stack alignment (16-byte).
+    ///
+    /// Default delegates to emit_dyn_alloca with 16-byte alignment;
+    /// backends may override for architecture-specific VLA allocation.
+    fn emit_vla_alloc(&mut self, dest: &Value, size: &Operand) {
+        self.emit_dyn_alloca(dest, size, 16);
+    }
+
     /// Emit a 128-bit value copy.
     fn emit_copy_i128(&mut self, dest: &Value, src: &Operand) {
         self.emit_load_operand(src);
@@ -1404,6 +1505,20 @@ pub trait ArchCodegen {
     /// Emit a target-independent intrinsic operation (fences, SIMD, CRC32, etc.).
     /// Each backend must implement this to emit the appropriate native instructions.
     fn emit_intrinsic(&mut self, _dest: &Option<Value>, _op: &IntrinsicOp, _dest_ptr: &Option<Value>, _args: &[Operand]) {}
+
+    /// Return the linker script path, if one was specified via the `-T` flag.
+    ///
+    /// The linker script parser in `linker_common::linker_script` uses this
+    /// to locate the script file when the per-architecture linker integrates
+    /// linker script support. Most of the actual parsing and section placement
+    /// logic resides in the shared linker common module, not in the codegen
+    /// trait — this method merely surfaces the path that the driver captured
+    /// from the CLI.
+    ///
+    /// Default returns `None` (no linker script specified).
+    fn linker_script_path(&self) -> Option<&std::path::Path> {
+        None
+    }
 
     /// Emit runtime helper stubs needed by this architecture.
     /// Called after all functions are generated, before the .note.GNU-stack section.

@@ -44,15 +44,23 @@ impl Lowerer {
     }
 
     /// Check if a TypeSpecifier resolves to a Bool type (through typedefs).
+    /// Unwraps _Atomic and restrict qualifiers so that e.g. `_Atomic _Bool`
+    /// typedef'd as `atomic_bool` is recognized as a boolean type.
     pub(super) fn is_type_bool(&self, ts: &TypeSpecifier) -> bool {
         matches!(ts, TypeSpecifier::Bool)
-            || self.resolve_typedef_ctype(ts).is_some_and(|ct| matches!(ct, CType::Bool))
+            || self.resolve_typedef_ctype(ts).is_some_and(|ct| {
+                matches!(Self::unwrap_qualifiers(&ct), CType::Bool)
+            })
     }
 
     /// Check if a TypeSpecifier resolves to a struct or union type (through typedefs).
+    /// Unwraps _Atomic and restrict qualifiers so that e.g. `_Atomic struct foo`
+    /// is correctly recognized as a struct type.
     pub(super) fn is_type_struct_or_union(&self, ts: &TypeSpecifier) -> bool {
         matches!(ts, TypeSpecifier::Struct(..) | TypeSpecifier::Union(..))
-            || self.resolve_typedef_ctype(ts).is_some_and(|ct| ct.is_struct_or_union())
+            || self.resolve_typedef_ctype(ts).is_some_and(|ct| {
+                Self::unwrap_qualifiers(&ct).is_struct_or_union()
+            })
     }
 
     /// Check if a TypeSpecifier is a transparent union (passed as first member for ABI).
@@ -78,15 +86,30 @@ impl Lowerer {
     }
 
     /// Check if a TypeSpecifier resolves to a complex type (through typedefs).
+    /// Unwraps _Atomic and restrict qualifiers so that e.g. `_Atomic _Complex double`
+    /// is correctly recognized as a complex type.
     pub(super) fn is_type_complex(&self, ts: &TypeSpecifier) -> bool {
         matches!(ts, TypeSpecifier::ComplexFloat | TypeSpecifier::ComplexDouble | TypeSpecifier::ComplexLongDouble)
-            || self.resolve_typedef_ctype(ts).is_some_and(|ct| ct.is_complex())
+            || self.resolve_typedef_ctype(ts).is_some_and(|ct| {
+                Self::unwrap_qualifiers(&ct).is_complex()
+            })
     }
 
     /// Check if a TypeSpecifier resolves to a pointer type (through typedefs).
+    /// Unwraps _Atomic and restrict qualifiers so that e.g. `_Atomic(int*)`
+    /// and `int * restrict` are correctly recognized as pointer types.
     pub(super) fn is_type_pointer(&self, ts: &TypeSpecifier) -> bool {
         matches!(ts, TypeSpecifier::Pointer(_, _))
-            || self.resolve_typedef_ctype(ts).is_some_and(|ct| matches!(ct, CType::Pointer(_, _)))
+            || self.resolve_typedef_ctype(ts).is_some_and(|ct| {
+                matches!(Self::unwrap_qualifiers(&ct), CType::Pointer(_, _))
+            })
+    }
+
+    /// Check if a TypeSpecifier resolves to a VLA (variable-length array) type
+    /// (through typedefs). VLAs have runtime-determined sizes and require special
+    /// handling during lowering (dynamic stack allocation via DynAlloca).
+    pub(super) fn is_type_vla(&self, ts: &TypeSpecifier) -> bool {
+        self.resolve_typedef_ctype(ts).is_some_and(|ct| ct.is_vla())
     }
 
     /// Resolve typeof(expr) to a concrete TypeSpecifier by analyzing the expression type.
@@ -141,15 +164,50 @@ impl Lowerer {
         if Self::ctypes_compatible(&ctype1, &ctype2) { 1 } else { 0 }
     }
 
+    /// Recursively unwrap _Atomic and restrict qualifier wrappers from a CType.
+    /// Returns the innermost non-qualifier CType reference.
+    /// Used by type predicates and compatibility checks where qualifiers are
+    /// transparent (e.g., `_Atomic _Bool` should be recognized as Bool).
+    fn unwrap_qualifiers(ct: &CType) -> &CType {
+        match ct {
+            CType::Atomic(inner) | CType::Restrict(inner) => Self::unwrap_qualifiers(inner),
+            other => other,
+        }
+    }
+
+    /// Strip _Atomic and restrict qualifiers from a CType for compatibility purposes.
+    /// Returns Some(inner) if a qualifier was stripped, None if no stripping needed.
+    /// Per GCC semantics, __builtin_types_compatible_p ignores top-level qualifiers.
+    /// Recursively strips nested qualifiers (e.g., `_Atomic(Restrict(int))` → `int`),
+    /// consistent with `unwrap_qualifiers` which also recurses through qualifier layers.
+    fn strip_ctype_qualifiers(ct: &CType) -> Option<CType> {
+        match ct {
+            CType::Atomic(inner) | CType::Restrict(inner) => {
+                let stripped = inner.as_ref().clone();
+                Some(Self::strip_ctype_qualifiers(&stripped).unwrap_or(stripped))
+            }
+            _ => None,
+        }
+    }
+
     /// Check if two CTypes are compatible for __builtin_types_compatible_p purposes.
     /// This is structural equality with special handling for:
     /// - Arrays: compatible if element types match (ignore size for unsized arrays)
     /// - Pointers: compatible if pointee types are compatible
     /// - Enums: treated as compatible with int
+    /// - _Atomic/_Restrict: top-level qualifiers are stripped (GCC semantics)
+    /// - VLAs: compatible with arrays of same element type (size is runtime)
     fn ctypes_compatible(a: &CType, b: &CType) -> bool {
+        // Strip _Atomic and restrict qualifiers for compatibility purposes
+        // (GCC __builtin_types_compatible_p ignores top-level qualifiers)
+        let a_stripped = Self::strip_ctype_qualifiers(a);
+        let b_stripped = Self::strip_ctype_qualifiers(b);
+        let a_ref = a_stripped.as_ref().unwrap_or(a);
+        let b_ref = b_stripped.as_ref().unwrap_or(b);
+
         // Normalize enum to int for compatibility purposes
-        let a_norm = match a { CType::Enum(_) => &CType::Int, other => other };
-        let b_norm = match b { CType::Enum(_) => &CType::Int, other => other };
+        let a_norm = match a_ref { CType::Enum(_) => &CType::Int, other => other };
+        let b_norm = match b_ref { CType::Enum(_) => &CType::Int, other => other };
 
         match (a_norm, b_norm) {
             // Pointers: pointee types must be compatible
@@ -158,6 +216,11 @@ impl Lowerer {
             (CType::Array(e1, s1), CType::Array(e2, s2)) => {
                 Self::ctypes_compatible(e1, e2) && s1 == s2
             }
+            // VLAs: compatible if element types are compatible (sizes are runtime)
+            (CType::Vla(e1), CType::Vla(e2)) => Self::ctypes_compatible(e1, e2),
+            // VLA compatible with regular array of same element type
+            (CType::Vla(e1), CType::Array(e2, _)) => Self::ctypes_compatible(e1, e2),
+            (CType::Array(e1, _), CType::Vla(e2)) => Self::ctypes_compatible(e1, e2),
             // Structs/Unions: use derived PartialEq (compares name + fields)
             (CType::Struct(s1), CType::Struct(s2)) => s1 == s2,
             (CType::Union(u1), CType::Union(u2)) => u1 == u2,
@@ -228,6 +291,8 @@ impl Lowerer {
             TypeSpecifier::AutoType => if is_32bit { IrType::I32 } else { IrType::I64 },
             // Vector type: return the element IR type (used for per-element operations)
             TypeSpecifier::Vector(inner, _) => self.type_spec_to_ir(inner),
+            // C11 _Atomic(T): atomic types have the same IR type as the inner type.
+            TypeSpecifier::Atomic(inner) => self.type_spec_to_ir(inner),
         }
     }
 
@@ -505,7 +570,7 @@ impl Lowerer {
     /// Returns None for unsized dimensions (e.g., `int arr[]`).
     fn collect_derived_array_dims(&self, derived: &[DerivedDeclarator]) -> Vec<Option<usize>> {
         derived.iter().filter_map(|d| {
-            if let DerivedDeclarator::Array(size_expr) = d {
+            if let DerivedDeclarator::Array { size: size_expr, .. } = d {
                 Some(size_expr.as_ref().and_then(|e| self.expr_as_array_size(e).map(|n| n as usize)))
             } else {
                 None
@@ -591,13 +656,27 @@ impl Lowerer {
         let ts = self.resolve_type_spec(ts);
         // Resolve the type spec through CType for typedef detection
         let resolved_ctype = self.type_spec_to_ctype(ts);
+
+        // Handle VLA types: VLAs are represented as Ptr in IR (dynamic stack allocation).
+        // VLA variables have pointer-like IR type; actual allocation happens at runtime
+        // via DynAlloca in stmt.rs. Size and strides are computed at runtime.
+        if let CType::Vla(ref elem_ctype) = resolved_ctype {
+            let elem_size = elem_ctype.size_ctx(&*self.types.borrow_struct_layouts()).max(1);
+            return (ptr_sz, elem_size, true, false, vec![]);
+        }
+
+        // Unwrap _Atomic/_Restrict qualifiers for type analysis (qualifiers don't
+        // affect memory layout). Keep resolved_ctype for downstream c_type storage
+        // so atomic/restrict info is preserved for later codegen stages.
+        let effective_ctype = Self::unwrap_qualifiers(&resolved_ctype);
+
         // Check for pointer declarators (from derived or from the resolved type itself)
         let has_pointer = derived.iter().any(|d| matches!(d, DerivedDeclarator::Pointer))
             || matches!(ts, TypeSpecifier::Pointer(_, _))
-            || matches!(resolved_ctype, CType::Pointer(_, _));
+            || matches!(effective_ctype, CType::Pointer(_, _));
 
-        let has_array = derived.iter().any(|d| matches!(d, DerivedDeclarator::Array(_)))
-            || matches!(resolved_ctype, CType::Array(_, _));
+        let has_array = derived.iter().any(|d| matches!(d, DerivedDeclarator::Array { .. }))
+            || matches!(effective_ctype, CType::Array(_, _));
 
         // Handle pointer and array combinations
         if has_pointer && !has_array {
@@ -609,8 +688,8 @@ impl Lowerer {
                 } else {
                     self.sizeof_type(inner)
                 }
-            } else if let CType::Pointer(ref inner_ct, _) = resolved_ctype {
-                // Pointer from typedef resolution
+            } else if let CType::Pointer(ref inner_ct, _) = effective_ctype {
+                // Pointer from typedef resolution (unwrapped through _Atomic/_Restrict)
                 if ptr_count >= 1 {
                     ptr_sz
                 } else {
@@ -638,10 +717,10 @@ impl Lowerer {
             // If pointer is from resolved type spec (not in derived), and array is in derived,
             // this is an array of typedef'd pointers
             let ptr_pos = derived.iter().position(|d| matches!(d, DerivedDeclarator::Pointer));
-            let pointer_from_type_spec = ptr_pos.is_none() && (matches!(ts, TypeSpecifier::Pointer(_, _)) || matches!(resolved_ctype, CType::Pointer(_, _)));
+            let pointer_from_type_spec = ptr_pos.is_none() && (matches!(ts, TypeSpecifier::Pointer(_, _)) || matches!(effective_ctype, CType::Pointer(_, _)));
 
             // Check if the outermost (last) derived element is an Array
-            let last_is_array = matches!(derived.last(), Some(DerivedDeclarator::Array(_)));
+            let last_is_array = matches!(derived.last(), Some(DerivedDeclarator::Array { .. }));
 
             if has_func_ptr || pointer_from_type_spec || last_is_array {
                 // Array of pointers (or array of pointers-to-arrays, etc.)
@@ -657,7 +736,7 @@ impl Lowerer {
                 let array_dims: Vec<Option<usize>> = if let Some(lpp) = last_ptr_pos {
                     // First try: collect Array dims after the last pointer
                     let after_dims: Vec<Option<usize>> = derived[lpp + 1..].iter().filter_map(|d| {
-                        if let DerivedDeclarator::Array(size_expr) = d {
+                        if let DerivedDeclarator::Array { size: size_expr, .. } = d {
                             Some(size_expr.as_ref().and_then(|e| self.expr_as_array_size(e).map(|n| n as usize)))
                         } else {
                             None
@@ -669,7 +748,7 @@ impl Lowerer {
                         // For function pointer arrays, array dims come BEFORE the
                         // Pointer+FunctionPointer group (e.g., [Array(3), Pointer, FuncPtr])
                         derived[..lpp].iter().filter_map(|d| {
-                            if let DerivedDeclarator::Array(size_expr) = d {
+                            if let DerivedDeclarator::Array { size: size_expr, .. } = d {
                                 Some(size_expr.as_ref().and_then(|e| self.expr_as_array_size(e).map(|n| n as usize)))
                             } else {
                                 None
@@ -719,7 +798,7 @@ impl Lowerer {
             let rest = &derived[..derived.len() - trailing_ptr_count];
             let array_dims: Vec<usize> = rest.iter()
                 .filter_map(|d| {
-                    if let DerivedDeclarator::Array(size_expr) = d {
+                    if let DerivedDeclarator::Array { size: size_expr, .. } = d {
                         Some(size_expr.as_ref()
                             .and_then(|e| self.expr_as_array_size(e).map(|n| n as usize))
                             .unwrap_or(1))
@@ -754,11 +833,12 @@ impl Lowerer {
         // If the resolved type itself is an Array (e.g., va_list = Array(Char, 24),
         // or typedef'd multi-dimensional arrays like typedef int arr_t[2][3])
         // and there are no derived array declarators, handle it as an array type.
-        let derived_has_array = derived.iter().any(|d| matches!(d, DerivedDeclarator::Array(_)));
+        let derived_has_array = derived.iter().any(|d| matches!(d, DerivedDeclarator::Array { .. }));
         if !derived_has_array && !has_pointer {
             // Check both TypeSpecifier::Array and CType::Array (for typedef'd arrays)
+            // Use effective_ctype (qualifier-unwrapped) so _Atomic(Array(...)) is detected
             let is_ts_array = matches!(ts, TypeSpecifier::Array(_, _));
-            let is_ctype_array = matches!(resolved_ctype, CType::Array(_, _));
+            let is_ctype_array = matches!(effective_ctype, CType::Array(_, _));
             if is_ts_array {
                 let all_dims = self.collect_type_array_dims(ts);
                 let mut inner = ts;
@@ -788,10 +868,12 @@ impl Lowerer {
             let has_func_ptr = derived.iter().any(|d| matches!(d,
                 DerivedDeclarator::Function(_, _) | DerivedDeclarator::FunctionPointer(_, _)));
             // Account for array dimensions in the type specifier itself
-            // Check both TypeSpecifier::Array and CType::Array (for typedef'd arrays)
+            // Check both TypeSpecifier::Array and CType::Array (for typedef'd arrays).
+            // Use effective_ctype (qualifier-unwrapped) for pattern matching so
+            // _Atomic(Array(...)) is handled correctly.
             let type_dims = if matches!(ts, TypeSpecifier::Array(_, _)) {
                 self.collect_type_array_dims(ts)
-            } else if matches!(resolved_ctype, CType::Array(_, _)) {
+            } else if matches!(effective_ctype, CType::Array(_, _)) {
                 Self::collect_ctype_array_dims(&resolved_ctype)
             } else {
                 vec![]
@@ -871,21 +953,39 @@ impl Lowerer {
 
     /// Collect array dimensions from a CType::Array chain.
     /// For CType::Array(CType::Array(Int, Some(3)), Some(2)), returns [2, 3].
+    /// Transparently unwraps _Atomic and restrict qualifiers so that
+    /// e.g. CType::Atomic(CType::Array(...)) is handled correctly.
     fn collect_ctype_array_dims(ctype: &CType) -> Vec<usize> {
         let mut dims = Vec::new();
         let mut current = ctype;
-        while let CType::Array(inner, size) = current {
-            dims.push(size.unwrap_or(1));
-            current = inner.as_ref();
+        loop {
+            match current {
+                CType::Array(inner, size) => {
+                    dims.push(size.unwrap_or(1));
+                    current = inner.as_ref();
+                }
+                // Transparently skip _Atomic and restrict qualifier wrappers
+                CType::Atomic(inner) | CType::Restrict(inner) => {
+                    current = inner.as_ref();
+                }
+                _ => break,
+            }
         }
         dims
     }
 
     /// Get the innermost element size for a CType::Array chain.
+    /// Transparently unwraps _Atomic and restrict qualifiers around arrays
+    /// so that e.g. CType::Atomic(CType::Array(...)) is handled correctly.
     fn ctype_innermost_elem_size(ctype: &CType, layouts: &crate::common::fx_hash::FxHashMap<String, RcLayout>) -> usize {
         let mut current = ctype;
-        while let CType::Array(inner, _) = current {
-            current = inner.as_ref();
+        loop {
+            match current {
+                CType::Array(inner, _) => current = inner.as_ref(),
+                // Transparently skip _Atomic and restrict qualifier wrappers
+                CType::Atomic(inner) | CType::Restrict(inner) => current = inner.as_ref(),
+                _ => break,
+            }
         }
         current.size_ctx(layouts).max(1)
     }
@@ -901,4 +1001,236 @@ impl Lowerer {
         }
     }
 
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::types::{CType, AddressSpace};
+    use crate::ir::lowering::lower::Lowerer;
+
+    // --- unwrap_qualifiers tests ---
+
+    #[test]
+    fn test_unwrap_qualifiers_atomic_int() {
+        let atomic_int = CType::Atomic(Box::new(CType::Int));
+        let result = Lowerer::unwrap_qualifiers(&atomic_int);
+        assert_eq!(*result, CType::Int);
+    }
+
+    #[test]
+    fn test_unwrap_qualifiers_restrict_pointer() {
+        let ptr = CType::Pointer(Box::new(CType::Int), AddressSpace::Default);
+        let restrict_ptr = CType::Restrict(Box::new(ptr.clone()));
+        let result = Lowerer::unwrap_qualifiers(&restrict_ptr);
+        assert!(matches!(result, CType::Pointer(_, _)));
+    }
+
+    #[test]
+    fn test_unwrap_qualifiers_nested_atomic_restrict() {
+        let ptr = CType::Pointer(Box::new(CType::Int), AddressSpace::Default);
+        let nested = CType::Atomic(Box::new(CType::Restrict(Box::new(ptr))));
+        let result = Lowerer::unwrap_qualifiers(&nested);
+        assert!(matches!(result, CType::Pointer(_, _)));
+    }
+
+    #[test]
+    fn test_unwrap_qualifiers_no_qualifier() {
+        let plain = CType::Double;
+        let result = Lowerer::unwrap_qualifiers(&plain);
+        assert_eq!(*result, CType::Double);
+    }
+
+    #[test]
+    fn test_unwrap_qualifiers_atomic_bool() {
+        let atomic_bool = CType::Atomic(Box::new(CType::Bool));
+        let result = Lowerer::unwrap_qualifiers(&atomic_bool);
+        assert_eq!(*result, CType::Bool);
+    }
+
+    #[test]
+    fn test_unwrap_qualifiers_atomic_struct() {
+        let s = CType::Struct("struct.Foo".into());
+        let atomic_struct = CType::Atomic(Box::new(s.clone()));
+        let result = Lowerer::unwrap_qualifiers(&atomic_struct);
+        assert_eq!(*result, s);
+    }
+
+    // --- strip_ctype_qualifiers tests ---
+
+    #[test]
+    fn test_strip_ctype_qualifiers_atomic() {
+        let atomic_int = CType::Atomic(Box::new(CType::Int));
+        let result = Lowerer::strip_ctype_qualifiers(&atomic_int);
+        assert_eq!(result, Some(CType::Int));
+    }
+
+    #[test]
+    fn test_strip_ctype_qualifiers_restrict() {
+        let ptr = CType::Pointer(Box::new(CType::Int), AddressSpace::Default);
+        let restrict_ptr = CType::Restrict(Box::new(ptr.clone()));
+        let result = Lowerer::strip_ctype_qualifiers(&restrict_ptr);
+        assert_eq!(result, Some(ptr));
+    }
+
+    #[test]
+    fn test_strip_ctype_qualifiers_none_for_plain() {
+        let plain = CType::Int;
+        let result = Lowerer::strip_ctype_qualifiers(&plain);
+        assert_eq!(result, None);
+    }
+
+    // --- ctypes_compatible tests ---
+
+    #[test]
+    fn test_ctypes_compatible_atomic_int_vs_int() {
+        let atomic_int = CType::Atomic(Box::new(CType::Int));
+        let int = CType::Int;
+        assert!(Lowerer::ctypes_compatible(&atomic_int, &int));
+        assert!(Lowerer::ctypes_compatible(&int, &atomic_int));
+    }
+
+    #[test]
+    fn test_ctypes_compatible_restrict_ptr_vs_ptr() {
+        let ptr = CType::Pointer(Box::new(CType::Int), AddressSpace::Default);
+        let restrict_ptr = CType::Restrict(Box::new(ptr.clone()));
+        assert!(Lowerer::ctypes_compatible(&restrict_ptr, &ptr));
+        assert!(Lowerer::ctypes_compatible(&ptr, &restrict_ptr));
+    }
+
+    #[test]
+    fn test_ctypes_compatible_vla_vs_vla_same_elem() {
+        let vla1 = CType::Vla(Box::new(CType::Int));
+        let vla2 = CType::Vla(Box::new(CType::Int));
+        assert!(Lowerer::ctypes_compatible(&vla1, &vla2));
+    }
+
+    #[test]
+    fn test_ctypes_compatible_vla_vs_vla_diff_elem() {
+        let vla_int = CType::Vla(Box::new(CType::Int));
+        let vla_char = CType::Vla(Box::new(CType::Char));
+        assert!(!Lowerer::ctypes_compatible(&vla_int, &vla_char));
+    }
+
+    #[test]
+    fn test_ctypes_compatible_vla_vs_array() {
+        let vla = CType::Vla(Box::new(CType::Int));
+        let arr = CType::Array(Box::new(CType::Int), Some(10));
+        assert!(Lowerer::ctypes_compatible(&vla, &arr));
+        assert!(Lowerer::ctypes_compatible(&arr, &vla));
+    }
+
+    #[test]
+    fn test_ctypes_compatible_vla_vs_array_diff_elem() {
+        let vla = CType::Vla(Box::new(CType::Int));
+        let arr = CType::Array(Box::new(CType::Char), Some(10));
+        assert!(!Lowerer::ctypes_compatible(&vla, &arr));
+    }
+
+    #[test]
+    fn test_ctypes_compatible_both_atomic_same() {
+        let a1 = CType::Atomic(Box::new(CType::Int));
+        let a2 = CType::Atomic(Box::new(CType::Int));
+        assert!(Lowerer::ctypes_compatible(&a1, &a2));
+    }
+
+    #[test]
+    fn test_ctypes_compatible_atomic_vs_different() {
+        let a1 = CType::Atomic(Box::new(CType::Int));
+        let a2 = CType::Atomic(Box::new(CType::Char));
+        assert!(!Lowerer::ctypes_compatible(&a1, &a2));
+    }
+
+    #[test]
+    fn test_ctypes_compatible_preserves_existing_behavior() {
+        // Pointers: int* == int*, int* != char*
+        let p1 = CType::Pointer(Box::new(CType::Int), AddressSpace::Default);
+        let p2 = CType::Pointer(Box::new(CType::Int), AddressSpace::Default);
+        assert!(Lowerer::ctypes_compatible(&p1, &p2));
+        let p3 = CType::Pointer(Box::new(CType::Char), AddressSpace::Default);
+        assert!(!Lowerer::ctypes_compatible(&p1, &p3));
+        // Arrays: int[5] == int[5], int[5] != int[3]
+        let a1 = CType::Array(Box::new(CType::Int), Some(5));
+        let a2 = CType::Array(Box::new(CType::Int), Some(5));
+        assert!(Lowerer::ctypes_compatible(&a1, &a2));
+        let a3 = CType::Array(Box::new(CType::Int), Some(3));
+        assert!(!Lowerer::ctypes_compatible(&a1, &a3));
+    }
+
+    // --- collect_ctype_array_dims tests ---
+
+    #[test]
+    fn test_collect_ctype_array_dims_plain_array() {
+        let arr = CType::Array(Box::new(CType::Int), Some(5));
+        let dims = Lowerer::collect_ctype_array_dims(&arr);
+        assert_eq!(dims, vec![5]);
+    }
+
+    #[test]
+    fn test_collect_ctype_array_dims_multidim() {
+        let inner = CType::Array(
+            Box::new(CType::Array(Box::new(CType::Int), Some(3))),
+            Some(2),
+        );
+        let dims = Lowerer::collect_ctype_array_dims(&inner);
+        assert_eq!(dims, vec![2, 3]);
+    }
+
+    #[test]
+    fn test_collect_ctype_array_dims_atomic_array() {
+        let atomic_arr = CType::Atomic(Box::new(
+            CType::Array(Box::new(CType::Int), Some(5))
+        ));
+        let dims = Lowerer::collect_ctype_array_dims(&atomic_arr);
+        assert_eq!(dims, vec![5]);
+    }
+
+    #[test]
+    fn test_collect_ctype_array_dims_restrict_array() {
+        let restrict_arr = CType::Restrict(Box::new(
+            CType::Array(Box::new(CType::Int), Some(10))
+        ));
+        let dims = Lowerer::collect_ctype_array_dims(&restrict_arr);
+        assert_eq!(dims, vec![10]);
+    }
+
+    #[test]
+    fn test_collect_ctype_array_dims_non_array() {
+        let dims = Lowerer::collect_ctype_array_dims(&CType::Int);
+        assert!(dims.is_empty());
+    }
+
+    // --- ctype_innermost_elem_size tests ---
+
+    #[test]
+    fn test_ctype_innermost_elem_size_plain() {
+        use crate::common::fx_hash::FxHashMap;
+        let layouts: FxHashMap<String, RcLayout> = FxHashMap::default();
+        let arr = CType::Array(Box::new(CType::Int), Some(5));
+        let size = Lowerer::ctype_innermost_elem_size(&arr, &layouts);
+        assert_eq!(size, 4);
+    }
+
+    #[test]
+    fn test_ctype_innermost_elem_size_atomic_array() {
+        use crate::common::fx_hash::FxHashMap;
+        let layouts: FxHashMap<String, RcLayout> = FxHashMap::default();
+        let atomic_arr = CType::Atomic(Box::new(
+            CType::Array(Box::new(CType::Char), Some(10))
+        ));
+        let size = Lowerer::ctype_innermost_elem_size(&atomic_arr, &layouts);
+        assert_eq!(size, 1);
+    }
+
+    #[test]
+    fn test_ctype_innermost_elem_size_nested_array() {
+        use crate::common::fx_hash::FxHashMap;
+        let layouts: FxHashMap<String, RcLayout> = FxHashMap::default();
+        let nested = CType::Array(
+            Box::new(CType::Array(Box::new(CType::Short), Some(3))),
+            Some(2),
+        );
+        let size = Lowerer::ctype_innermost_elem_size(&nested, &layouts);
+        assert_eq!(size, 2);
+    }
 }

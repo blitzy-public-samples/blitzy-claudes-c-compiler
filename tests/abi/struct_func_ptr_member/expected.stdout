@@ -1,0 +1,9 @@
+fptr_size_eq_ptr: OK
+sizeof_struct: OK
+offset_f1: OK
+offset_f2: OK
+offset_f3: OK
+call_f1: OK
+call_f2: OK
+call_f3: OK
+All struct function pointer member tests passed

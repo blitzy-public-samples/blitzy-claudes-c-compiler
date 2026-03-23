@@ -1,0 +1,7 @@
+sizeof_packed: OK
+offsetof_a: OK
+offsetof_b: OK
+offsetof_c: OK
+alignof_packed: OK
+value_correctness: OK
+All packed basic tests passed

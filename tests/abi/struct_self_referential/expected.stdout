@@ -1,0 +1,8 @@
+sizeof_node: OK
+offset_next: OK
+offset_value: OK
+list_sum: OK
+list_count: OK
+self_ref: OK
+null_next: OK
+All self-referential struct tests passed

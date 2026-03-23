@@ -418,6 +418,9 @@ data or synthetic tokens injected into the output for the parser.
 Unrecognized pragmas (including `#pragma GCC diagnostic ...`) are silently
 ignored.
 
+The C99/C11 `_Pragma("...")` operator is fully supported: it is desugared to
+an equivalent `#pragma` directive per C11 §6.10.9 during macro expansion.
+
 ---
 
 ## Predefined Macros
@@ -603,6 +606,60 @@ i686, and i386.
 
 ---
 
+## Recent Additions
+
+### Device+Inode `#pragma once` Tracking
+
+The `#pragma once` mechanism now uses device and inode numbers (retrieved via
+`std::fs::metadata`) instead of raw `PathBuf` comparison. This correctly
+deduplicates headers reached through symlinks or hard links, matching the
+behavior of GCC and Clang. When metadata is unavailable (e.g., on virtual
+filesystems that do not provide stable inode numbers), the implementation
+falls back to path-based deduplication.
+
+### `#pragma pack` Push/Pop Stack Semantics
+
+The `#pragma pack` directive now supports full stack semantics:
+
+| Form | Behavior |
+|------|----------|
+| `#pragma pack(push, N)` | Push the current alignment onto the stack and set alignment to `N`. |
+| `#pragma pack(push)` | Push the current alignment onto the stack without changing it. |
+| `#pragma pack(pop)` | Restore the alignment from the top of the stack. |
+| `#pragma pack(N)` | Set alignment to `N` without modifying the stack. |
+| `#pragma pack()` | Reset alignment to the default (no packing). |
+
+The alignment stack is maintained as a `Vec<Option<usize>>` in the
+preprocessor state. These directives emit synthetic tokens
+(`__ccc_pack_push_N`, `__ccc_pack_pop`, etc.) that are consumed by the
+parser to adjust struct layout. All pack pragmas are suppressed in
+`asm_mode` to avoid assembler errors.
+
+### Trigraph Preprocessing (Phase 1)
+
+When the `-trigraphs` CLI flag is passed, the preprocessor performs trigraph
+replacement as Phase 1 of C translation (per C11 §5.1.1.2). The following
+nine trigraph sequences are translated before any other processing:
+
+| Trigraph | Replacement |
+|----------|-------------|
+| `??=` | `#` |
+| `??/` | `\` |
+| `??'` | `^` |
+| `??(` | `[` |
+| `??)` | `]` |
+| `??!` | `\|` |
+| `??<` | `{` |
+| `??>` | `}` |
+| `??-` | `~` |
+
+Trigraph processing is disabled by default (matching modern GCC/Clang
+behavior) and is only activated with `-trigraphs`. Digraphs (`<:`, `:>`,
+`<%`, `%>`, `%:`, `%:%:`) are handled unconditionally in the lexer, not in
+the preprocessor.
+
+---
+
 ## Known Limitations
 
 - **`__DATE__` and `__TIME__` are static** -- they expand to compile-time
@@ -611,11 +668,10 @@ i686, and i386.
   difference between 80-bit extended precision and IEEE binary128.
 - **`__has_feature` and `__has_extension` always return `0`** -- no Clang
   feature set is modeled.
-- **`_Pragma("...")` is skipped** -- the C99 `_Pragma` operator is consumed
-  and discarded during macro expansion rather than being executed.
 - **No `#embed` support** -- the C23 `#embed` directive is not implemented.
-- **No digraph/trigraph processing** -- trigraphs (`??=`, `??/`, etc.) and
-  digraphs (`<:`, `:>`) are not translated in the preprocessor phase.
+- **Trigraph support behind `-trigraphs` flag** -- trigraphs (`??=`, `??/`, etc.)
+  are translated in the preprocessor phase when `-trigraphs` is passed. Digraphs
+  (`<:`, `:>`, `<%`, `%>`, `%:`, `%:%:`) are handled unconditionally in the lexer.
 - **Expression evaluator does not support floating-point** -- `#if`
   expressions are evaluated using integer arithmetic only (standard-compliant,
   since preprocessor expressions are integer constant expressions).

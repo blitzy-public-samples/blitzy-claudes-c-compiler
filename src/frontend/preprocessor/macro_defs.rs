@@ -124,6 +124,13 @@ pub struct MacroTable {
     /// identifier. Without this, `$FOO` is tokenized as one identifier and the
     /// macro `FOO` is never expanded.
     pub(super) asm_mode: bool,
+    /// Pending `_Pragma` directive strings collected during macro expansion.
+    /// When `_Pragma("...")` is encountered during expansion, the pragma text
+    /// is desugared and stored here for the preprocessor pipeline to process
+    /// after the expansion pass completes (since expansion takes `&self` but
+    /// pragma handling requires `&mut self`). Wrapped in RefCell to allow
+    /// mutation during expansion methods that take `&self`.
+    pending_pragmas: std::cell::RefCell<Vec<String>>,
 }
 
 impl MacroTable {
@@ -135,6 +142,7 @@ impl MacroTable {
             expanded_macros: std::cell::RefCell::new(Vec::new()),
             track_expansions: Cell::new(false),
             asm_mode: false,
+            pending_pragmas: std::cell::RefCell::new(Vec::new()),
         }
     }
 
@@ -217,6 +225,14 @@ impl MacroTable {
         std::mem::take(&mut *self.expanded_macros.borrow_mut())
     }
 
+    /// Take pending `_Pragma` directive strings collected during macro expansion.
+    /// Returns the accumulated pragma texts and clears the internal buffer.
+    /// Called by the preprocessor pipeline after each expansion pass to process
+    /// desugared `_Pragma("...")` operators as equivalent `#pragma` directives.
+    pub fn take_pending_pragmas(&self) -> Vec<String> {
+        std::mem::take(&mut *self.pending_pragmas.borrow_mut())
+    }
+
     /// Expand macros in a line of text.
     /// Returns the expanded text.
     pub fn expand_line(&self, line: &str) -> String {
@@ -230,6 +246,7 @@ impl MacroTable {
     /// overhead when preprocessing kernel headers with thousands of lines).
     pub fn expand_line_reuse(&self, line: &str, expanding: &mut FxHashSet<String>) -> String {
         expanding.clear();
+        self.pending_pragmas.borrow_mut().clear();
         if self.track_expansions.get() {
             self.expanded_macros.borrow_mut().clear();
         }
@@ -441,9 +458,11 @@ impl MacroTable {
             return i;
         }
 
-        // Handle _Pragma("string") operator (C99 §6.10.9).
+        // Handle _Pragma("string") operator (C11 §6.10.9).
+        // Desugars _Pragma("...") into a pending #pragma directive for the
+        // preprocessor pipeline to process after expansion completes.
         if ident == "_Pragma" {
-            return Self::skip_pragma(bytes, i, ident, result);
+            return self.desugar_pragma(bytes, i, ident, result);
         }
 
         // Handle __COUNTER__ built-in
@@ -506,29 +525,99 @@ impl MacroTable {
         }
     }
 
-    /// Skip a _Pragma("...") operator, consuming the parenthesized argument.
-    fn skip_pragma(bytes: &[u8], i: usize, ident: &str, result: &mut String) -> usize {
+    /// Desugar a `_Pragma("...")` operator per C11 §6.10.9.
+    ///
+    /// The `_Pragma` operator takes a single string literal argument,
+    /// destringifies it (removing enclosing quotes and unescaping `\\` → `\`
+    /// and `\"` → `"`), and stores the result as a pending `#pragma`
+    /// directive. The preprocessor pipeline retrieves these via
+    /// `take_pending_pragmas()` after expansion and processes them as if
+    /// `#pragma <destringified_text>` had appeared at that point.
+    ///
+    /// If the syntax is malformed (no parenthesized string literal), falls
+    /// back to emitting `_Pragma` as a plain identifier (error resilience).
+    fn desugar_pragma(&self, bytes: &[u8], i: usize, ident: &str, result: &mut String) -> usize {
         let len = bytes.len();
         let mut j = i;
-        while j < len && bytes[j].is_ascii_whitespace() { j += 1; }
-        if j < len && bytes[j] == b'(' {
-            let mut depth = 1;
+
+        // Skip whitespace after _Pragma
+        while j < len && bytes[j].is_ascii_whitespace() {
             j += 1;
-            while j < len && depth > 0 {
-                if bytes[j] == b'(' {
-                    depth += 1;
-                } else if bytes[j] == b')' {
-                    depth -= 1;
-                } else if bytes[j] == b'"' || bytes[j] == b'\'' {
-                    j = skip_literal_bytes(bytes, j, bytes[j]);
-                    continue;
-                }
+        }
+
+        // Must have '(' — if not, emit _Pragma as a plain identifier
+        if j >= len || bytes[j] != b'(' {
+            result.push_str(ident);
+            return i;
+        }
+        j += 1; // skip '('
+
+        // Skip whitespace after '('
+        while j < len && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+
+        // Must have a string literal — if not, fall back to identifier output
+        if j >= len || bytes[j] != b'"' {
+            result.push_str(ident);
+            return i;
+        }
+
+        // Extract the raw content between the quotes, handling escape sequences
+        let str_start = j + 1;
+        j += 1; // skip opening '"'
+        while j < len && bytes[j] != b'"' {
+            if bytes[j] == b'\\' && j + 1 < len {
+                j += 2; // skip escaped character
+            } else {
                 j += 1;
             }
-            return j;
         }
-        result.push_str(ident);
-        i
+        let str_end = j;
+        if j < len {
+            j += 1; // skip closing '"'
+        }
+
+        // Skip whitespace to closing ')'
+        while j < len && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if j < len && bytes[j] == b')' {
+            j += 1; // skip ')'
+        }
+
+        // Destringify per C11 §6.10.9 paragraph 1:
+        //  - Each `\"` in the string literal becomes `"`
+        //  - Each `\\` becomes `\`
+        let raw_bytes = &bytes[str_start..str_end];
+        let mut pragma_text = String::with_capacity(raw_bytes.len());
+        let mut k = 0;
+        while k < raw_bytes.len() {
+            if raw_bytes[k] == b'\\' && k + 1 < raw_bytes.len() {
+                match raw_bytes[k + 1] {
+                    b'\\' => {
+                        pragma_text.push('\\');
+                        k += 2;
+                    }
+                    b'"' => {
+                        pragma_text.push('"');
+                        k += 2;
+                    }
+                    _ => {
+                        // Other escape sequences are preserved as-is
+                        pragma_text.push(raw_bytes[k] as char);
+                        k += 1;
+                    }
+                }
+            } else {
+                pragma_text.push(raw_bytes[k] as char);
+                k += 1;
+            }
+        }
+
+        // Store the destringified pragma for the preprocessor to process
+        self.pending_pragmas.borrow_mut().push(pragma_text);
+        j
     }
 
     /// Expand a macro invocation (function-like or object-like).

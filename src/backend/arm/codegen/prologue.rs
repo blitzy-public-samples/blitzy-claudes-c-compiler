@@ -1,6 +1,6 @@
 //! ArmCodegen: prologue/epilogue and stack frame operations.
 
-use crate::ir::reexports::{IrFunction, Instruction, Value};
+use crate::ir::reexports::{IrFunction, Instruction, Operand, Value};
 use crate::common::types::IrType;
 use crate::backend::generation::{calculate_stack_space_common, find_param_alloca};
 use crate::backend::call_abi::{ParamClass, classify_params};
@@ -335,5 +335,51 @@ impl ArmCodegen {
             IrType::U32 | IrType::F32 => "ldr32",
             _ => "ldr64",
         }
+    }
+
+    // ---- VLA dynamic stack management ----
+
+    /// Save the current stack pointer to the designated stack slot before VLA
+    /// allocation. The `save_slot` Value refers to the IR destination where
+    /// the current SP will be preserved for later restoration at scope exit.
+    pub(super) fn emit_vla_save_sp_impl(&mut self, save_slot: &Value) {
+        // Move SP into the accumulator (x0), then store to the save slot.
+        // On AArch64 we cannot str SP directly, so we transfer through x0.
+        self.state.emit("    mov x0, sp");
+        self.store_x0_to(save_slot);
+    }
+
+    /// Restore the stack pointer from a previously saved value at VLA scope
+    /// exit. This deallocates all VLA stack space allocated since the
+    /// corresponding `emit_vla_save_sp` call.
+    pub(super) fn emit_vla_restore_sp_impl(&mut self, save_slot: &Value) {
+        // Load the saved SP value into x9 (caller-saved temp), then restore.
+        // We use x9 rather than x0 to avoid clobbering the accumulator
+        // needlessly; however, `operand_to_x0` is not available for bare
+        // &Value, so we load from the slot directly.
+        if let Some(&reg) = self.reg_assignments.get(&save_slot.0) {
+            let reg_name = super::emit::callee_saved_name(reg);
+            self.state.emit_fmt(format_args!("    mov sp, {}", reg_name));
+        } else if let Some(slot) = self.state.get_slot(save_slot.0) {
+            self.emit_load_from_sp("x9", slot.0, "ldr");
+            self.state.emit("    mov sp, x9");
+        }
+    }
+
+    /// Dynamically allocate stack space for a VLA. `size` contains the
+    /// runtime byte count. The resulting pointer is stored into `dest`.
+    /// The allocation maintains AArch64's mandatory 16-byte SP alignment.
+    pub(super) fn emit_vla_alloc_impl(&mut self, dest: &Value, size: &Operand) {
+        // Load the runtime size into x0 (the accumulator).
+        self.operand_to_x0(size);
+        // Round up to 16-byte alignment: (size + 15) & ~15
+        self.state.emit("    add x0, x0, #15");
+        self.state.emit("    and x0, x0, #-16");
+        // Subtract from SP to allocate (stack grows downward).
+        self.state.emit("    sub sp, sp, x0");
+        // The allocated region starts at the new SP value.
+        self.state.emit("    mov x0, sp");
+        // Store the pointer to the destination.
+        self.store_x0_to(dest);
     }
 }

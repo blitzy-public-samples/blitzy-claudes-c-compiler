@@ -1,0 +1,5 @@
+make_big: OK
+make_big_from: OK
+sret_roundtrip: OK
+chain_return: OK
+All large struct return tests passed

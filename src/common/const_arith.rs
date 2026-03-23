@@ -600,3 +600,201 @@ pub fn truncate_and_extend_bits(bits: u64, target_width: usize, target_signed: b
 
     (result, target_signed)
 }
+
+// === Complex number constant arithmetic (C11 Annex G) ===
+//
+// These functions implement compile-time evaluation of _Complex arithmetic
+// operations following the rules in C11 Annex G (informative) for handling
+// infinities, NaNs, and mixed real/complex operands.
+//
+// Key Annex G principles:
+// - Multiplication and division of complex numbers must produce infinities
+//   (not NaN) when mathematically expected, even though the naive algebraic
+//   formula may yield NaN due to inf*0 or inf-inf intermediate terms.
+// - Division by complex zero produces complex infinity with appropriate signs.
+// - Mixed real/complex operations are component-wise (no cross-terms).
+
+/// Evaluate complex multiplication: (a_re + a_im*i) * (b_re + b_im*i)
+///
+/// Implements the C11 Annex G.5.1 algorithm:
+/// 1. Compute the naive result using the standard algebraic formula.
+/// 2. If either component of the result is NaN, apply Annex G recovery rules
+///    to produce infinity instead of NaN when either operand is infinite.
+///
+/// The recovery handles three cases:
+/// - If operand `a` is infinite: box its components to ±1/±0, recalculate, scale by ∞.
+/// - If operand `b` is infinite: same boxing applied to `b`.
+/// - If neither operand is infinite but an intermediate product is ±∞, scale result by ∞.
+pub fn eval_complex_mul(a_re: f64, a_im: f64, b_re: f64, b_im: f64) -> (f64, f64) {
+    // Step 1: Naive formula
+    //   result_re = a_re*b_re - a_im*b_im
+    //   result_im = a_re*b_im + a_im*b_re
+    let ac = a_re * b_re;
+    let bd = a_im * b_im;
+    let ad = a_re * b_im;
+    let bc = a_im * b_re;
+    let mut result_re = ac - bd;
+    let mut result_im = ad + bc;
+
+    // Step 2: If the naive result contains NaN, attempt Annex G recovery.
+    if result_re.is_nan() || result_im.is_nan() {
+        let mut ar = a_re;
+        let mut ai = a_im;
+        let mut br = b_re;
+        let mut bi = b_im;
+
+        // Classify whether each operand is "infinite" (has at least one ±∞ component).
+        let a_inf = ar.is_infinite() || ai.is_infinite();
+        let b_inf = br.is_infinite() || bi.is_infinite();
+
+        // Case 1: Operand `a` is infinite.
+        // "Box" its components: infinite → ±1.0, NaN → ±0.0 (preserving sign via copysign).
+        // Then replace NaN in b with ±0.0 to prevent inf*NaN propagation.
+        if a_inf {
+            ar = f64::copysign(if ar.is_infinite() { 1.0 } else { 0.0 }, ar);
+            ai = f64::copysign(if ai.is_infinite() { 1.0 } else { 0.0 }, ai);
+            if br.is_nan() {
+                br = f64::copysign(0.0, br);
+            }
+            if bi.is_nan() {
+                bi = f64::copysign(0.0, bi);
+            }
+        }
+
+        // Case 2: Operand `b` is infinite.
+        // Same boxing logic applied symmetrically to `b`, and NaN cleanup in `a`.
+        if b_inf {
+            br = f64::copysign(if br.is_infinite() { 1.0 } else { 0.0 }, br);
+            bi = f64::copysign(if bi.is_infinite() { 1.0 } else { 0.0 }, bi);
+            if ar.is_nan() {
+                ar = f64::copysign(0.0, ar);
+            }
+            if ai.is_nan() {
+                ai = f64::copysign(0.0, ai);
+            }
+        }
+
+        // Case 3: Neither operand is infinite, but an intermediate product overflowed
+        // to ±∞. This happens with very large finite operands (e.g. near MAX).
+        if !a_inf && !b_inf
+            && (ac.is_infinite() || bd.is_infinite() || ad.is_infinite() || bc.is_infinite())
+        {
+            // Box NaN components of both operands to ±0.0.
+            if ar.is_nan() {
+                ar = f64::copysign(0.0, ar);
+            }
+            if ai.is_nan() {
+                ai = f64::copysign(0.0, ai);
+            }
+            if br.is_nan() {
+                br = f64::copysign(0.0, br);
+            }
+            if bi.is_nan() {
+                bi = f64::copysign(0.0, bi);
+            }
+        }
+
+        // Recalculate using boxed values, then scale by infinity.
+        // Any of the three cases above ensures that the boxed formula
+        // produces a finite result whose sign is correct, and the ∞ scale
+        // gives the expected infinite result.
+        if a_inf || b_inf
+            || ac.is_infinite() || bd.is_infinite()
+            || ad.is_infinite() || bc.is_infinite()
+        {
+            result_re = f64::INFINITY * (ar * br - ai * bi);
+            result_im = f64::INFINITY * (ar * bi + ai * br);
+        }
+    }
+
+    (result_re, result_im)
+}
+
+/// Evaluate complex division: (a_re + a_im*i) / (b_re + b_im*i)
+///
+/// Implements the C11 Annex G.5.2 algorithm:
+/// 1. Compute the naive result using the standard algebraic formula with
+///    denominator `b_re² + b_im²`.
+/// 2. If either component of the result is NaN, apply Annex G recovery:
+///    - Finite / zero → ±∞ (with appropriate sign per copysign)
+///    - ∞ / finite → ∞ (numerator is infinite, denominator finite)
+///    - Finite / ∞ → 0 (numerator finite, denominator infinite)
+pub fn eval_complex_div(a_re: f64, a_im: f64, b_re: f64, b_im: f64) -> (f64, f64) {
+    // Step 1: Naive formula
+    //   denom = b_re² + b_im²
+    //   result_re = (a_re*b_re + a_im*b_im) / denom
+    //   result_im = (a_im*b_re - a_re*b_im) / denom
+    let denom = b_re * b_re + b_im * b_im;
+    let mut result_re = (a_re * b_re + a_im * b_im) / denom;
+    let mut result_im = (a_im * b_re - a_re * b_im) / denom;
+
+    // Step 2: If the naive result contains NaN, attempt Annex G recovery.
+    if result_re.is_nan() || result_im.is_nan() {
+        let a_inf = a_re.is_infinite() || a_im.is_infinite();
+        let b_inf = b_re.is_infinite() || b_im.is_infinite();
+        let b_zero = b_re == 0.0 && b_im == 0.0;
+
+        if b_zero && !a_re.is_nan() && !a_im.is_nan() {
+            // Case 1: Divisor is zero, numerator is not NaN.
+            // Per C11, complex division by zero produces ±∞ components.
+            // Multiply by ∞ to get correct sign propagation from the numerator.
+            result_re = f64::INFINITY * a_re;
+            result_im = f64::INFINITY * a_im;
+        } else if a_inf && !b_inf {
+            // Case 2: Numerator is infinite, denominator is finite.
+            // Box the numerator: ∞ → ±1.0, finite/NaN → ±0.0.
+            let ar = f64::copysign(if a_re.is_infinite() { 1.0 } else { 0.0 }, a_re);
+            let ai = f64::copysign(if a_im.is_infinite() { 1.0 } else { 0.0 }, a_im);
+            result_re = f64::INFINITY * (ar * b_re + ai * b_im);
+            result_im = f64::INFINITY * (ai * b_re - ar * b_im);
+        } else if !a_inf && b_inf {
+            // Case 3: Numerator is finite, denominator is infinite.
+            // Box the denominator: ∞ → ±1.0, finite/NaN → ±0.0.
+            // Result converges to zero with correct sign.
+            let br = f64::copysign(if b_re.is_infinite() { 1.0 } else { 0.0 }, b_re);
+            let bi = f64::copysign(if b_im.is_infinite() { 1.0 } else { 0.0 }, b_im);
+            result_re = 0.0 * (a_re * br + a_im * bi);
+            result_im = 0.0 * (a_im * br - a_re * bi);
+        }
+    }
+
+    (result_re, result_im)
+}
+
+/// Evaluate mixed real × complex multiplication: real * (c_re + c_im*i)
+///
+/// Per C11 6.3.1.8 and Annex G, when a real value multiplies a complex value,
+/// the real part is treated as (real + 0*i), but the multiplication is done
+/// component-wise (no cross-terms with zero imaginary part needed):
+///   result = (real * c_re, real * c_im)
+///
+/// This avoids the inf*0 = NaN pitfall that would occur if we used the full
+/// complex multiplication formula with b_im = 0.
+pub fn eval_mixed_real_complex_mul(real: f64, c_re: f64, c_im: f64) -> (f64, f64) {
+    (real * c_re, real * c_im)
+}
+
+/// Evaluate complex / real division: (c_re + c_im*i) / real
+///
+/// Per C11 Annex G, dividing a complex value by a real scalar is performed
+/// component-wise, avoiding the cross-term NaN issues of full complex division:
+///   result = (c_re / real, c_im / real)
+///
+/// Division by zero follows IEEE 754 rules: finite/0 → ±∞, 0/0 → NaN.
+pub fn eval_mixed_real_complex_div(c_re: f64, c_im: f64, real: f64) -> (f64, f64) {
+    (c_re / real, c_im / real)
+}
+
+/// Evaluate real / complex division: real / (c_re + c_im*i)
+///
+/// Treats the real numerator as (real + 0*i) and applies the conjugate method:
+///   real / (c_re + c_im*i) = real * (c_re - c_im*i) / (c_re² + c_im²)
+///
+/// Delegates to `eval_complex_div` with a_im = 0.0 to get full Annex G
+/// recovery for infinities and NaN edge cases. This ensures that:
+/// - real / complex_zero → (±∞, ±∞) with correct signs
+/// - real / complex_infinity → (0, 0)
+/// - Infinity recovery follows the same Annex G.5.2 rules as full complex division
+pub fn eval_real_div_complex(real: f64, c_re: f64, c_im: f64) -> (f64, f64) {
+    eval_complex_div(real, 0.0, c_re, c_im)
+}

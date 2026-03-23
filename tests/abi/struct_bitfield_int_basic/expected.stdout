@@ -1,0 +1,8 @@
+sizeof_struct: OK
+alignof_struct: OK
+store_load_all: OK
+single_unit_packing: OK
+field_independence: OK
+negative_values: OK
+extremes: OK
+All basic int bitfield tests passed

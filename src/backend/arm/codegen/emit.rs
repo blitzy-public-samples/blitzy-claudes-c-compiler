@@ -1020,6 +1020,9 @@ impl ArmCodegen {
                     IrConst::F64(v) => self.emit_load_imm64("x0", v.to_bits() as i64),
                     IrConst::LongDouble(v, _) => self.emit_load_imm64("x0", v.to_bits() as i64),
                     IrConst::I128(v) => self.emit_load_imm64("x0", *v as i64), // truncate to 64-bit
+                    // Complex constants: load the real part into x0.
+                    IrConst::ComplexF32(re, _) => self.emit_load_imm64("x0", re.to_bits() as i64),
+                    IrConst::ComplexF64(re, _) => self.emit_load_imm64("x0", re.to_bits() as i64),
                     IrConst::Zero => self.state.emit("    mov x0, #0"),
                 }
             }
@@ -1728,6 +1731,48 @@ pub(super) const ARM_ARG_REGS: [&str; 8] = ["x0", "x1", "x2", "x3", "x4", "x5", 
 const ARM_TMP_REGS: [&str; 8] = ["x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16"];
 
 impl ArchCodegen for ArmCodegen {
+    // ========================================================================
+    // AArch64 (AAPCS64) Calling Convention Summary
+    // ========================================================================
+    //
+    // Register usage:
+    //   x0-x7   : Argument / result registers (caller-saved)
+    //   x8      : Indirect result location (struct return pointer)
+    //   x9-x15  : Temporary / scratch registers (caller-saved)
+    //   x16-x17 : Intra-procedure-call scratch (IP0, IP1)
+    //   x18     : Platform register (reserved)
+    //   x19-x28 : Callee-saved registers
+    //   x29     : Frame pointer (FP, callee-saved)
+    //   x30     : Link register (LR, callee-saved)
+    //   SP      : Stack pointer (must be 16-byte aligned at all times)
+    //
+    // Variadic argument passing:
+    //   Named integer args in x0-x7, named float args in d0-d7.
+    //   Variadic float arguments are promoted to GP registers (not SIMD).
+    //   Additional arguments passed on stack (8-byte slots, 8-byte aligned).
+    //
+    // Struct return convention:
+    //   Structs > 16 bytes: caller allocates space, passes pointer in x8.
+    //   Structs ≤ 16 bytes: returned in x0 (and x1 for 9-16 byte structs).
+    //   Note: x8 is NOT x0 — this is AArch64-specific (sret_uses_dedicated_reg).
+    //
+    // Stack alignment:
+    //   SP must be 16-byte aligned at function entry and at every SP modification.
+    //   Local frame size is rounded up to 16-byte boundary.
+    //
+    // Callee-saved registers:
+    //   x19-x28: General-purpose callee-saved (ARM_CALLEE_SAVED = x20-x28 in CCC)
+    //   x29 (FP): Frame pointer, saved/restored in prologue/epilogue pair
+    //   x30 (LR): Link register, saved/restored in prologue/epilogue pair
+    //   d8-d15: Lower 64 bits of SIMD callee-saved (not currently used by CCC)
+    //
+    // CCC-specific notes:
+    //   x0 : Universal accumulator (scratch/result) used by all codegen methods
+    //   x1 : Secondary accumulator, used for two-operand patterns
+    //   x13, x14: Additional caller-saved (ARM_CALLER_SAVED) for register allocator
+    //   x9 : Scratch for memcpy source address
+    //   x10: Scratch for memcpy operations
+    // ========================================================================
     fn state(&mut self) -> &mut CodegenState { &mut self.state }
     fn state_ref(&self) -> &CodegenState { &self.state }
 
@@ -1869,6 +1914,10 @@ impl ArchCodegen for ArmCodegen {
         fn emit_epilogue_and_ret(&mut self, frame_size: i64) => emit_epilogue_and_ret_impl;
         fn store_instr_for_type(&self, ty: IrType) -> &'static str => store_instr_for_type_impl;
         fn load_instr_for_type(&self, ty: IrType) -> &'static str => load_instr_for_type_impl;
+        // VLA dynamic stack management
+        fn emit_vla_save_sp(&mut self, save_slot: &Value) => emit_vla_save_sp_impl;
+        fn emit_vla_restore_sp(&mut self, save_slot: &Value) => emit_vla_restore_sp_impl;
+        fn emit_vla_alloc(&mut self, dest: &Value, size: &Operand) => emit_vla_alloc_impl;
         // memory
         fn emit_store(&mut self, val: &Operand, ptr: &Value, ty: IrType) => emit_store_impl;
         fn emit_load(&mut self, dest: &Value, ptr: &Value, ty: IrType) => emit_load_impl;
@@ -1950,6 +1999,7 @@ impl ArchCodegen for ArmCodegen {
         // atomics
         fn emit_atomic_rmw(&mut self, dest: &Value, op: AtomicRmwOp, ptr: &Operand, val: &Operand, ty: IrType, ordering: AtomicOrdering) => emit_atomic_rmw_impl;
         fn emit_atomic_cmpxchg(&mut self, dest: &Value, ptr: &Operand, expected: &Operand, desired: &Operand, ty: IrType, success_ordering: AtomicOrdering, failure_ordering: AtomicOrdering, returns_bool: bool) => emit_atomic_cmpxchg_impl;
+        fn emit_atomic_cmpxchg_weak(&mut self, dest: &Value, ptr: &Operand, expected: &Operand, desired: &Operand, ty: IrType, success_ordering: AtomicOrdering, failure_ordering: AtomicOrdering, returns_bool: bool) => emit_atomic_cmpxchg_weak_impl;
         fn emit_atomic_load(&mut self, dest: &Value, ptr: &Operand, ty: IrType, ordering: AtomicOrdering) => emit_atomic_load_impl;
         fn emit_atomic_store(&mut self, ptr: &Operand, val: &Operand, ty: IrType, ordering: AtomicOrdering) => emit_atomic_store_impl;
         fn emit_fence(&mut self, ordering: AtomicOrdering) => emit_fence_impl;

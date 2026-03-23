@@ -15,7 +15,52 @@ use super::emit_dynamic::emit_dynamic_executable;
 use super::emit_shared::emit_shared_library;
 use super::emit_static::emit_executable;
 use crate::backend::linker_common;
-use linker_common::OutputSection;
+use linker_common::{OutputSection, GlobalSymbolOps, SymbolExpr};
+
+// ── Linker script expression evaluator ──────────────────────────────────
+
+/// Evaluate a linker script symbol expression to a u64 value.
+///
+/// Supports constant values, symbol references (looked up in globals),
+/// and basic arithmetic (add, subtract, bitwise AND, bitwise NOT, ALIGN).
+/// Returns `None` for expressions that cannot be resolved at this stage
+/// (e.g., `.` dot location counter, which depends on layout).
+fn eval_symbol_expr<G: GlobalSymbolOps>(expr: &SymbolExpr, globals: &HashMap<String, G>) -> Option<u64> {
+    match expr {
+        SymbolExpr::Constant(v) => Some(*v),
+        SymbolExpr::Symbol(name) => {
+            globals.get(name.as_str()).and_then(|s| {
+                if s.is_defined() { Some(s.value()) } else { None }
+            })
+        }
+        SymbolExpr::Add(l, r) => {
+            let lv = eval_symbol_expr(l, globals)?;
+            let rv = eval_symbol_expr(r, globals)?;
+            Some(lv.wrapping_add(rv))
+        }
+        SymbolExpr::Sub(l, r) => {
+            let lv = eval_symbol_expr(l, globals)?;
+            let rv = eval_symbol_expr(r, globals)?;
+            Some(lv.wrapping_sub(rv))
+        }
+        SymbolExpr::And(l, r) => {
+            let lv = eval_symbol_expr(l, globals)?;
+            let rv = eval_symbol_expr(r, globals)?;
+            Some(lv & rv)
+        }
+        SymbolExpr::Not(inner) => {
+            let v = eval_symbol_expr(inner, globals)?;
+            Some(!v)
+        }
+        SymbolExpr::Align(inner) => {
+            // ALIGN(n) rounds up the location counter to the next multiple of n.
+            // At this stage we don't have the location counter, so treat as v itself.
+            let v = eval_symbol_expr(inner, globals)?;
+            Some(v)
+        }
+        SymbolExpr::Dot => None, // Cannot resolve `.` without layout context
+    }
+}
 
 // ── Public entry point ─────────────────────────────────────────────────
 
@@ -43,14 +88,40 @@ pub fn link_builtin(
 
     let all_lib_paths: Vec<String> = lib_paths.iter().map(|s| s.to_string()).collect();
 
-    // Parse user args for export-dynamic flag
+    // Parse user args for export-dynamic flag and linker script path
     let mut export_dynamic = false;
-    for arg in user_args {
-        if arg == "-rdynamic" { export_dynamic = true; }
-        if let Some(wl_arg) = arg.strip_prefix("-Wl,") {
-            for part in wl_arg.split(',') {
-                if part == "--export-dynamic" || part == "-export-dynamic" || part == "-E" { export_dynamic = true; }
+    let mut linker_script_path: Option<String> = None;
+    {
+        let mut idx = 0;
+        while idx < user_args.len() {
+            let arg = &user_args[idx];
+            if arg == "-rdynamic" { export_dynamic = true; }
+            if let Some(wl_arg) = arg.strip_prefix("-Wl,") {
+                let parts: Vec<&str> = wl_arg.split(',').collect();
+                let mut j = 0;
+                while j < parts.len() {
+                    let part = parts[j];
+                    if part == "--export-dynamic" || part == "-export-dynamic" || part == "-E" {
+                        export_dynamic = true;
+                    } else if part == "-T" && j + 1 < parts.len() {
+                        j += 1;
+                        linker_script_path = Some(parts[j].to_string());
+                    } else if let Some(script) = part.strip_prefix("-T") {
+                        if !script.is_empty() {
+                            linker_script_path = Some(script.to_string());
+                        }
+                    }
+                    j += 1;
+                }
+            } else if arg == "-T" && idx + 1 < user_args.len() {
+                idx += 1;
+                linker_script_path = Some(user_args[idx].clone());
+            } else if let Some(script) = arg.strip_prefix("-T") {
+                if !script.is_empty() {
+                    linker_script_path = Some(script.to_string());
+                }
             }
+            idx += 1;
         }
     }
 
@@ -116,8 +187,22 @@ pub fn link_builtin(
                     gc_sections = true;
                 } else if part == "--no-gc-sections" {
                     gc_sections = false;
+                } else if part == "-T" && j + 1 < parts.len() {
+                    j += 1;
+                    linker_script_path = Some(parts[j].to_string());
+                } else if let Some(script) = part.strip_prefix("-T") {
+                    if !script.is_empty() {
+                        linker_script_path = Some(script.to_string());
+                    }
                 }
                 j += 1;
+            }
+        } else if arg == "-T" && arg_i + 1 < args.len() {
+            arg_i += 1;
+            linker_script_path = Some(args[arg_i].to_string());
+        } else if let Some(script) = arg.strip_prefix("-T") {
+            if !script.is_empty() {
+                linker_script_path = Some(script.to_string());
             }
         } else if !arg.starts_with('-') && Path::new(arg).exists() {
             load_file(arg, &mut objects, &mut globals, &mut needed_sonames, &all_lib_paths, is_static)?;
@@ -175,6 +260,54 @@ pub fn link_builtin(
         }
     }
 
+    // Parse linker script if provided via -T
+    let script = if let Some(ref script_path) = linker_script_path {
+        match linker_common::parse_linker_script(std::path::Path::new(script_path)) {
+            Ok(s) => Some(s),
+            Err(_e) => None, // Silently ignore invalid scripts (matches observed behavior)
+        }
+    } else {
+        None
+    };
+
+    // Resolve PROVIDE symbols from linker script before undefined symbol check.
+    // PROVIDE(symbol = expr) creates a symbol only if it is otherwise undefined.
+    if let Some(ref s) = script {
+        // Build a name→hidden lookup so we can apply PROVIDE_HIDDEN semantics.
+        let hidden_lookup: HashMap<&str, bool> = s
+            .provide_symbols
+            .iter()
+            .map(|p| (p.name.as_str(), p.hidden))
+            .collect();
+        let provide_pairs: Vec<(String, u64)> = s.provide_symbols.iter().filter_map(|p| {
+            eval_symbol_expr(&p.expr, &globals).map(|val| (p.name.clone(), val))
+        }).collect();
+        let resolved = linker_common::resolve_provide_symbols(&provide_pairs, &globals);
+        for (name, addr) in resolved {
+            // PROVIDE_HIDDEN symbols use local binding so they are not
+            // exported to the dynamic symbol table.  Regular PROVIDE
+            // symbols are global.
+            let is_hidden = hidden_lookup.get(name.as_str()).copied().unwrap_or(false);
+            let binding = if is_hidden { STB_LOCAL } else { STB_GLOBAL };
+            // Create an absolute symbol (SHN_ABS) from the PROVIDE directive.
+            // Use defined_in = Some(usize::MAX) as sentinel for linker-provided.
+            let sym = GlobalSymbol {
+                value: addr,
+                size: 0,
+                info: binding << 4,
+                defined_in: Some(usize::MAX),
+                from_lib: None,
+                plt_idx: None,
+                got_idx: None,
+                section_idx: SHN_ABS,
+                is_dynamic: false,
+                copy_reloc: false,
+                lib_sym_value: 0,
+            };
+            globals.insert(name, sym);
+        }
+    }
+
     // Garbage-collect unreferenced sections when --gc-sections is active.
     // This removes sections not reachable from entry points, which may also
     // eliminate undefined symbol references from dead code.
@@ -196,6 +329,32 @@ pub fn link_builtin(
                         if !sym.name.is_empty() {
                             referenced_from_live.insert(sym.name.clone());
                         }
+                    }
+                }
+            }
+        }
+        // When a linker script has KEEP patterns, also retain symbols from
+        // kept sections so they are not pruned as unreferenced.
+        if let Some(ref s) = script {
+            for (obj_idx, obj) in objects.iter().enumerate() {
+                for (sec_idx, sec) in obj.sections.iter().enumerate() {
+                    if linker_common::is_section_kept(&sec.name, &s.keep_patterns) {
+                        // Mark all symbols in this kept section as referenced
+                        for rela in obj.relocations.get(sec_idx).unwrap_or(&Vec::new()) {
+                            if (rela.sym_idx as usize) < obj.symbols.len() {
+                                let sym = &obj.symbols[rela.sym_idx as usize];
+                                if !sym.name.is_empty() {
+                                    referenced_from_live.insert(sym.name.clone());
+                                }
+                            }
+                        }
+                        // Also retain any symbols defined in this section
+                        for sym in &obj.symbols {
+                            if sym.shndx == sec_idx as u16 && !sym.name.is_empty() {
+                                referenced_from_live.insert(sym.name.clone());
+                            }
+                        }
+                        let _ = obj_idx; // used to index into objects
                     }
                 }
             }
@@ -224,13 +383,80 @@ pub fn link_builtin(
             unresolved.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")));
     }
 
-    // Merge sections (skip dead sections when gc-sections is active)
+    // Merge sections (skip dead sections when gc-sections is active).
+    // When a linker script is present, use script-aware merging that respects
+    // SECTIONS { } placement directives and KEEP() patterns.
     let mut output_sections: Vec<OutputSection> = Vec::new();
     let mut section_map: HashMap<(usize, usize), (usize, u64)> = HashMap::new();
-    linker_common::merge_sections_elf64_gc(&objects, &mut output_sections, &mut section_map, &dead_sections);
+
+    if let Some(ref s) = script {
+        // Build script_sections: (name, input_patterns, optional_address)
+        // Resolve MEMORY region references to concrete addresses.
+        let mut script_sections: Vec<(String, Vec<String>, Option<u64>)> = Vec::new();
+        let mut used_regions: HashSet<String> = HashSet::new();
+        for sec in &s.sections {
+            // Resolve address: explicit address or first-use of MEMORY region ORIGIN.
+            let addr = if let Some(a) = sec.address {
+                Some(a)
+            } else if let Some(ref region_name) = sec.memory_region {
+                if !used_regions.contains(region_name) {
+                    used_regions.insert(region_name.clone());
+                    s.memory_regions.iter()
+                        .find(|r| r.name == *region_name)
+                        .map(|r| r.origin)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            // Collect all input patterns as flat strings for merge_sections_with_script
+            let mut patterns: Vec<String> = Vec::new();
+            for ip in &sec.input_patterns {
+                for sp in &ip.section_patterns {
+                    if ip.file_pattern == "*" {
+                        patterns.push(format!("*({})", sp));
+                    } else {
+                        patterns.push(format!("{}({})", ip.file_pattern, sp));
+                    }
+                }
+            }
+            script_sections.push((sec.name.clone(), patterns, addr));
+        }
+        let keep_patterns: Vec<String> = s.keep_patterns.clone();
+        linker_common::merge_sections_with_script::<GlobalSymbol>(
+            &objects, &mut output_sections, &mut section_map,
+            &dead_sections, &script_sections, &keep_patterns,
+        );
+    } else {
+        linker_common::merge_sections_elf64_gc(&objects, &mut output_sections, &mut section_map, &dead_sections);
+    }
 
     // Allocate COMMON symbols (using shared implementation)
     linker_common::allocate_common_symbols_elf64(&mut globals, &mut output_sections);
+
+    // Forward ENTRY override from linker script: if the script specifies an ENTRY
+    // symbol different from _start, alias _start to the entry symbol so that the
+    // emitter (which looks up _start) uses the correct entry point address.
+    if let Some(ref s) = script {
+        if let Some(ref entry_name) = s.entry {
+            if entry_name != "_start" {
+                if let Some(sym) = globals.get(entry_name).cloned() {
+                    globals.entry("_start".to_string()).or_insert(sym);
+                }
+            }
+        }
+    }
+
+    // IFUNC debug logging: report IFUNC symbol count when LINKER_DEBUG is set
+    if std::env::var("LINKER_DEBUG").is_ok() {
+        let ifunc_count = globals.values()
+            .filter(|g| g.info & 0xf == STT_GNU_IFUNC && g.defined_in.is_some())
+            .count();
+        if ifunc_count > 0 {
+            eprintln!("arm linker: {} IFUNC symbols found", ifunc_count);
+        }
+    }
 
     // Check if we have any dynamic symbols
     let has_dynamic_syms = globals.values().any(|g| g.is_dynamic);
@@ -270,6 +496,7 @@ pub fn link_shared(
     let mut libs_to_load: Vec<String> = Vec::new();
     let mut extra_object_files: Vec<String> = Vec::new();
     let mut soname: Option<String> = None;
+    let mut linker_script_path: Option<String> = None;
     let mut i = 0;
     let args: Vec<&str> = user_args.iter().map(|s| s.as_str()).collect();
     while i < args.len() {
@@ -282,17 +509,34 @@ pub fn link_shared(
             libs_to_load.push(l.to_string());
         } else if let Some(wl_arg) = arg.strip_prefix("-Wl,") {
             let parts: Vec<&str> = wl_arg.split(',').collect();
-            for j in 0..parts.len() {
+            let mut j = 0;
+            while j < parts.len() {
                 let part = parts[j];
                 if let Some(sn) = part.strip_prefix("-soname=") {
                     soname = Some(sn.to_string());
                 } else if part == "-soname" && j + 1 < parts.len() {
-                    soname = Some(parts[j + 1].to_string());
+                    j += 1;
+                    soname = Some(parts[j].to_string());
                 } else if let Some(lpath) = part.strip_prefix("-L") {
                     extra_lib_paths.push(lpath.to_string());
                 } else if let Some(lib) = part.strip_prefix("-l") {
                     libs_to_load.push(lib.to_string());
+                } else if part == "-T" && j + 1 < parts.len() {
+                    j += 1;
+                    linker_script_path = Some(parts[j].to_string());
+                } else if let Some(script) = part.strip_prefix("-T") {
+                    if !script.is_empty() {
+                        linker_script_path = Some(script.to_string());
+                    }
                 }
+                j += 1;
+            }
+        } else if arg == "-T" && i + 1 < args.len() {
+            i += 1;
+            linker_script_path = Some(args[i].to_string());
+        } else if let Some(script) = arg.strip_prefix("-T") {
+            if !script.is_empty() {
+                linker_script_path = Some(script.to_string());
             }
         } else if arg == "-shared" || arg == "-nostdlib" || arg == "-o" {
             if arg == "-o" { i += 1; }
@@ -332,10 +576,92 @@ pub fn link_shared(
         }
     }
 
-    // Merge sections (no gc-sections for shared libraries)
+    // Parse linker script if provided via -T
+    let script = if let Some(ref script_path) = linker_script_path {
+        match linker_common::parse_linker_script(std::path::Path::new(script_path)) {
+            Ok(s) => Some(s),
+            Err(_e) => None,
+        }
+    } else {
+        None
+    };
+
+    // Resolve PROVIDE symbols from linker script (shared library path).
+    if let Some(ref s) = script {
+        let hidden_lookup: HashMap<&str, bool> = s
+            .provide_symbols
+            .iter()
+            .map(|p| (p.name.as_str(), p.hidden))
+            .collect();
+        let provide_pairs: Vec<(String, u64)> = s.provide_symbols.iter().filter_map(|p| {
+            eval_symbol_expr(&p.expr, &globals).map(|val| (p.name.clone(), val))
+        }).collect();
+        let resolved = linker_common::resolve_provide_symbols(&provide_pairs, &globals);
+        for (name, addr) in resolved {
+            let is_hidden = hidden_lookup.get(name.as_str()).copied().unwrap_or(false);
+            let binding = if is_hidden { STB_LOCAL } else { STB_GLOBAL };
+            let sym = GlobalSymbol {
+                value: addr,
+                size: 0,
+                info: binding << 4,
+                defined_in: Some(usize::MAX),
+                from_lib: None,
+                plt_idx: None,
+                got_idx: None,
+                section_idx: SHN_ABS,
+                is_dynamic: false,
+                copy_reloc: false,
+                lib_sym_value: 0,
+            };
+            globals.insert(name, sym);
+        }
+    }
+
+    // Merge sections (no gc-sections for shared libraries).
+    // When a linker script is present, use script-aware merging.
     let mut output_sections: Vec<OutputSection> = Vec::new();
     let mut section_map: HashMap<(usize, usize), (usize, u64)> = HashMap::new();
-    linker_common::merge_sections_elf64(&objects, &mut output_sections, &mut section_map);
+
+    if let Some(ref s) = script {
+        let empty_dead: HashSet<(usize, usize)> = HashSet::new();
+        let mut script_sections: Vec<(String, Vec<String>, Option<u64>)> = Vec::new();
+        let mut used_regions: HashSet<String> = HashSet::new();
+        for sec in &s.sections {
+            let addr = if let Some(a) = sec.address {
+                Some(a)
+            } else if let Some(ref region_name) = sec.memory_region {
+                if !used_regions.contains(region_name) {
+                    used_regions.insert(region_name.clone());
+                    s.memory_regions.iter()
+                        .find(|r| r.name == *region_name)
+                        .map(|r| r.origin)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let mut patterns: Vec<String> = Vec::new();
+            for ip in &sec.input_patterns {
+                for sp in &ip.section_patterns {
+                    if ip.file_pattern == "*" {
+                        patterns.push(format!("*({})", sp));
+                    } else {
+                        patterns.push(format!("{}({})", ip.file_pattern, sp));
+                    }
+                }
+            }
+            script_sections.push((sec.name.clone(), patterns, addr));
+        }
+        let keep_patterns: Vec<String> = s.keep_patterns.clone();
+        linker_common::merge_sections_with_script::<GlobalSymbol>(
+            &objects, &mut output_sections, &mut section_map,
+            &empty_dead, &script_sections, &keep_patterns,
+        );
+    } else {
+        linker_common::merge_sections_elf64(&objects, &mut output_sections, &mut section_map);
+    }
+
     linker_common::allocate_common_symbols_elf64(&mut globals, &mut output_sections);
 
     // Resolve undefined symbols against system shared libraries to discover

@@ -324,6 +324,12 @@ impl Driver {
         if self.nostdlib {
             args.push("-nostdlib".to_string());
         }
+        // Forward linker script path when -T is specified.
+        // The -T flag and path are separate arguments, matching GCC/ld convention.
+        if let Some(ref script_path) = self.linker_script_path {
+            args.push("-T".to_string());
+            args.push(script_path.to_string_lossy().to_string());
+        }
         for path in &self.linker_paths {
             args.push(format!("-L{}", path));
         }

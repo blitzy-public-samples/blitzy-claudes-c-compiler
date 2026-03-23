@@ -67,6 +67,7 @@ impl Parser {
         }
     }
 
+    // grammar: expression
     pub(super) fn parse_expr(&mut self) -> Expr {
         let lhs = self.parse_assignment_expr();
         if matches!(self.peek(), TokenKind::Comma) {
@@ -79,6 +80,7 @@ impl Parser {
         }
     }
 
+    // grammar: assignment-expression
     pub(super) fn parse_assignment_expr(&mut self) -> Expr {
         let lhs = self.parse_conditional_expr();
 
@@ -102,6 +104,7 @@ impl Parser {
         }
     }
 
+    // grammar: conditional-expression
     fn parse_conditional_expr(&mut self) -> Expr {
         let cond = self.parse_binary_expr(PrecedenceLevel::LogicalOr);
         if self.consume_if(&TokenKind::Question) {
@@ -150,6 +153,7 @@ impl Parser {
 
     /// Parse a left-associative binary expression at the given precedence level.
     /// This is the shared core that replaces 10 nearly-identical parsing functions.
+    // grammar: logical-OR-expression through multiplicative-expression
     fn parse_binary_expr(&mut self, level: PrecedenceLevel) -> Expr {
         let mut lhs = self.parse_next_tighter(level);
         while let Some(op) = self.token_to_binop(self.peek(), level) {
@@ -161,6 +165,7 @@ impl Parser {
         lhs
     }
 
+    // grammar: logical-or-expression through multiplicative-expression (precedence climbing)
     /// Parse the next tighter precedence level.
     fn parse_next_tighter(&mut self, level: PrecedenceLevel) -> Expr {
         match level {
@@ -179,6 +184,7 @@ impl Parser {
 
     /// Parse a cast expression: (type-name)expr, compound literal (type-name){...},
     /// or fall through to unary expression.
+    // grammar: cast-expression
     pub(super) fn parse_cast_expr(&mut self) -> Expr {
         if matches!(self.peek(), TokenKind::LParen) {
             let save = self.pos;
@@ -223,6 +229,7 @@ impl Parser {
         self.parse_unary_expr()
     }
 
+    // grammar: unary-expression
     fn parse_unary_expr(&mut self) -> Expr {
         match self.peek() {
             TokenKind::AmpAmp => {
@@ -341,6 +348,7 @@ impl Parser {
     }
 
     /// Parse sizeof expression. Handles both sizeof(type-name) and sizeof expr.
+    // grammar: unary-expression (sizeof)
     fn parse_sizeof_expr(&mut self) -> Expr {
         let span = self.peek_span();
         self.advance(); // consume 'sizeof'
@@ -376,12 +384,14 @@ impl Parser {
         Expr::Sizeof(Box::new(SizeofArg::Expr(expr)), span)
     }
 
+    // grammar: postfix-expression
     fn parse_postfix_expr(&mut self) -> Expr {
         let expr = self.parse_primary_expr();
         self.parse_postfix_ops(expr)
     }
 
     /// Parse postfix operators ([], ., ->, ++, --, function call) applied to an initial expression.
+    // grammar: postfix-expression (operators)
     fn parse_postfix_ops(&mut self, mut expr: Expr) -> Expr {
         loop {
             match self.peek() {
@@ -447,6 +457,7 @@ impl Parser {
         expr
     }
 
+    // grammar: primary-expression
     fn parse_primary_expr(&mut self) -> Expr {
         match self.peek() {
             TokenKind::IntLiteral(val) => {
@@ -687,6 +698,7 @@ impl Parser {
     }
 
     /// Parse _Generic(controlling_expr, type: expr, ..., default: expr)
+    // grammar: generic-selection
     fn parse_generic_selection(&mut self) -> Expr {
         let span = self.peek_span();
         self.advance(); // consume _Generic

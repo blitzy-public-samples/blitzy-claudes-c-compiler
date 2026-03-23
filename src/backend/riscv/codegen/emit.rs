@@ -1,3 +1,45 @@
+//! RISC-V 64-bit code generator implementing the LP64D calling convention.
+//!
+//! ## RISC-V LP64D Calling Convention Summary
+//!
+//! ### Integer Argument Passing
+//! - Arguments passed in GP registers: `a0`–`a7` (8 registers)
+//! - Additional arguments passed on the stack, 8-byte aligned
+//! - Arguments larger than XLEN (64 bits) are passed in register pairs (e.g., i128 in a0:a1)
+//!
+//! ### Floating-Point Argument Passing
+//! - FP arguments in `fa0`–`fa7` (8 FP registers) for non-variadic functions
+//! - For variadic functions, float args are promoted to GP registers (a0–a7)
+//! - Structs with float fields may be passed in FP+GP register combinations
+//!
+//! ### Return Values
+//! - Integer return: `a0` (64-bit or smaller), `a0:a1` (128-bit)
+//! - Float return: `fa0` (f32/f64)
+//! - Struct return: hidden first argument pointer in `a0` (consumes a register slot)
+//!
+//! ### Stack Alignment
+//! - Stack pointer (`sp`) must be 16-byte aligned at all times
+//! - Variadic register save area: 64 bytes (a0–a7) above the frame pointer
+//!
+//! ### Callee-Saved Registers
+//! - `s0`/`fp` (frame pointer), `s1`, `s2`–`s11`, `ra` (return address)
+//! - `fs0`–`fs11` (FP callee-saved, not currently used by regalloc)
+//!
+//! ### Caller-Saved (Temporary) Registers
+//! - `t0`–`t6` (GP temporaries, used as accumulator/scratch)
+//! - `ft0`–`ft11` (FP temporaries)
+//! - `a0`–`a7` (argument registers, caller-saved)
+//!
+//! ### Register Usage in This Backend
+//! - `t0`: primary accumulator (loaded by `operand_to_t0`)
+//! - `t1`: secondary operand (comparison, atomics pointer)
+//! - `t2`: tertiary operand (atomics value, comparison)
+//! - `t3`–`t5`: used in call argument staging and 128-bit operations
+//! - `t6`: scratch for large immediate materialization
+//! - `s0`: frame pointer (always allocated)
+//! - `s1`, `s7`–`s11`: primary callee-saved pool for register allocation
+//! - `s2`–`s6`: extended callee-saved pool for register allocation
+
 use crate::delegate_to_impl;
 use crate::ir::reexports::{
     AtomicOrdering,
@@ -87,6 +129,25 @@ pub(super) const RISCV_ARG_REGS: [&str; 8] = ["a0", "a1", "a2", "a3", "a4", "a5"
 
 /// RISC-V 64 code generator. Implements the ArchCodegen trait for the shared framework.
 /// Uses standard RISC-V calling convention with register allocation for hot values.
+///
+/// NOTE (fix_dash): The RISC-V dash shell compilation failure was caused by TWO bugs
+/// in the RISC-V linker (emit_exec.rs and symbols.rs), not in codegen:
+///
+/// Bug 1 — Empty version section headers (emit_exec.rs):
+/// The linker emitted .gnu.version / .gnu.version_r section headers with zero-length
+/// data that aliased the following .rela.dyn section at the same file offset. The
+/// dynamic linker misinterpreted relocation bytes as version indices. Fix: section
+/// headers are now omitted when version data is empty.
+///
+/// Bug 2 — COPY relocation alias breakage (symbols.rs, emit_exec.rs):
+/// When a COPY-relocated symbol (e.g. `environ`) has aliases in the shared library
+/// at the same address (e.g. `__environ`, `_environ` in glibc), glibc's startup code
+/// sets the canonical name (`__environ`) but the executable only had a COPY for
+/// `environ`. Since `__environ` was not redirected to the executable's BSS, the write
+/// went to glibc's memory and the executable's `environ` stayed NULL, causing a
+/// segfault when dash dereferenced it. Fix: `mark_plt_and_copy_symbols` now detects
+/// shared-library aliases and adds COPY entries for all of them, with BSS address
+/// coalescing so all aliases share one slot.
 pub struct RiscvCodegen {
     pub(crate) state: CodegenState,
     pub(super) current_return_type: IrType,
@@ -112,6 +173,18 @@ pub struct RiscvCodegen {
     pub(super) used_callee_saved: Vec<PhysReg>,
     /// Whether to suppress linker relaxation (-mno-relax).
     pub(super) no_relax: bool,
+    /// Stack slot offset (relative to s0) for saving sp before VLA allocations.
+    /// `None` if the current function has no VLAs.
+    pub(super) vla_save_slot: Option<i64>,
+    /// Cached per-argument struct alignment info from `prepare_struct_stack_aligns`.
+    ///
+    /// Set by `emit_call` (via the `ArchCodegen` trait) before stack space
+    /// computation and stack argument emission.  Indexed by argument position;
+    /// `Some(16)` means the struct at that position requires 16-byte alignment.
+    /// Used by `emit_call_compute_stack_space_impl` and
+    /// `emit_call_stack_args_impl` to apply correct alignment for structs
+    /// containing `long double` or `__int128` members.
+    pub(super) call_struct_arg_aligns: Vec<Option<usize>>,
 }
 
 impl RiscvCodegen {
@@ -129,6 +202,8 @@ impl RiscvCodegen {
             reg_assignments: FxHashMap::default(),
             used_callee_saved: Vec::new(),
             no_relax: false,
+            vla_save_slot: None,
+            call_struct_arg_aligns: Vec::new(),
         }
     }
 
@@ -330,6 +405,13 @@ impl RiscvCodegen {
                         self.state.emit_fmt(format_args!("    li t0, {}", bits as i64));
                     }
                     IrConst::I128(v) => self.state.emit_fmt(format_args!("    li t0, {}", *v as i64)),
+                    // Complex constants: load the real part into t0.
+                    IrConst::ComplexF32(re, _) => {
+                        self.state.emit_fmt(format_args!("    li t0, {}", re.to_bits() as i64));
+                    }
+                    IrConst::ComplexF64(re, _) => {
+                        self.state.emit_fmt(format_args!("    li t0, {}", re.to_bits() as i64));
+                    }
                     IrConst::Zero => self.state.emit("    li t0, 0"),
                 }
             }
@@ -476,6 +558,18 @@ impl ArchCodegen for RiscvCodegen {
     fn state(&mut self) -> &mut CodegenState { &mut self.state }
     fn state_ref(&self) -> &CodegenState { &self.state }
     fn ptr_directive(&self) -> PtrDirective { PtrDirective::Dword }
+
+    /// Cache per-argument struct alignment info for use during stack arg emission.
+    ///
+    /// RISC-V LP64D needs the actual struct alignment to decide whether to pad
+    /// a `StructByValStack` argument to a 16-byte boundary (required when the
+    /// struct contains `long double` or `__int128` members).  The alignment
+    /// data arrives in `emit_call` (from the IR lowering layer) but is not
+    /// forwarded to the individual `emit_call_*` sub-methods, so we cache it
+    /// here for later use.
+    fn prepare_struct_stack_aligns(&mut self, struct_arg_aligns: &[Option<usize>]) {
+        self.call_struct_arg_aligns = struct_arg_aligns.to_vec();
+    }
 
     fn get_phys_reg_for_value(&self, val_id: u32) -> Option<PhysReg> {
         self.reg_assignments.get(&val_id).copied()
@@ -641,6 +735,10 @@ impl ArchCodegen for RiscvCodegen {
         fn emit_epilogue_and_ret(&mut self, frame_size: i64) => emit_epilogue_and_ret_impl;
         fn store_instr_for_type(&self, ty: IrType) -> &'static str => store_instr_for_type_impl;
         fn load_instr_for_type(&self, ty: IrType) -> &'static str => load_instr_for_type_impl;
+        // VLA (variable-length array) support
+        fn emit_vla_save_sp(&mut self, save_slot: &Value) => emit_vla_save_sp_impl;
+        fn emit_vla_restore_sp(&mut self, save_slot: &Value) => emit_vla_restore_sp_impl;
+        fn emit_vla_alloc(&mut self, dest: &Value, size: &Operand) => emit_vla_alloc_impl;
         // memory
         fn emit_store(&mut self, val: &Operand, ptr: &Value, ty: IrType) => emit_store_impl;
         fn emit_load(&mut self, dest: &Value, ptr: &Value, ty: IrType) => emit_load_impl;
@@ -710,6 +808,7 @@ impl ArchCodegen for RiscvCodegen {
         // atomics
         fn emit_atomic_rmw(&mut self, dest: &Value, op: AtomicRmwOp, ptr: &Operand, val: &Operand, ty: IrType, ordering: AtomicOrdering) => emit_atomic_rmw_impl;
         fn emit_atomic_cmpxchg(&mut self, dest: &Value, ptr: &Operand, expected: &Operand, desired: &Operand, ty: IrType, ordering: AtomicOrdering, failure_ordering: AtomicOrdering, returns_bool: bool) => emit_atomic_cmpxchg_impl;
+        fn emit_atomic_cmpxchg_weak(&mut self, dest: &Value, ptr: &Operand, expected: &Operand, desired: &Operand, ty: IrType, ordering: AtomicOrdering, failure_ordering: AtomicOrdering, returns_bool: bool) => emit_atomic_cmpxchg_weak_impl;
         fn emit_atomic_load(&mut self, dest: &Value, ptr: &Operand, ty: IrType, ordering: AtomicOrdering) => emit_atomic_load_impl;
         fn emit_atomic_store(&mut self, ptr: &Operand, val: &Operand, ty: IrType, ordering: AtomicOrdering) => emit_atomic_store_impl;
         fn emit_fence(&mut self, ordering: AtomicOrdering) => emit_fence_impl;

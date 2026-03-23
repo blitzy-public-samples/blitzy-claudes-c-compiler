@@ -140,17 +140,80 @@ AArch64), GNU coreutils, Busybox, CPython, QEMU, and LuaJIT.
 
 ### Known Limitations
 
-- **Optimization levels**: All levels (`-O0` through `-O3`, `-Os`, `-Oz`) run
-  the same optimization pipeline. Separate tiers will be added as the compiler
-  matures.
 - **Long double**: x86 80-bit extended precision is supported via x87 FPU
   instructions. On ARM/RISC-V, `long double` is IEEE binary128 via
   compiler-rt/libgcc soft-float libcalls.
-- **Complex numbers**: `_Complex` arithmetic has some edge-case failures.
-- **GNU extensions**: Partial `__attribute__` support. NEON intrinsics are
-  partially implemented (core 128-bit operations work).
-- **Atomics**: `_Atomic` is parsed but treated as the underlying type (the
-  qualifier is not tracked through the type system).
+- **Complex numbers**: `_Complex` arithmetic is supported, including
+  multiplication and division edge cases per Annex G. Some rare corner cases
+  may remain.
+- **GNU extensions**: 20 `__attribute__` types are supported (`format`,
+  `deprecated`, `warn_unused_result`, `malloc`, `pure`, `const`, `section`,
+  `used`, `alias`, `constructor`, `destructor`, `visibility`, `aligned`,
+  `packed`, `weak`, `noreturn`, `always_inline`, `noinline`, `cold`, `hot`).
+  Unsupported attributes emit a warning via `-Wattributes` (suppressible with
+  `-Wno-attributes`). NEON intrinsics cover ≥90% of 128-bit operation families
+  including lane manipulation, widening/narrowing, saturating arithmetic,
+  load/store variants, comparison, and bitwise operations.
+
+### C11 Conformance and New Features
+
+The compiler implements the following C11 language features and enhancements:
+
+**C11 Language Features:**
+
+- **`_Atomic` qualifier**: Type-system tracking with atomic
+  load, store, compound assignment (fetch\_add/sub/and/or/xor), and
+  increment/decrement on all four architectures
+  (x86-64: LOCK CMPXCHG/XADD/XCHG; AArch64: LDXR/STXR/CASP; RISC-V:
+  LR/SC/AMO; i686: LOCK CMPXCHG8B)
+- **`_Generic` selection**: Compile-time type matching with exact type, compatible
+  type, and `default` association support
+- **`_Static_assert`**: Compile-time assertion with improved diagnostics, including
+  the single-argument form
+- **`_Alignas`**: Alignment specifier with power-of-two validation and minimum
+  natural alignment enforcement
+- **`_Noreturn`**: Function specifier with reachable-return warning and dead code
+  elimination after `_Noreturn` calls
+- **Variable Length Arrays (VLAs)**: Stack allocation with runtime `sizeof`
+  evaluation, multi-dimensional support, `[*]` parameter syntax, and proper
+  scope-based deallocation
+- **`restrict` qualifier**: Parsed and propagated through the type system, with
+  alias analysis integration in GVN and LICM optimization passes
+- **`inline` linkage**: C99 and GNU inline semantics with correct linkage rules
+
+**Tiered Optimization Pipeline:**
+
+Six distinct optimization tiers with per-tier pass configuration:
+
+| Level | Behavior |
+|-------|----------|
+| `-O0` | Skip all optimization passes and mem2reg |
+| `-O1` | Constant folding, copy propagation, DCE, and mem2reg |
+| `-O2` | Full optimization pipeline (default) |
+| `-O3` | Full pipeline with loop unrolling and aggressive inlining |
+| `-Os` | Full pipeline with reduced inlining for smaller binaries |
+| `-Oz` | Full pipeline with inlining disabled for minimum size |
+
+**Additional Enhancements:**
+
+- **Tail call optimization**: Self-recursive tail calls optimized on all four
+  architectures (previously x86-64 only)
+- **Preprocessor**: `#pragma once` with device+inode deduplication, `#pragma pack`
+  push/pop/reset stack, `_Pragma("...")` operator desugaring
+- **Digraphs and trigraphs**: Digraph tokens recognized unconditionally; trigraph
+  processing available via `-trigraphs` flag
+- **Parser error recovery**: Multi-error reporting (up to 20 diagnostics per
+  translation unit) with source-line caret output
+- **Linker script support**: `-T script.ld` with `SECTIONS`, `MEMORY`, `ENTRY`,
+  `PROVIDE`, and `KEEP` directives
+- **Diagnostics**: `-Werror=<name>` granular warning-to-error promotion,
+  `-pedantic` mode for GNU extension warnings
+- **NEON intrinsics**: ≥90% coverage of 128-bit NEON operation families
+- **Register allocator**: Loop-depth-aware spill weight calculation for improved
+  register allocation in hot loops
+- **GNU IFUNC**: Indirect function dispatch on x86-64 and AArch64, with
+  unsupported-platform diagnostics on i686 and RISC-V
+- **Static linking**: `-static` flag with NSS function usage warnings
 
 ## Testing
 
@@ -193,13 +256,15 @@ and comparing stdout and the exit code against the expected files.
 src/                Compiler source code (Rust)
   frontend/         C source -> typed AST (preprocessor, lexer, parser, sema)
   ir/               Target-independent SSA IR (lowering, mem2reg)
-  passes/           SSA optimization passes (15 passes + shared loop analysis)
+  passes/           SSA optimization passes (16 passes + shared loop analysis)
   backend/          IR -> assembly -> machine code -> ELF (4 architectures)
   common/           Shared types, symbol table, diagnostics
   driver/           CLI parsing, pipeline orchestration
 
 include/            Bundled C headers (x86 SIMD: SSE through AVX-512, AES-NI, FMA, SHA, BMI2; ARM NEON)
 tests/              Compiler tests (each test is a directory with main.c and expected output)
+docs/               Formal EBNF grammar and specification documents
+.github/            CI/CD GitHub Actions workflows
 ideas/              Future work proposals and improvement notes
 ```
 

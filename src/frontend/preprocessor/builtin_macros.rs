@@ -411,10 +411,10 @@ fn define_type_traits_macros(macros: &mut MacroTable) {
     // C11/C17 feature test macros
     def(macros, "__STDC_UTF_16__", "1");
     def(macros, "__STDC_UTF_32__", "1");
-    def(macros, "__STDC_NO_ATOMICS__", "1");
+    // __STDC_NO_ATOMICS__ is NOT defined: _Atomic qualifier is fully supported.
     // Note: We support _Complex types, so __STDC_NO_COMPLEX__ is NOT defined.
     // __STDC_NO_THREADS__ is NOT defined because we link against glibc which provides <threads.h>
-    def(macros, "__STDC_NO_VLA__", "1");
+    // __STDC_NO_VLA__ is NOT defined: variable-length arrays are fully supported.
 
     // EXIT_SUCCESS and EXIT_FAILURE from <stdlib.h>
     def(macros, "EXIT_SUCCESS", "0");

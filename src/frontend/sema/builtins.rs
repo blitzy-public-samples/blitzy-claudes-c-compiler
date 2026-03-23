@@ -2,6 +2,10 @@
 //!
 //! Many C programs use GCC builtins (e.g., __builtin_abort, __builtin_memcpy).
 //! We map these to their standard library equivalents so the linker can resolve them.
+//!
+//! Additionally recognizes __atomic_*, __sync_*, and __c11_atomic_* builtin
+//! families for atomic operations. These are dispatched by pattern matching
+//! in the IR lowering code (expr_atomics.rs) rather than through BUILTIN_MAP.
 
 use crate::common::fx_hash::FxHashMap;
 use std::sync::LazyLock;
@@ -666,9 +670,13 @@ pub fn is_builtin(name: &str) -> bool {
     is_atomic_builtin(name)
 }
 
-/// Check if a name is an atomic/sync builtin handled by the IR lowering code.
+/// Check if a name is an atomic/sync/c11-atomic builtin handled by the IR lowering code.
 /// These are dispatched by name pattern in try_lower_atomic_builtin() and
 /// classify_fetch_op()/classify_op_fetch() rather than through the BUILTIN_MAP.
+/// Covers three families:
+/// - __atomic_* (GCC C11-style)
+/// - __sync_* (legacy GCC-style)
+/// - __c11_atomic_* (Clang C11-style)
 fn is_atomic_builtin(name: &str) -> bool {
     // __atomic_* family (C11-style)
     if name.starts_with("__atomic_") {
@@ -704,6 +712,21 @@ fn is_atomic_builtin(name: &str) -> bool {
             "__sync_val_compare_and_swap" | "__sync_bool_compare_and_swap" |
             "__sync_lock_test_and_set" | "__sync_lock_release" |
             "__sync_synchronize"
+        );
+    }
+    // __c11_atomic_* family (Clang-style C11 atomics)
+    if name.starts_with("__c11_atomic_") {
+        return matches!(name,
+            "__c11_atomic_load" |
+            "__c11_atomic_store" |
+            "__c11_atomic_exchange" |
+            "__c11_atomic_compare_exchange_strong" |
+            "__c11_atomic_compare_exchange_weak" |
+            "__c11_atomic_fetch_add" |
+            "__c11_atomic_fetch_sub" |
+            "__c11_atomic_fetch_and" |
+            "__c11_atomic_fetch_or" |
+            "__c11_atomic_fetch_xor"
         );
     }
     false

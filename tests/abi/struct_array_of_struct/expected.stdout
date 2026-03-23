@@ -1,0 +1,11 @@
+sizeof_elem: OK
+alignof_elem: OK
+elem_offset_x: OK
+elem_offset_y: OK
+array_stride: OK
+sizeof_s: OK
+offset_items: OK
+offset_tag: OK
+store_load_array: OK
+return_struct: OK
+All struct array of struct tests passed

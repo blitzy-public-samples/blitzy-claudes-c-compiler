@@ -282,19 +282,25 @@ fn resolve_numeric_refs_in_expr(
     while i < bytes.len() {
         if bytes[i].is_ascii_digit() {
             let start = i;
-            // Skip hex literals (0x..., 0X...) and binary literals (0b..., 0B...)
-            // to avoid misinterpreting hex digits as label refs (e.g., 0x1b)
-            if bytes[i] == b'0' && i + 1 < bytes.len()
-                && (bytes[i + 1] == b'x' || bytes[i + 1] == b'X'
-                    || bytes[i + 1] == b'b' || bytes[i + 1] == b'B')
-            {
-                // Consume the entire hex/binary literal
-                i += 2; // skip 0x or 0b
-                while i < bytes.len() && bytes[i].is_ascii_alphanumeric() {
-                    i += 1;
+            // Skip hex literals (0x..., 0X...) to avoid misinterpreting hex
+            // digits as label refs (e.g., 0x1b). For 0b/0B, only treat as a
+            // binary literal if followed by binary digits [01]; otherwise `0b`
+            // is a backward reference to numeric label 0.
+            if bytes[i] == b'0' && i + 1 < bytes.len() {
+                let next = bytes[i + 1];
+                let is_hex = next == b'x' || next == b'X';
+                let is_bin = (next == b'b' || next == b'B')
+                    && i + 2 < bytes.len()
+                    && (bytes[i + 2] == b'0' || bytes[i + 2] == b'1');
+                if is_hex || is_bin {
+                    // Consume the entire hex/binary literal
+                    i += 2; // skip 0x or 0b
+                    while i < bytes.len() && bytes[i].is_ascii_alphanumeric() {
+                        i += 1;
+                    }
+                    result.push_str(&expr[start..i]);
+                    continue;
                 }
-                result.push_str(&expr[start..i]);
-                continue;
             }
             while i < bytes.len() && bytes[i].is_ascii_digit() {
                 i += 1;
@@ -338,6 +344,12 @@ fn resolve_numeric_directive(
         }
         AsmDirective::Quad(vals) => {
             AsmDirective::Quad(resolve_numeric_data_values(vals, current_idx, defs))
+        }
+        AsmDirective::Org { expr, fill } => {
+            AsmDirective::Org {
+                expr: resolve_numeric_refs_in_expr(expr, current_idx, defs),
+                fill: *fill,
+            }
         }
         _ => dir.clone(),
     }

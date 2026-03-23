@@ -1,0 +1,1 @@
+NEON intrinsics are ARM-specific, not available on RISC-V

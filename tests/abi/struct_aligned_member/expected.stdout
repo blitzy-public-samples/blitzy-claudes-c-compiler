@@ -1,0 +1,8 @@
+sizeof_aligned_member: OK
+offsetof_b: OK
+offsetof_a: OK
+offsetof_c: OK
+sizeof_default: OK
+offsetof_b_default: OK
+value_correctness: OK
+All aligned member tests passed

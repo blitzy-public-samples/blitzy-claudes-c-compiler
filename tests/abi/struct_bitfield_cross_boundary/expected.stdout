@@ -1,0 +1,9 @@
+sizeof_struct: OK
+alignof_struct: OK
+store_load_both: OK
+boundary_field_b: OK
+cross_unit_no_corrupt: OK
+reverse_no_corrupt: OK
+negative_values: OK
+extremes: OK
+All cross-boundary bitfield tests passed

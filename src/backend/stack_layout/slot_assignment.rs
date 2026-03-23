@@ -388,18 +388,13 @@ fn classify_value(
         }
     }
 
-    // Detect small values (types that fit in 4 bytes on 64-bit targets).
-    // Currently used to populate small_slot_values for future store/load
-    // width optimization. Slot allocation remains 8-byte minimum because
-    // the backend's store/load paths aren't fully type-safe yet (some paths
-    // always use movq/sd/str x0 regardless of IR type).
-    let is_small = !crate::common::types::target_is_32bit() && matches!(
-        inst.result_type(),
-        Some(IrType::I8) | Some(IrType::U8) |
-        Some(IrType::I16) | Some(IrType::U16) |
-        Some(IrType::I32) | Some(IrType::U32) |
-        Some(IrType::F32)
-    );
+    // NOTE: 4-byte stack slots for small values are DISABLED because no backend
+    // codegen currently emits narrow (32-bit) store/load instructions for SSA
+    // values — all backends use full-width stores (movq on x86-64, str x-reg on
+    // AArch64, sd on RISC-V) which write 8 bytes and clobber the adjacent 4-byte
+    // slot. Re-enable this once all four backends' store_rax_to / store_x0_to /
+    // spill paths are updated to check is_small_slot and emit narrow instructions.
+    let is_small = false;
     let slot_size: i64 = if is_i128 || is_f128 {
         16
     } else {
@@ -619,6 +614,7 @@ pub(super) fn assign_tier3_block_local_slots(
     // For each block, assign slots with greedy coloring.
     for (blk_idx, values) in &per_block {
         let mut active: Vec<(usize, i64, i64)> = Vec::new(); // (last_use, offset, size)
+        let mut free_4: Vec<i64> = Vec::new();
         let mut free_8: Vec<i64> = Vec::new();
         let mut free_16: Vec<i64> = Vec::new();
         let mut block_peak: i64 = block_space.get(blk_idx).copied().unwrap_or(0);
@@ -631,14 +627,14 @@ pub(super) fn assign_tier3_block_local_slots(
             while i < active.len() {
                 if active[i].0 < my_def {
                     let (_, off, sz) = active.swap_remove(i);
-                    if sz == 16 { free_16.push(off); } else { free_8.push(off); }
+                    if sz == 16 { free_16.push(off); } else if sz == 4 { free_4.push(off); } else { free_8.push(off); }
                 } else {
                     i += 1;
                 }
             }
 
             // Try to reuse a freed slot of matching size.
-            let free_list = if slot_size == 16 { &mut free_16 } else { &mut free_8 };
+            let free_list = if slot_size == 16 { &mut free_16 } else if slot_size == 4 { &mut free_4 } else { &mut free_8 };
             let offset = if let Some(reused) = free_list.pop() {
                 reused
             } else {
@@ -700,7 +696,8 @@ pub(super) fn assign_tier2_liveness_packed_slots(
         interval_map.insert(iv.value_id, (iv.start, iv.end));
     }
 
-    // Separate by slot size for packing (8-byte and 16-byte pools).
+    // Separate by slot size for packing (4-byte, 8-byte, and 16-byte pools).
+    let mut values_4: Vec<(u32, u32, u32)> = Vec::new();
     let mut values_8: Vec<(u32, u32, u32)> = Vec::new();
     let mut values_16: Vec<(u32, u32, u32)> = Vec::new();
     let mut no_interval: Vec<(u32, i64)> = Vec::new();
@@ -709,6 +706,8 @@ pub(super) fn assign_tier2_liveness_packed_slots(
         if let Some(&(start, end)) = interval_map.get(&mbv.dest_id) {
             if mbv.slot_size == 16 {
                 values_16.push((mbv.dest_id, start, end));
+            } else if mbv.slot_size == 4 {
+                values_4.push((mbv.dest_id, start, end));
             } else {
                 values_8.push((mbv.dest_id, start, end));
             }
@@ -717,6 +716,7 @@ pub(super) fn assign_tier2_liveness_packed_slots(
         }
     }
 
+    pack_values_into_slots(&mut values_4, state, non_local_space, 4, assign_slot);
     pack_values_into_slots(&mut values_8, state, non_local_space, 8, assign_slot);
     pack_values_into_slots(&mut values_16, state, non_local_space, 16, assign_slot);
 
@@ -792,7 +792,7 @@ pub(super) fn finalize_deferred_slots(
         // non_local_space to it. This prevents alignment rounding in assign_slot
         // from causing adjacent slots to overlap when nls is not aligned.
         let max_align = deferred_slots.iter()
-            .map(|ds| if ds.align > 0 { ds.align } else { 8 })
+            .map(|ds| if ds.align > 0 { ds.align } else if ds.size <= 4 { 4 } else { 8 })
             .max()
             .unwrap_or(8);
         let aligned_nls = if max_align > 8 {

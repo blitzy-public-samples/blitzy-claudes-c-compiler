@@ -1,0 +1,9 @@
+sizeof_struct: OK
+alignof_struct: OK
+store_load_all: OK
+boundary_field_e: OK
+no_corrupt_across_units: OK
+adjacent_independence: OK
+negative_values: OK
+extremes: OK
+All adjacent bitfield tests passed

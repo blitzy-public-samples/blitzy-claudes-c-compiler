@@ -18,7 +18,7 @@ use crate::frontend::parser::Parser;
 use crate::frontend::sema::SemanticAnalyzer;
 use crate::ir::lowering::Lowerer;
 use crate::ir::mem2reg::{promote_allocas, eliminate_phis};
-use crate::passes::run_passes;
+use crate::passes::{run_passes, OptLevel};
 
 /// Compilation mode - determines where in the pipeline to stop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -195,6 +195,9 @@ pub struct Driver {
     /// When false, bare GNU keywords like `typeof` and `asm` are treated as
     /// identifiers (the __typeof__/__asm__ forms always work).
     pub(super) gnu_extensions: bool,
+    /// The C standard version string from -std= (e.g., "c11", "gnu17").
+    /// Used to set __STDC_VERSION__ to the correct value.
+    pub(super) c_standard: Option<String>,
     /// Whether to place each function in its own section (-ffunction-sections).
     pub(super) function_sections: bool,
     /// Whether to place each data object in its own section (-fdata-sections).
@@ -234,6 +237,21 @@ pub struct Driver {
     /// _REENTRANT=1 (matching GCC/Clang behavior). Build systems that detect
     /// pthread support via configure (ax_pthread.m4) add -lpthread themselves.
     pub(super) pthread: bool,
+    /// Whether trigraph processing is enabled (-trigraphs flag).
+    /// When true, the preprocessor performs Phase 1 trigraph replacement
+    /// before other preprocessing. Off by default (matching modern GCC).
+    pub(super) trigraphs_enabled: bool,
+    /// Whether -pedantic mode is enabled.
+    /// When true, warnings are emitted for GNU extensions and non-standard C.
+    pub(super) pedantic: bool,
+    /// Path to linker script file (-T flag).
+    /// When Some, the linker script is parsed for SECTIONS, MEMORY, ENTRY,
+    /// PROVIDE, and KEEP directives.
+    pub(super) linker_script_path: Option<std::path::PathBuf>,
+    /// Whether -Oz (aggressive size optimization) is requested.
+    /// Distinguished from -Os: both set optimize_size=true, but -Oz
+    /// additionally disables inlining entirely, whereas -Os reduces it to 50%.
+    pub(super) size_opt_aggressive: bool,
 }
 
 impl Driver {
@@ -291,6 +309,7 @@ impl Driver {
             undef_all: false,
             warning_config: WarningConfig::new(),
             gnu_extensions: true,
+            c_standard: None,
             function_sections: false,
             data_sections: false,
             gnu89_inline: false,
@@ -302,6 +321,10 @@ impl Driver {
             no_unwind_tables: false,
             raw_args: Vec::new(),
             pthread: false,
+            trigraphs_enabled: false,
+            pedantic: false,
+            linker_script_path: None,
+            size_opt_aggressive: false,
         }
     }
 
@@ -799,12 +822,23 @@ impl Driver {
         if !self.gnu_extensions {
             preprocessor.set_strict_ansi(true);
         }
+        // Enable trigraph preprocessing when -trigraphs flag is active.
+        // Trigraphs (??=, ??/, etc.) are replaced in preprocessing Phase 1,
+        // before any other preprocessing. Off by default per modern GCC.
+        if self.trigraphs_enabled {
+            preprocessor.set_trigraphs(true);
+        }
         // Set inline semantics mode: -fgnu89-inline or -std=gnu89 uses GNU89
         // inline semantics (__GNUC_GNU_INLINE__), while the default C99+ mode
         // uses __GNUC_STDC_INLINE__. Projects like mpack use these macros to
         // select the correct inline linkage model.
         if self.gnu89_inline {
             preprocessor.set_gnu89_inline(true);
+        }
+        // Set __STDC_VERSION__ based on -std= flag. When -std=c11 is passed,
+        // __STDC_VERSION__ should be 201112L instead of the default 201710L.
+        if let Some(ref std_ver) = self.c_standard {
+            preprocessor.set_stdc_version(std_ver);
         }
         // Set optimization macros: __OPTIMIZE__ for -O1+, __OPTIMIZE_SIZE__ for -Os/-Oz.
         // The Linux kernel's BUILD_BUG() relies on __OPTIMIZE__ to expand to a noreturn
@@ -918,6 +952,11 @@ impl Driver {
         let mut diagnostics = DiagnosticEngine::new();
         diagnostics.set_warning_config(self.warning_config.clone());
         diagnostics.set_color_mode(self.color_mode);
+        // Enable -pedantic mode in the diagnostic engine.
+        // When active, the diagnostic engine emits warnings for GNU extensions.
+        if self.pedantic {
+            diagnostics.set_pedantic(true);
+        }
 
         // Emit preprocessor warnings through diagnostic engine with Cpp kind
         // so they can be controlled via -Wcpp / -Wno-cpp / -Werror=cpp.
@@ -1078,11 +1117,27 @@ impl Driver {
 
         // Run optimization passes
         let t5 = std::time::Instant::now();
-        promote_allocas(&mut module);
+        // Map driver state to the OptLevel enum for tiered pass dispatch:
+        // -O0 → O0, -O1 → O1, -O2 → O2, -O3 → O3, -Os → Os, -Oz → Oz
+        let opt = if self.optimize_size {
+            if self.size_opt_aggressive { OptLevel::Oz } else { OptLevel::Os }
+        } else {
+            match self.opt_level {
+                0 => OptLevel::O0,
+                1 => OptLevel::O1,
+                3 => OptLevel::O3,
+                _ => OptLevel::O2,
+            }
+        };
+        // Run mem2reg to promote stack allocas to SSA registers.
+        // Skip at -O0 for fastest compile (no optimization passes at all).
+        if opt != OptLevel::O0 {
+            promote_allocas(&mut module);
+        }
         if time_phases { eprintln!("[TIME] mem2reg: {:.3}s", t5.elapsed().as_secs_f64()); }
 
         let t6 = std::time::Instant::now();
-        run_passes(&mut module, self.opt_level, self.target);
+        run_passes(&mut module, opt, self.target);
         if time_phases { eprintln!("[TIME] opt passes: {:.3}s", t6.elapsed().as_secs_f64()); }
 
         // Lower SSA phi nodes to copies before codegen

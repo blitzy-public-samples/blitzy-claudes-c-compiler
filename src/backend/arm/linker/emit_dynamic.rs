@@ -26,10 +26,20 @@ pub(super) fn emit_dynamic_executable(
     let mut dynstr = DynStrTab::new();
     for lib in needed_sonames { dynstr.add(lib); }
 
-    // Build dynamic symbol name list
+    // Build dynamic symbol name list — skip locally-defined IFUNC symbols
+    // since they use IRELATIVE relocations (sym_idx=0, addend=resolver_addr)
+    // rather than JUMP_SLOT entries that reference a dynamic symbol index.
     let mut dyn_sym_names: Vec<String> = Vec::new();
     for name in plt_names {
-        if !dyn_sym_names.contains(name) { dyn_sym_names.push(name.clone()); }
+        if !dyn_sym_names.contains(name) {
+            // Skip locally-defined IFUNC symbols — they don't need dynsym entries
+            let is_local_ifunc = globals.get(name).map(|g|
+                (g.info & 0xf) == STT_GNU_IFUNC && g.defined_in.is_some()
+            ).unwrap_or(false);
+            if !is_local_ifunc {
+                dyn_sym_names.push(name.clone());
+            }
+        }
     }
     for (name, is_plt) in got_entries {
         if !name.is_empty() && !*is_plt && !dyn_sym_names.contains(name) {
@@ -170,12 +180,38 @@ pub(super) fn emit_dynamic_executable(
     // Text segment
     offset = (offset + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
     let text_page_offset = offset;
-    let text_page_addr = BASE_ADDR + offset;
+
+    // Linker script text address adjustment: if a linker script assigned an
+    // explicit virtual address to any executable section, use it as the base.
+    let text_script_base: Option<u64> = {
+        let mut min_addr: Option<u64> = None;
+        for sec in output_sections.iter() {
+            if sec.addr != 0 && sec.flags & SHF_EXECINSTR != 0 && sec.flags & SHF_ALLOC != 0 {
+                if min_addr.is_none() || sec.addr < min_addr.unwrap() {
+                    min_addr = Some(sec.addr);
+                }
+            }
+        }
+        min_addr
+    };
+    for sec in output_sections.iter_mut() {
+        if sec.flags & SHF_EXECINSTR != 0 && sec.flags & SHF_ALLOC != 0 {
+            sec.addr = 0;
+        }
+    }
+    let default_text_vaddr = BASE_ADDR + text_page_offset;
+    let text_vaddr_base: u64 = match text_script_base {
+        Some(addr) if addr >= BASE_ADDR + PAGE_SIZE => addr,
+        Some(_) => default_text_vaddr,
+        None => default_text_vaddr,
+    };
+    let text_page_addr = text_vaddr_base;
+
     for sec in output_sections.iter_mut() {
         if sec.flags & SHF_EXECINSTR != 0 && sec.flags & SHF_ALLOC != 0 {
             let a = sec.alignment.max(4);
             offset = (offset + a - 1) & !(a - 1);
-            sec.addr = BASE_ADDR + offset;
+            sec.addr = text_vaddr_base + (offset - text_page_offset);
             sec.file_offset = offset;
             offset += sec.mem_size;
         }
@@ -183,21 +219,48 @@ pub(super) fn emit_dynamic_executable(
     // PLT in text segment
     let (plt_addr, plt_offset) = if plt_size > 0 {
         offset = (offset + 15) & !15;
-        let a = BASE_ADDR + offset; let o = offset; offset += plt_size; (a, o)
+        let a = text_vaddr_base + (offset - text_page_offset); let o = offset; offset += plt_size; (a, o)
     } else { (0u64, 0u64) };
     let text_total_size = offset - text_page_offset;
 
     // Rodata segment (separate LOAD R)
     offset = (offset + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
     let rodata_page_offset = offset;
-    let rodata_page_addr = BASE_ADDR + offset;
+
+    // Linker script rodata address adjustment
+    let rodata_script_base: Option<u64> = {
+        let mut min_addr: Option<u64> = None;
+        for sec in output_sections.iter() {
+            if sec.addr != 0 && sec.flags & SHF_ALLOC != 0
+                && sec.flags & SHF_EXECINSTR == 0
+                && sec.flags & SHF_WRITE == 0
+                && sec.sh_type != SHT_NOBITS
+                && sec.flags & SHF_TLS == 0
+            {
+                if min_addr.is_none() || sec.addr < min_addr.unwrap() {
+                    min_addr = Some(sec.addr);
+                }
+            }
+        }
+        min_addr
+    };
+    for sec in output_sections.iter_mut() {
+        if sec.flags & SHF_ALLOC != 0 && sec.flags & SHF_EXECINSTR == 0 &&
+           sec.flags & SHF_WRITE == 0 && sec.sh_type != SHT_NOBITS &&
+           sec.flags & SHF_TLS == 0 {
+            sec.addr = 0;
+        }
+    }
+    let rodata_vaddr_base: u64 = rodata_script_base.unwrap_or(BASE_ADDR + rodata_page_offset);
+    let rodata_page_addr = rodata_vaddr_base;
+
     for sec in output_sections.iter_mut() {
         if sec.flags & SHF_ALLOC != 0 && sec.flags & SHF_EXECINSTR == 0 &&
            sec.flags & SHF_WRITE == 0 && sec.sh_type != SHT_NOBITS &&
            sec.flags & SHF_TLS == 0 {
             let a = sec.alignment.max(1);
             offset = (offset + a - 1) & !(a - 1);
-            sec.addr = BASE_ADDR + offset;
+            sec.addr = rodata_vaddr_base + (offset - rodata_page_offset);
             sec.file_offset = offset;
             offset += sec.mem_size;
         }
@@ -207,7 +270,26 @@ pub(super) fn emit_dynamic_executable(
     // RW segment
     offset = (offset + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
     let rw_page_offset = offset;
-    let rw_page_addr = BASE_ADDR + offset;
+
+    // Linker script RW address adjustment
+    let rw_script_base: Option<u64> = {
+        let mut min_addr: Option<u64> = None;
+        for sec in output_sections.iter() {
+            if sec.addr != 0 && sec.flags & SHF_ALLOC != 0 && sec.flags & SHF_WRITE != 0 {
+                if min_addr.is_none() || sec.addr < min_addr.unwrap() {
+                    min_addr = Some(sec.addr);
+                }
+            }
+        }
+        min_addr
+    };
+    for sec in output_sections.iter_mut() {
+        if sec.flags & SHF_ALLOC != 0 && sec.flags & SHF_WRITE != 0 {
+            sec.addr = 0;
+        }
+    }
+    let rw_vaddr_base: u64 = rw_script_base.unwrap_or(BASE_ADDR + rw_page_offset);
+    let rw_page_addr = rw_vaddr_base;
 
     let mut init_array_addr = 0u64; let mut init_array_size = 0u64;
     let mut fini_array_addr = 0u64; let mut fini_array_size = 0u64;
@@ -216,7 +298,7 @@ pub(super) fn emit_dynamic_executable(
         if sec.name == ".init_array" {
             let a = sec.alignment.max(8);
             offset = (offset + a - 1) & !(a - 1);
-            sec.addr = BASE_ADDR + offset; sec.file_offset = offset;
+            sec.addr = rw_vaddr_base + (offset - rw_page_offset); sec.file_offset = offset;
             init_array_addr = sec.addr; init_array_size = sec.mem_size;
             offset += sec.mem_size; break;
         }
@@ -225,25 +307,25 @@ pub(super) fn emit_dynamic_executable(
         if sec.name == ".fini_array" {
             let a = sec.alignment.max(8);
             offset = (offset + a - 1) & !(a - 1);
-            sec.addr = BASE_ADDR + offset; sec.file_offset = offset;
+            sec.addr = rw_vaddr_base + (offset - rw_page_offset); sec.file_offset = offset;
             fini_array_addr = sec.addr; fini_array_size = sec.mem_size;
             offset += sec.mem_size; break;
         }
     }
 
     offset = (offset + 7) & !7;
-    let dynamic_offset = offset; let dynamic_addr = BASE_ADDR + offset; offset += dynamic_size;
+    let dynamic_offset = offset; let dynamic_addr = rw_vaddr_base + (offset - rw_page_offset); offset += dynamic_size;
     offset = (offset + 7) & !7;
-    let got_offset = offset; let got_addr = BASE_ADDR + offset; offset += got_size;
+    let got_offset = offset; let got_addr = rw_vaddr_base + (offset - rw_page_offset); offset += got_size;
     offset = (offset + 7) & !7;
-    let got_plt_offset = offset; let got_plt_addr = BASE_ADDR + offset; offset += got_plt_size;
+    let got_plt_offset = offset; let got_plt_addr = rw_vaddr_base + (offset - rw_page_offset); offset += got_plt_size;
 
     // Data.rel.ro
     for sec in output_sections.iter_mut() {
         if sec.name == ".data.rel.ro" {
             let a = sec.alignment.max(1);
             offset = (offset + a - 1) & !(a - 1);
-            sec.addr = BASE_ADDR + offset; sec.file_offset = offset;
+            sec.addr = rw_vaddr_base + (offset - rw_page_offset); sec.file_offset = offset;
             offset += sec.mem_size;
         }
     }
@@ -256,7 +338,7 @@ pub(super) fn emit_dynamic_executable(
            sec.name != ".data.rel.ro" {
             let a = sec.alignment.max(1);
             offset = (offset + a - 1) & !(a - 1);
-            sec.addr = BASE_ADDR + offset; sec.file_offset = offset;
+            sec.addr = rw_vaddr_base + (offset - rw_page_offset); sec.file_offset = offset;
             offset += sec.mem_size;
         }
     }
@@ -271,7 +353,7 @@ pub(super) fn emit_dynamic_executable(
         if sec.flags & SHF_TLS != 0 && sec.flags & SHF_ALLOC != 0 && sec.sh_type != SHT_NOBITS {
             let a = sec.alignment.max(1);
             offset = (offset + a - 1) & !(a - 1);
-            sec.addr = BASE_ADDR + offset; sec.file_offset = offset;
+            sec.addr = rw_vaddr_base + (offset - rw_page_offset); sec.file_offset = offset;
             if tls_addr == 0 { tls_addr = sec.addr; tls_file_offset = offset; tls_align = a; }
             tls_file_size += sec.mem_size;
             tls_mem_size += sec.mem_size;
@@ -279,7 +361,7 @@ pub(super) fn emit_dynamic_executable(
         }
     }
     if tls_addr == 0 && has_tls_sections {
-        tls_addr = BASE_ADDR + offset;
+        tls_addr = rw_vaddr_base + (offset - rw_page_offset);
         tls_file_offset = offset;
     }
     for sec in output_sections.iter_mut() {
@@ -294,7 +376,7 @@ pub(super) fn emit_dynamic_executable(
     tls_mem_size = (tls_mem_size + tls_align - 1) & !(tls_align - 1);
     let has_tls = tls_addr != 0;
 
-    let bss_addr = BASE_ADDR + offset;
+    let bss_addr = rw_vaddr_base + (offset - rw_page_offset);
     let mut bss_size = 0u64;
     for sec in output_sections.iter_mut() {
         if sec.sh_type == SHT_NOBITS && sec.flags & SHF_ALLOC != 0 && sec.flags & SHF_TLS == 0 {
@@ -362,6 +444,27 @@ pub(super) fn emit_dynamic_executable(
                     gsym.value += output_sections[oi].addr + so;
                 }
             }
+        }
+    }
+
+    // For locally-defined IFUNC symbols, the current value is the resolver function address.
+    // We save it before redirecting the symbol to its PLT stub, so the IRELATIVE relocation
+    // addend can use the resolver address while call sites go through the PLT.
+    let mut ifunc_resolver_addrs: HashMap<String, u64> = HashMap::new();
+    for (name, gsym) in globals.iter() {
+        if (gsym.info & 0xf) == STT_GNU_IFUNC && gsym.defined_in.is_some() {
+            ifunc_resolver_addrs.insert(name.clone(), gsym.value);
+        }
+    }
+    // Redirect IFUNC symbol value to its PLT stub address, and change type to STT_FUNC
+    // so that call sites resolve through the PLT for lazy/eager resolution
+    for (_name, gsym) in globals.iter_mut() {
+        if (gsym.info & 0xf) == STT_GNU_IFUNC && gsym.defined_in.is_some() {
+            if let Some(pi) = gsym.plt_idx {
+                gsym.value = plt_addr + 32 + pi as u64 * 16;
+            }
+            // Change type from STT_GNU_IFUNC to STT_FUNC, preserving binding
+            gsym.info = (gsym.info & 0xf0) | STT_FUNC;
         }
     }
 
@@ -524,14 +627,25 @@ pub(super) fn emit_dynamic_executable(
         }
     }
 
-    // .rela.plt (R_AARCH64_JUMP_SLOT = 1026)
+    // .rela.plt — R_AARCH64_JUMP_SLOT for dynamic symbols,
+    //              R_AARCH64_IRELATIVE for locally-defined IFUNC symbols
     const R_AARCH64_JUMP_SLOT: u64 = 1026;
+    const R_AARCH64_IRELATIVE: u64 = 1032;
     let mut rp = rela_plt_offset as usize;
     let gpb = got_plt_addr + 24;
     for (i, name) in plt_names.iter().enumerate() {
         let gea = gpb + i as u64 * 8;
-        let si = dyn_sym_names.iter().position(|n| n == name).map(|j| j+1).unwrap_or(0) as u64;
-        w64(&mut out, rp, gea); w64(&mut out, rp+8, (si << 32) | R_AARCH64_JUMP_SLOT); w64(&mut out, rp+16, 0);
+        let is_local_ifunc = ifunc_resolver_addrs.contains_key(name);
+        if is_local_ifunc {
+            // IRELATIVE: sym_idx=0, addend=resolver address (saved before PLT redirection)
+            let resolver_addr = ifunc_resolver_addrs.get(name).copied().unwrap_or(0);
+            w64(&mut out, rp, gea);
+            w64(&mut out, rp+8, R_AARCH64_IRELATIVE);
+            w64(&mut out, rp+16, resolver_addr);
+        } else {
+            let si = dyn_sym_names.iter().position(|n| n == name).map(|j| j+1).unwrap_or(0) as u64;
+            w64(&mut out, rp, gea); w64(&mut out, rp+8, (si << 32) | R_AARCH64_JUMP_SLOT); w64(&mut out, rp+16, 0);
+        }
         rp += 24;
     }
 
@@ -792,11 +906,11 @@ pub(super) fn emit_dynamic_executable(
                         let sa_val = (s as i64 + a) as u64;
                         reloc::encode_movw(&mut out, fp, (sa_val & 0xffff) as u32);
                     }
-                    R_AARCH64_MOVW_UABS_G1_NC => {
+                    R_AARCH64_MOVW_UABS_G1 | R_AARCH64_MOVW_UABS_G1_NC => {
                         let sa_val = (s as i64 + a) as u64;
                         reloc::encode_movw(&mut out, fp, ((sa_val >> 16) & 0xffff) as u32);
                     }
-                    R_AARCH64_MOVW_UABS_G2_NC => {
+                    R_AARCH64_MOVW_UABS_G2 | R_AARCH64_MOVW_UABS_G2_NC => {
                         let sa_val = (s as i64 + a) as u64;
                         reloc::encode_movw(&mut out, fp, ((sa_val >> 32) & 0xffff) as u32);
                     }

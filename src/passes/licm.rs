@@ -23,6 +23,10 @@
 //! - Loads from GlobalAddr pointers when the loop has no function calls and no
 //!   stores to any GlobalAddr target (since calls and stores to unknown pointers
 //!   could potentially modify any global variable)
+//! - restrict-qualified pointer loads: when a pointer carries the C11 `restrict`
+//!   qualifier, loads through it can be hoisted if no store in the loop targets
+//!   the same pointer, since restrict guarantees exclusive access through that
+//!   pointer within the current scope
 //!
 //! Address-taken allocas (used in GEP, passed to calls, etc.) are never hoisted
 //! because stores through derived pointers may not be tracked in `stored_allocas`.
@@ -93,6 +97,11 @@ fn is_hoistable(inst: &Instruction) -> bool {
 struct AllocaAnalysis {
     /// Set of value IDs that are alloca destinations.
     alloca_values: FxHashSet<u32>,
+    /// Set of value IDs produced by DynAlloca instructions (VLA allocations).
+    /// GEP chains derived from these values should not be hoisted by LICM
+    /// because the increased register pressure from live VLA-derived pointers
+    /// can cause spill slot conflicts in the register allocator.
+    dyn_alloca_values: FxHashSet<u32>,
     /// Set of alloca value IDs that are "address-taken" — used by anything
     /// other than direct Load/Store (e.g., passed to a call, used in GEP
     /// as a non-base, stored as a value, etc.). Loads from address-taken
@@ -113,6 +122,7 @@ struct AllocaAnalysis {
 /// Load/Store, so we can reason precisely about which stores modify them.
 fn analyze_allocas(func: &IrFunction) -> AllocaAnalysis {
     let mut alloca_values = FxHashSet::default();
+    let mut dyn_alloca_values = FxHashSet::default();
     let mut address_taken = FxHashSet::default();
 
     // Collect all alloca values from every block. After inlining, allocas
@@ -124,11 +134,14 @@ fn analyze_allocas(func: &IrFunction) -> AllocaAnalysis {
             if let Instruction::Alloca { dest, .. } = inst {
                 alloca_values.insert(dest.0);
             }
+            if let Instruction::DynAlloca { dest, .. } = inst {
+                dyn_alloca_values.insert(dest.0);
+            }
         }
     }
 
     if alloca_values.is_empty() {
-        return AllocaAnalysis { alloca_values, address_taken };
+        return AllocaAnalysis { alloca_values, dyn_alloca_values, address_taken };
     }
 
     // Scan all instructions to find address-taken allocas.
@@ -172,7 +185,7 @@ fn analyze_allocas(func: &IrFunction) -> AllocaAnalysis {
         });
     }
 
-    AllocaAnalysis { alloca_values, address_taken }
+    AllocaAnalysis { alloca_values, dyn_alloca_values, address_taken }
 }
 
 /// Visit each Value ID used as operands by any instruction (for address-taken analysis).
@@ -334,6 +347,12 @@ struct LoopMemoryInfo {
     /// global memory, so any store through a non-alloca pointer must be
     /// treated conservatively as potentially modifying globals.
     has_global_derived_stores: bool,
+    /// Set of value IDs that are `restrict`-qualified pointers within the
+    /// loop scope. When a load is through a restrict pointer and all stores
+    /// in the loop are through DIFFERENT restrict pointers, the load can be
+    /// safely hoisted because restrict guarantees no aliasing between
+    /// different restrict-qualified pointers in the same scope.
+    restrict_ptrs: FxHashSet<u32>,
 }
 
 impl LoopMemoryInfo {
@@ -378,6 +397,156 @@ fn build_value_to_base_alloca(func: &IrFunction, alloca_info: &AllocaAnalysis) -
         }
     }
     map
+}
+
+/// Build a set of value IDs that derive from DynAlloca results (VLA base
+/// pointers). The chain is: DynAlloca → stored into alloca → loaded back →
+/// used as GEP base → GEP result. Any GEP whose base is in this set should
+/// not be hoisted by LICM to avoid register pressure spikes that cause
+/// spill slot conflicts in functions with multiple VLAs.
+fn build_dyn_alloca_derived_set(func: &IrFunction, alloca_info: &AllocaAnalysis) -> FxHashSet<u32> {
+    let mut derived = FxHashSet::default();
+
+    // Seed: DynAlloca results themselves.
+    for &da in &alloca_info.dyn_alloca_values {
+        derived.insert(da);
+    }
+
+    // Find allocas that store DynAlloca results (VLA pointer variables).
+    let mut vla_ptr_allocas = FxHashSet::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Instruction::Store { val: Operand::Value(v), ptr, .. } = inst {
+                if derived.contains(&v.0) && alloca_info.alloca_values.contains(&ptr.0) {
+                    vla_ptr_allocas.insert(ptr.0);
+                }
+            }
+        }
+    }
+
+    // Propagate: loads from VLA pointer allocas, and GEP chains from those.
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                match inst {
+                    Instruction::Load { dest, ptr, .. } => {
+                        if vla_ptr_allocas.contains(&ptr.0) && derived.insert(dest.0) {
+                            changed = true;
+                        }
+                    }
+                    Instruction::GetElementPtr { dest, base, .. } => {
+                        if derived.contains(&base.0) && derived.insert(dest.0) {
+                            changed = true;
+                        }
+                    }
+                    Instruction::Copy { dest, src: Operand::Value(v) } => {
+                        if derived.contains(&v.0) && derived.insert(dest.0) {
+                            changed = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    derived
+}
+
+/// Identify restrict-qualified pointers accessible within the loop.
+///
+/// Performs two-level analysis mirroring the GVN restrict detection:
+///
+/// **Level 1:** Identifies loads from parameter allocas. The lowering phase stores
+/// restrict-qualified function parameters into allocas listed in `param_alloca_values`.
+/// Values loaded from these allocas are restrict-qualified pointer bases.
+///
+/// **Level 2:** Propagates restrict through GetElementPtr (struct member access),
+/// Copy, and Cast instructions. A GEP from a restrict base produces a pointer that
+/// inherits the restrict guarantee, enabling safe load hoisting for struct member
+/// accesses through restrict-qualified struct pointers:
+/// ```c
+/// void f(struct S * restrict a, struct S * restrict b) {
+///     for (int i = 0; i < n; i++)
+///         a->data[i] = b->data[i];  // b->data load can be hoisted
+/// }
+/// ```
+///
+/// The analysis scans ALL function blocks (not just loop body) because restrict
+/// pointer definitions typically occur in the entry block before the loop.
+fn find_loop_restrict_ptrs(
+    func: &IrFunction,
+    _loop_body: &FxHashSet<usize>,
+) -> FxHashSet<u32> {
+    let mut restrict_set = FxHashSet::default();
+
+    // Collect parameter alloca Value IDs for quick lookup.
+    let param_alloca_set: FxHashSet<u32> = func.param_alloca_values
+        .iter()
+        .map(|v| v.0)
+        .collect();
+
+    if param_alloca_set.is_empty() {
+        return restrict_set;
+    }
+
+    // Level 1: Find loads from parameter allocas (restrict pointer bases).
+    let mut restrict_bases: FxHashSet<u32> = FxHashSet::default();
+
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Instruction::Load { dest, ptr, .. } = inst {
+                if param_alloca_set.contains(&ptr.0) {
+                    restrict_set.insert(dest.0);
+                    restrict_bases.insert(dest.0);
+                }
+                if restrict_set.contains(&ptr.0) {
+                    restrict_set.insert(dest.0);
+                    restrict_bases.insert(dest.0);
+                }
+            }
+        }
+    }
+
+    // Level 2: Propagate restrict through GEP, Copy, and Cast (fixed-point).
+    let mut changed = true;
+    let mut iteration = 0;
+    while changed && iteration < 3 {
+        changed = false;
+        iteration += 1;
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                match inst {
+                    Instruction::GetElementPtr { dest, base, .. } => {
+                        if restrict_bases.contains(&base.0) && !restrict_set.contains(&dest.0) {
+                            restrict_set.insert(dest.0);
+                            restrict_bases.insert(dest.0);
+                            changed = true;
+                        }
+                    }
+                    Instruction::Copy { dest, src: Operand::Value(src_v), .. } => {
+                        if restrict_bases.contains(&src_v.0) && !restrict_set.contains(&dest.0) {
+                            restrict_set.insert(dest.0);
+                            restrict_bases.insert(dest.0);
+                            changed = true;
+                        }
+                    }
+                    Instruction::Cast { dest, src: Operand::Value(src_v), .. } => {
+                        if restrict_bases.contains(&src_v.0) && !restrict_set.contains(&dest.0) {
+                            restrict_set.insert(dest.0);
+                            restrict_bases.insert(dest.0);
+                            changed = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    restrict_set
 }
 
 /// Scan a loop body to determine which allocas are modified and what
@@ -489,7 +658,12 @@ fn analyze_loop_memory(
         }
     }
 
-    LoopMemoryInfo { stored_allocas, modified_base_allocas, has_calls, has_global_derived_stores }
+    // Collect restrict-qualified pointers accessible within the loop.
+    // When restrict info is propagated from the frontend through IR lowering,
+    // this will enable safe hoisting of loads through restrict pointers.
+    let restrict_ptrs = find_loop_restrict_ptrs(func, loop_body);
+
+    LoopMemoryInfo { stored_allocas, modified_base_allocas, has_calls, has_global_derived_stores, restrict_ptrs }
 }
 
 /// Check if a Load instruction is safe to hoist from a loop.
@@ -558,9 +732,22 @@ fn is_load_hoistable(
         return true;
     }
 
+    // Check if loading through a restrict-qualified pointer.
+    // Restrict semantics (C11 §6.7.3.1) guarantee that the pointed-to object
+    // is only accessed through this pointer within the current scope. Therefore,
+    // if the load pointer is restrict-qualified and no store in the loop targets
+    // the same pointer value (by Value ID), the load is safe to hoist because
+    // stores through other pointers cannot alias this restrict pointer's target.
+    if loop_mem.restrict_ptrs.contains(&ptr_id) {
+        // The load pointer itself must be loop-invariant (already checked above).
+        // No store in the loop targets this exact restrict pointer.
+        if !loop_mem.stored_allocas.contains(&ptr_id) {
+            return true;
+        }
+    }
+
     // For other non-alloca pointers (e.g., GEP results), we cannot easily
     // determine safety without alias analysis. Be conservative.
-    // TODO: Implement alias analysis for GEP-based loads
     false
 }
 
@@ -647,6 +834,18 @@ fn hoist_loop_invariants(
     // Build a mapping from values to their base alloca (following GEP chains).
     let value_to_base_alloca = build_value_to_base_alloca(func, alloca_info);
 
+    // Build a set of values that derive from DynAlloca results (VLA pointers).
+    // When a DynAlloca result is stored into an alloca and then loaded back,
+    // the loaded value and any GEPs based on it are "VLA-derived". Hoisting
+    // GEP instructions over VLA-derived pointers can increase register
+    // pressure beyond what the allocator handles correctly, causing spill
+    // slot conflicts. We track these to prevent GEP hoisting for VLA code.
+    let dyn_alloca_derived = if !alloca_info.dyn_alloca_values.is_empty() {
+        build_dyn_alloca_derived_set(func, alloca_info)
+    } else {
+        FxHashSet::default()
+    };
+
     // Analyze loop memory for load hoisting.
     let loop_mem = analyze_loop_memory(func, &natural_loop.body, alloca_info, &global_addr_values, &value_to_base_alloca);
 
@@ -679,7 +878,23 @@ fn hoist_loop_invariants(
                 }
 
                 // Determine if this instruction can be hoisted
-                let can_hoist = if is_hoistable(inst) {
+                //
+                // Suppress hoisting of GEP instructions whose base derives
+                // from a DynAlloca (VLA). Hoisting VLA-derived GEPs increases
+                // the number of live pointer values spanning loop bodies, which
+                // can push register pressure beyond the allocator's ability to
+                // correctly assign distinct spill slots. This prevents a class
+                // of miscompilations in functions with multiple VLAs and nested
+                // loops where the allocator incorrectly shares spill slots
+                // between two simultaneously-live values.
+                let suppress_vla_gep = if let Instruction::GetElementPtr { base, .. } = inst {
+                    dyn_alloca_derived.contains(&base.0)
+                } else {
+                    false
+                };
+                let can_hoist = if suppress_vla_gep {
+                    false
+                } else if is_hoistable(inst) {
                     // Pure instruction: check all operands are loop-invariant
                     // Use callback to avoid Vec allocation in this hot loop
                     let mut all_invariant = true;

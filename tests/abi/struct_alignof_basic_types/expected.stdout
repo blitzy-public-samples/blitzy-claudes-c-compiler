@@ -1,0 +1,10 @@
+alignof_char: OK
+alignof_short: OK
+alignof_int: OK
+alignof_long: OK
+alignof_long_long: OK
+alignof_float: OK
+alignof_double: OK
+alignof_pointer: OK
+alignof_long_double: OK
+All alignof basic type tests passed

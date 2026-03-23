@@ -1,0 +1,11 @@
+access_union_i: OK
+access_union_d: OK
+offset_tag: OK
+offset_union: OK
+offset_c: OK
+sizeof_struct: OK
+union_overlap: OK
+store_load_all: OK
+return_struct: OK
+union_overwrite: OK
+All anonymous union tests passed

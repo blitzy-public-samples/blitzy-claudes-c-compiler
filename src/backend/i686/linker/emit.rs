@@ -10,6 +10,7 @@ use super::reloc::{self, RelocContext};
 use super::gnu_hash::build_gnu_hash_32;
 use super::DynStrTab;
 use crate::backend::linker_common;
+use crate::backend::linker_common::ScriptSection;
 
 pub(super) fn emit_executable(
     inputs: &[InputObject],
@@ -29,8 +30,20 @@ pub(super) fn emit_executable(
     is_nostdlib: bool,
     _needed_libs_param: &[&str],
     output_path: &str,
+    entry_override: Option<&str>,
+    script_sections: Option<&[ScriptSection]>,
 ) -> Result<(), String> {
     let num_ifunc = ifunc_symbols.len();
+
+    // Helper: look up a fixed virtual address for a section name in the linker
+    // script SECTIONS directives. Returns `None` when no linker script is active
+    // or the section is not mentioned in the script, allowing the default
+    // sequential layout to proceed.
+    let script_addr_for = |name: &str| -> Option<u32> {
+        script_sections.and_then(|secs| {
+            secs.iter().find(|s| s.name == name).and_then(|s| s.address.map(|a| a as u32))
+        })
+    };
 
     // ── Build dynamic symbol/string tables ────────────────────────────────
     let mut needed_libs: Vec<String> = Vec::new();
@@ -282,9 +295,17 @@ pub(super) fn emit_executable(
 
     let interp_data = INTERP.to_vec();
 
+    // If the linker script specifies an address for .text that is below the
+    // default BASE_ADDR, use that as the effective base for the entire ELF.
+    // This prevents the text PT_LOAD segment from being placed below the
+    // header PT_LOAD, which would create an invalid ELF layout.
+    let effective_base: u32 = script_addr_for(".text")
+        .filter(|&a| a < BASE_ADDR)
+        .unwrap_or(BASE_ADDR);
+
     // Section layout tracking
     let mut file_offset: u32 = ehdr_size;
-    let mut vaddr: u32 = BASE_ADDR + ehdr_size;
+    let mut vaddr: u32 = effective_base + ehdr_size;
 
     let phdr_offset = file_offset;
     let phdr_vaddr = vaddr;
@@ -380,8 +401,22 @@ pub(super) fn emit_executable(
     // ── Segment 1 (RX): .init + .plt + .text + .fini ──
     file_offset = align_up(file_offset, PAGE_SIZE);
     vaddr = align_up(vaddr, PAGE_SIZE);
-    vaddr = (vaddr & !0xfff) | (file_offset & 0xfff);
-    if vaddr < BASE_ADDR + file_offset { vaddr += PAGE_SIZE; }
+    // If the linker script specifies a fixed address for .text and the
+    // effective base was NOT already lowered to accommodate it, jump to
+    // that address.  When effective_base already matches the script
+    // address the sequential layout is correct and must not be reset
+    // (resetting would collide with the header PT_LOAD segment).
+    if let Some(text_addr) = script_addr_for(".text") {
+        if effective_base == BASE_ADDR {
+            // effective_base was not lowered — apply the script address directly
+            vaddr = text_addr;
+        }
+        // else: effective_base already accounts for the text address;
+        // keep the sequential layout that naturally follows the headers.
+    } else {
+        vaddr = (vaddr & !0xfff) | (file_offset & 0xfff);
+        if vaddr < effective_base + file_offset { vaddr += PAGE_SIZE; }
+    }
 
     let text_seg_file_start = file_offset;
     let text_seg_vaddr_start = vaddr;
@@ -454,9 +489,15 @@ pub(super) fn emit_executable(
 
     // ── Segment 2 (RO): .rodata + .eh_frame ──
     file_offset = align_up(file_offset, PAGE_SIZE); vaddr = align_up(vaddr, PAGE_SIZE);
-    vaddr = (vaddr & !0xfff) | (file_offset & 0xfff);
-    if vaddr <= text_seg_vaddr_end {
-        vaddr = align_up(text_seg_vaddr_end, PAGE_SIZE) | (file_offset & 0xfff);
+    // If the linker script specifies a fixed address for .rodata, use it as the
+    // rodata segment start vaddr; otherwise use the standard sequential layout.
+    if let Some(rodata_addr) = script_addr_for(".rodata") {
+        vaddr = rodata_addr;
+    } else {
+        vaddr = (vaddr & !0xfff) | (file_offset & 0xfff);
+        if vaddr <= text_seg_vaddr_end {
+            vaddr = align_up(text_seg_vaddr_end, PAGE_SIZE) | (file_offset & 0xfff);
+        }
     }
 
     let rodata_seg_file_start = file_offset;
@@ -507,9 +548,15 @@ pub(super) fn emit_executable(
 
     // ── Segment 3 (RW): .init_array + .fini_array + .dynamic + .got + .got.plt + .data + .bss ──
     file_offset = align_up(file_offset, PAGE_SIZE); vaddr = align_up(vaddr, PAGE_SIZE);
-    vaddr = (vaddr & !0xfff) | (file_offset & 0xfff);
-    if vaddr <= rodata_seg_vaddr_end {
-        vaddr = align_up(rodata_seg_vaddr_end, PAGE_SIZE) | (file_offset & 0xfff);
+    // If the linker script specifies a fixed address for .data, use it as the
+    // data segment start vaddr; otherwise use the standard sequential layout.
+    if let Some(data_addr) = script_addr_for(".data") {
+        vaddr = data_addr;
+    } else {
+        vaddr = (vaddr & !0xfff) | (file_offset & 0xfff);
+        if vaddr <= rodata_seg_vaddr_end {
+            vaddr = align_up(rodata_seg_vaddr_end, PAGE_SIZE) | (file_offset & 0xfff);
+        }
     }
 
     let data_seg_file_start = file_offset;
@@ -628,7 +675,7 @@ pub(super) fn emit_executable(
         bss_vaddr, data_seg_vaddr_end, data_seg_vaddr_start,
         text_seg_vaddr_end, dynamic_vaddr, is_static,
         init_array_vaddr, init_array_size, fini_array_vaddr, fini_array_size,
-        rel_iplt_vaddr, rel_iplt_size,
+        rel_iplt_vaddr, rel_iplt_size, effective_base,
     );
 
     // Override IFUNC symbol addresses to point to IPLT entries
@@ -828,10 +875,34 @@ pub(super) fn emit_executable(
         push_dyn(&mut dynamic_data, DT_NULL, 0);
     }
 
-    // Entry point
-    let entry_point = global_symbols.get("_start")
-        .map(|s| s.address)
-        .unwrap_or_else(|| global_symbols.get("main").map(|s| s.address).unwrap_or(BASE_ADDR));
+    // Entry point — for dynamically linked executables the entry point MUST
+    // be `_start` (the CRT startup routine that initialises the C runtime
+    // and calls `main`).  A linker script's `ENTRY(main)` is honoured only
+    // when linking a static/freestanding binary where `_start` is absent.
+    // This matches real-world behaviour: kernel linker scripts use
+    // `ENTRY(_start)` because the kernel is freestanding, while user-space
+    // dynamic binaries always need `_start` to set up argc/argv and invoke
+    // `__libc_start_main`.
+    let entry_point = if !is_static {
+        // Dynamic executable: always prefer _start; fall back to ENTRY()
+        // symbol only if _start is not defined.
+        global_symbols
+            .get("_start")
+            .map(|s| s.address)
+            .or_else(|| {
+                entry_override
+                    .and_then(|name| global_symbols.get(name))
+                    .map(|s| s.address)
+            })
+            .unwrap_or(effective_base)
+    } else {
+        // Static/freestanding: honour ENTRY() if present, otherwise _start.
+        let entry_sym = entry_override.unwrap_or("_start");
+        global_symbols
+            .get(entry_sym)
+            .map(|s| s.address)
+            .unwrap_or(effective_base)
+    };
 
     // Patch dynsym for copy-reloc symbols
     for name in &copy_syms_for_dynsym {
@@ -883,7 +954,7 @@ pub(super) fn emit_executable(
         write_ph(&mut output, &mut phdr_pos, PT_INTERP, interp_offset, interp_vaddr,
             interp_size, interp_size, PF_R, 1);
     }
-    write_ph(&mut output, &mut phdr_pos, PT_LOAD, 0, BASE_ADDR,
+    write_ph(&mut output, &mut phdr_pos, PT_LOAD, 0, effective_base,
         ro_headers_end, ro_headers_end, PF_R, PAGE_SIZE);
     write_ph(&mut output, &mut phdr_pos, PT_LOAD, text_seg_file_start, text_seg_vaddr_start,
         text_seg_file_end - text_seg_file_start, text_seg_vaddr_end - text_seg_vaddr_start,
@@ -1116,6 +1187,7 @@ fn assign_symbol_addresses(
     init_array_vaddr: u32, init_array_size: u32,
     fini_array_vaddr: u32, fini_array_size: u32,
     rel_iplt_vaddr: u32, rel_iplt_size: u32,
+    effective_base: u32,
 ) {
     global_symbols.entry("_GLOBAL_OFFSET_TABLE_".to_string()).or_insert(LinkerSymbol {
         address: got_base, size: 0, sym_type: STT_OBJECT, binding: STB_LOCAL,
@@ -1129,7 +1201,7 @@ fn assign_symbol_addresses(
     }
 
     let linker_addrs = LinkerSymbolAddresses {
-        base_addr: BASE_ADDR as u64,
+        base_addr: effective_base as u64,
         got_addr: got_base as u64,
         dynamic_addr: if is_static { 0 } else { dynamic_vaddr as u64 },
         bss_addr: bss_vaddr as u64,

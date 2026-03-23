@@ -187,12 +187,22 @@ impl<'a> ExprTypeChecker<'a> {
                 }
             }
 
-            // Dereference peels off one Pointer/Array layer
+            // Dereference peels off one Pointer/Array layer.
+            // Handles _Atomic(ptr), restrict(ptr), and VLA transparently.
             Expr::Deref(inner, _) => {
                 if let Some(inner_ct) = self.infer_expr_ctype(inner) {
+                    // Strip _Atomic and restrict qualifiers before dereferencing,
+                    // so that *(_Atomic int*) and *(restrict int*) produce int.
+                    let inner_ct = inner_ct.into_strip_atomic();
+                    let inner_ct = match inner_ct {
+                        CType::Restrict(r) => *r,
+                        other => other,
+                    };
                     match inner_ct {
                         CType::Pointer(pointee, _) => Some(*pointee),
                         CType::Array(elem, _) => Some(*elem),
+                        // VLA dereference: treat like array element access
+                        CType::Vla(elem) => Some(*elem),
                         // Dereferencing a function is a no-op in C
                         CType::Function(_) => Some(inner_ct),
                         _ => None,
@@ -202,21 +212,37 @@ impl<'a> ExprTypeChecker<'a> {
                 }
             }
 
-            // Array subscript peels off one Array/Pointer layer
+            // Array subscript peels off one Array/Pointer layer.
+            // Handles _Atomic, restrict, and VLA types transparently.
             Expr::ArraySubscript(base, index, _) => {
                 // Try base first (arr[i])
                 if let Some(base_ct) = self.infer_expr_ctype(base) {
+                    // Strip _Atomic/restrict before subscript resolution
+                    let base_ct = base_ct.into_strip_atomic();
+                    let base_ct = match base_ct {
+                        CType::Restrict(r) => *r,
+                        other => other,
+                    };
                     match base_ct {
                         CType::Array(elem, _) => return Some(*elem),
                         CType::Pointer(pointee, _) => return Some(*pointee),
+                        // VLA subscript: access element type like a regular array
+                        CType::Vla(elem) => return Some(*elem),
                         _ => {}
                     }
                 }
                 // Reverse subscript (i[arr])
                 if let Some(idx_ct) = self.infer_expr_ctype(index) {
+                    // Strip _Atomic/restrict for the reverse case too
+                    let idx_ct = idx_ct.into_strip_atomic();
+                    let idx_ct = match idx_ct {
+                        CType::Restrict(r) => *r,
+                        other => other,
+                    };
                     match idx_ct {
                         CType::Array(elem, _) => return Some(*elem),
                         CType::Pointer(pointee, _) => return Some(*pointee),
+                        CType::Vla(elem) => return Some(*elem),
                         _ => {}
                     }
                 }
@@ -362,6 +388,18 @@ impl<'a> ExprTypeChecker<'a> {
         let lct = self.infer_expr_ctype(lhs);
         let rct = self.infer_expr_ctype(rhs);
 
+        // C11: Strip _Atomic and restrict qualifiers for binary operation type inference.
+        // Binary operations on _Atomic int variables produce int (not _Atomic int).
+        // restrict is an optimization hint and does not affect result types.
+        let lct = lct.map(|t| {
+            let t = t.into_strip_atomic();
+            match t { CType::Restrict(inner) => *inner, other => other }
+        });
+        let rct = rct.map(|t| {
+            let t = t.into_strip_atomic();
+            match t { CType::Restrict(inner) => *inner, other => other }
+        });
+
         // Shift operators: result type is the promoted type of the left operand
         if matches!(op, BinOp::Shl | BinOp::Shr) {
             if let Some(l) = lct {
@@ -394,6 +432,17 @@ impl<'a> ExprTypeChecker<'a> {
                         }
                         return Some(CType::Pointer(elem.clone(), AddressSpace::Default));
                     }
+                    // VLA decays to pointer like a regular array for arithmetic.
+                    CType::Vla(elem) => {
+                        if *op == BinOp::Sub {
+                            if let Some(ref r) = rct {
+                                if r.is_pointer_like() {
+                                    return Some(CType::Long);
+                                }
+                            }
+                        }
+                        return Some(CType::Pointer(elem.clone(), AddressSpace::Default));
+                    }
                     _ => {}
                 }
             }
@@ -403,6 +452,8 @@ impl<'a> ExprTypeChecker<'a> {
                     match r {
                         CType::Pointer(_, _) => return rct,
                         CType::Array(elem, _) => return Some(CType::Pointer(elem.clone(), AddressSpace::Default)),
+                        // VLA decays to pointer like a regular array.
+                        CType::Vla(elem) => return Some(CType::Pointer(elem.clone(), AddressSpace::Default)),
                         _ => {}
                     }
                 }
@@ -460,6 +511,8 @@ impl<'a> ExprTypeChecker<'a> {
     }
 
     /// Extract the return CType from a function or function pointer type.
+    /// Transparently unwraps _Atomic and restrict qualifiers to reach the
+    /// underlying function or function pointer type.
     fn extract_return_ctype_from_type(ct: &CType) -> Option<CType> {
         match ct {
             CType::Function(ft) => Some(ft.return_type.clone()),
@@ -472,20 +525,44 @@ impl<'a> ExprTypeChecker<'a> {
                 },
                 other => Some(other.clone()),
             },
+            // _Atomic(func_ptr) or restrict(func_ptr): unwrap and re-dispatch
+            CType::Atomic(inner) => Self::extract_return_ctype_from_type(inner),
+            CType::Restrict(inner) => Self::extract_return_ctype_from_type(inner),
             _ => None,
         }
     }
 
     /// Infer the CType of a struct/union field access.
+    /// Strips _Atomic and restrict qualifiers from the base type so that
+    /// member access through `_Atomic struct S` or `restrict`-qualified
+    /// pointers resolves fields correctly.
     fn infer_field_ctype(&self, base_expr: &Expr, field_name: &str, is_pointer: bool) -> Option<CType> {
         let base_ctype = if is_pointer {
             match self.infer_expr_ctype(base_expr)? {
                 CType::Pointer(inner, _) => *inner,
                 CType::Array(inner, _) => *inner,
+                // _Atomic(struct_ptr) -> strip atomic, then dereference
+                CType::Atomic(inner) => match *inner {
+                    CType::Pointer(pointee, _) => *pointee,
+                    other => other,
+                },
+                // restrict(ptr) -> strip restrict, then dereference
+                CType::Restrict(inner) => match *inner {
+                    CType::Pointer(pointee, _) => *pointee,
+                    other => other,
+                },
                 _ => return None,
             }
         } else {
             self.infer_expr_ctype(base_expr)?
+        };
+
+        // Strip _Atomic and restrict qualifiers before struct/union field lookup.
+        // _Atomic struct S and struct S have the same field layout.
+        let base_ctype = base_ctype.into_strip_atomic();
+        let base_ctype = match base_ctype {
+            CType::Restrict(inner) => *inner,
+            other => other,
         };
 
         match &base_ctype {
@@ -504,32 +581,53 @@ impl<'a> ExprTypeChecker<'a> {
 
     /// Resolve a _Generic selection based on the controlling expression's type.
     fn infer_generic_selection_ctype(&self, controlling: &Expr, associations: &[GenericAssociation]) -> Option<CType> {
-        let controlling_ct = self.infer_expr_ctype(controlling);
-        let mut default_expr: Option<&Expr> = None;
+        let controlling_ct = self.infer_expr_ctype(controlling)?;
 
-        for assoc in associations {
+        // Build the association list for the shared eval_generic_selection utility.
+        // Each entry is (CType, Option<index>) where the index maps back to the
+        // original association list position.
+        let mut typed_assocs: Vec<(CType, Option<usize>)> = Vec::new();
+        let mut default_idx: Option<usize> = None;
+
+        for (i, assoc) in associations.iter().enumerate() {
             match &assoc.type_spec {
-                None => { default_expr = Some(&assoc.expr); }
+                None => { default_idx = Some(i); }
                 Some(type_spec) => {
                     let assoc_ct = self.resolve_type_spec(type_spec);
-                    if let Some(ref ctrl_ct) = controlling_ct {
-                        if self.ctype_matches_generic(ctrl_ct, &assoc_ct) {
-                            return self.infer_expr_ctype(&assoc.expr);
-                        }
-                    }
+                    typed_assocs.push((assoc_ct, Some(i)));
                 }
             }
         }
 
-        if let Some(def) = default_expr {
-            return self.infer_expr_ctype(def);
+        // Use the shared selection algorithm from common::const_eval.
+        let compat_fn = |ctrl: &CType, assoc: &CType| -> bool {
+            self.ctype_matches_generic(ctrl, assoc)
+        };
+        let selected = crate::common::const_eval::eval_generic_selection(
+            &controlling_ct,
+            &typed_assocs,
+            default_idx,
+            &compat_fn,
+        );
+
+        // Resolve the selected association's expression type.
+        if let Some(idx) = selected {
+            self.infer_expr_ctype(&associations[idx].expr)
+        } else {
+            None
         }
-        None
     }
 
     /// Check if two CTypes match for _Generic selection purposes.
     /// Uses compatible-type rules: ignores qualifiers, matches arrays with pointers.
+    /// Per C11 §6.5.1.1p2, the controlling expression's type is determined after
+    /// lvalue conversion, which removes qualifiers including _Atomic and restrict.
     fn ctype_matches_generic(&self, controlling: &CType, assoc: &CType) -> bool {
+        // C11 §6.5.1.1p2: Strip _Atomic and restrict qualifiers before comparison.
+        // Lvalue conversion removes type qualifiers, so _Atomic int matches int.
+        let controlling = controlling.strip_atomic().strip_restrict();
+        let assoc = assoc.strip_atomic().strip_restrict();
+
         // Exact match
         if std::mem::discriminant(controlling) == std::mem::discriminant(assoc) {
             match (controlling, assoc) {
@@ -547,6 +645,12 @@ impl<'a> ExprTypeChecker<'a> {
         }
         // Array decays to pointer for _Generic matching
         if let CType::Array(elem, _) = controlling {
+            if let CType::Pointer(pointee, _) = assoc {
+                return self.ctype_matches_generic(elem, pointee);
+            }
+        }
+        // VLA decays to pointer for _Generic matching, just like regular arrays.
+        if let CType::Vla(elem) = controlling {
             if let CType::Pointer(pointee, _) = assoc {
                 return self.ctype_matches_generic(elem, pointee);
             }
@@ -586,6 +690,10 @@ impl<'a> ExprTypeChecker<'a> {
             TypeSpecifier::ComplexFloat => CType::ComplexFloat,
             TypeSpecifier::ComplexDouble => CType::ComplexDouble,
             TypeSpecifier::ComplexLongDouble => CType::ComplexLongDouble,
+            TypeSpecifier::Atomic(inner) => {
+                let inner_ct = self.resolve_type_spec(inner);
+                CType::Atomic(Box::new(inner_ct))
+            }
             TypeSpecifier::Pointer(inner, addr_space) => {
                 CType::Pointer(Box::new(self.resolve_type_spec(inner)), *addr_space)
             }
@@ -764,11 +872,11 @@ impl<'a> ExprTypeChecker<'a> {
                 DerivedDeclarator::Pointer => {
                     ctype = CType::Pointer(Box::new(ctype), AddressSpace::Default);
                 }
-                DerivedDeclarator::Array(Some(size_expr)) => {
+                DerivedDeclarator::Array { size: Some(size_expr), .. } => {
                     let size = self.eval_const_expr(size_expr).unwrap_or(0) as usize;
                     ctype = CType::Array(Box::new(ctype), Some(size));
                 }
-                DerivedDeclarator::Array(None) => {
+                DerivedDeclarator::Array { size: None, .. } => {
                     ctype = CType::Array(Box::new(ctype), None);
                 }
                 _ => {} // Function/FunctionPointer not expected in struct fields
@@ -881,11 +989,11 @@ impl<'a> ExprTypeChecker<'a> {
                             DerivedDeclarator::Pointer => {
                                 ctype = CType::Pointer(Box::new(ctype), AddressSpace::Default);
                             }
-                            DerivedDeclarator::Array(Some(size_expr)) => {
+                            DerivedDeclarator::Array { size: Some(size_expr), .. } => {
                                 let size = self.eval_const_expr(size_expr).unwrap_or(0) as usize;
                                 ctype = CType::Array(Box::new(ctype), Some(size));
                             }
-                            DerivedDeclarator::Array(None) => {
+                            DerivedDeclarator::Array { size: None, .. } => {
                                 ctype = CType::Array(Box::new(ctype), None);
                             }
                             _ => {} // Function/FunctionPointer not expected here
@@ -936,9 +1044,16 @@ impl<'a> ExprTypeChecker<'a> {
             Expr::Deref(inner, _) => {
                 let inner_ct = self.infer_expr_ctype(inner)
                     .or_else(|| self.infer_expr_ctype_with_scope(inner, scope))?;
+                // Strip _Atomic/restrict qualifiers before dereferencing
+                let inner_ct = inner_ct.into_strip_atomic();
+                let inner_ct = match inner_ct {
+                    CType::Restrict(r) => *r,
+                    other => other,
+                };
                 match inner_ct {
                     CType::Pointer(pointee, _) => Some(*pointee),
                     CType::Array(elem, _) => Some(*elem),
+                    CType::Vla(elem) => Some(*elem),
                     _ => None,
                 }
             }

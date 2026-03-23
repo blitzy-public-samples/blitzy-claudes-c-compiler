@@ -203,6 +203,20 @@ impl Lowerer {
             return Some(result);
         }
 
+        // Handle NEON intrinsic builtins (__builtin_neon_* or short-form vXXX names).
+        // These map directly to IntrinsicOp::Neon* variants for AArch64 backend emission.
+        if let Some(neon_op) = crate::ir::intrinsics::resolve_neon_intrinsic(name) {
+            let arg_vals: Vec<Operand> = args.iter().map(|a| self.lower_expr(a)).collect();
+            let dest = self.fresh_value();
+            self.emit(Instruction::Intrinsic {
+                dest: Some(dest),
+                dest_ptr: None,
+                op: neon_op,
+                args: arg_vals,
+            });
+            return Some(Operand::Value(dest));
+        }
+
         let builtin_info = builtins::resolve_builtin(name)?;
         match &builtin_info.kind {
             BuiltinKind::LibcAlias(libc_name) => {
@@ -890,5 +904,11 @@ fn classify_ctype(ty: &CType) -> i64 {
         CType::Struct(_) => 12,      // record_type_class
         CType::Union(_) => 13,       // union_type_class
         CType::Vector(_, _) => 14,   // array_type_class (GCC classifies vectors here)
+        // _Atomic qualifier: classify based on inner type
+        CType::Atomic(inner) => classify_ctype(inner),
+        // restrict-qualified pointer: pointer_type_class
+        CType::Restrict(_) => 5,     // pointer_type_class
+        // VLA: decays to pointer like arrays
+        CType::Vla(_) => 5,          // pointer_type_class (VLA decays to pointer)
     }
 }

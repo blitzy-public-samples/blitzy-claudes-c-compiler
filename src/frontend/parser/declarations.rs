@@ -10,6 +10,7 @@
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::source::Span;
 use crate::common::types::AddressSpace;
+use crate::common::const_eval as shared_const_eval;
 use crate::frontend::lexer::token::TokenKind;
 use super::ast::*;
 use super::parse::{ModeKind, ParsedDeclAttrs, Parser};
@@ -34,6 +35,7 @@ struct DeclContext {
 }
 
 impl Parser {
+    // grammar: external-declaration
     pub(super) fn parse_external_decl(&mut self) -> Option<ExternalDecl> {
         // Reset all declaration-level flags before parsing the next declaration.
         self.attrs = ParsedDeclAttrs::default();
@@ -129,6 +131,7 @@ impl Parser {
             d.set_typedef(self.attrs.parsing_typedef());
             d.set_const(self.attrs.parsing_const());
             d.set_volatile(self.attrs.parsing_volatile());
+            d.set_restrict(self.attrs.is_restrict());
             d.set_thread_local(self.attrs.parsing_thread_local());
             return Some(ExternalDecl::Declaration(d));
         }
@@ -143,8 +146,39 @@ impl Parser {
         // Merge alignment from _Alignas (type specifier), declarator attrs, and post-declarator attrs.
         // Per C11, alignment can only increase (6.7.5), so take the maximum.
         let mut merged_alignment = self.attrs.parsed_alignas.take();
+        let has_c11_alignas = self.attrs.has_c11_alignas();
+        self.attrs.set_c11_alignas(false);
         let alignas_type = self.attrs.parsed_alignas_type.take();
         let alignment_sizeof_type = self.attrs.parsed_alignment_sizeof_type.take();
+        // Validate _Alignas constraints before merging with __attribute__((aligned(N))).
+        // __attribute__((aligned(N))) has different rules (allows any positive value),
+        // so only _Alignas values are checked here (guarded by has_c11_alignas flag).
+        if has_c11_alignas {
+            if let Some(alignas_val) = merged_alignment {
+                // C11 §6.7.5: _Alignas(N) requires N to be a power of 2.
+                // Use shared validate_alignas utility for consistent validation.
+                if let Err(msg) = crate::common::type_builder::validate_alignas(alignas_val) {
+                    self.emit_error(format!("_Alignas: {}", msg), start);
+                }
+                // C11 §6.7.5: _Alignas cannot reduce alignment below the natural
+                // alignment of the declared type.
+                let tag_aligns = if self.struct_tag_alignments.is_empty() {
+                    None
+                } else {
+                    Some(&self.struct_tag_alignments)
+                };
+                let natural = Self::alignof_type_spec(&type_spec, tag_aligns);
+                if alignas_val > 0 && alignas_val < natural {
+                    self.diagnostics.warning(
+                        format!(
+                            "requested alignment is less than minimum alignment of {} for type",
+                            natural
+                        ),
+                        start,
+                    );
+                }
+            }
+        }
         for a in [decl_aligned, post_aligned].iter().copied().flatten() {
             merged_alignment = Some(merged_alignment.map_or(a, |prev| prev.max(a)));
         }
@@ -154,6 +188,7 @@ impl Parser {
         // Capture alias/weak/visibility/section/error attributes
         let is_weak = self.attrs.parsing_weak();
         let alias_target = self.attrs.parsing_alias_target.take();
+        let ifunc_resolver = self.attrs.parsing_ifunc_resolver.take();
         // Use explicit __attribute__((visibility(...))) if present, otherwise fall back
         // to the current #pragma GCC visibility default (if any).
         let visibility = self.attrs.parsing_visibility.take()
@@ -177,7 +212,9 @@ impl Parser {
         decl_attrs.set_used(is_used);
         decl_attrs.set_fastcall(is_fastcall);
         decl_attrs.set_naked(is_naked);
+        decl_attrs.set_deprecated(self.attrs.parsing_deprecated());
         decl_attrs.alias_target = alias_target;
+        decl_attrs.ifunc_resolver = ifunc_resolver;
         decl_attrs.visibility = visibility;
         decl_attrs.section = section;
         decl_attrs.asm_register = first_asm_reg;
@@ -210,6 +247,7 @@ impl Parser {
         }
     }
 
+    // grammar: function-definition
     /// Parse the rest of a function definition after the declarator.
     fn parse_function_def(
         &mut self,
@@ -240,6 +278,15 @@ impl Parser {
         let is_gnu_inline = self.attrs.parsing_gnu_inline();
         let is_always_inline = self.attrs.parsing_always_inline();
         let is_noinline = self.attrs.parsing_noinline();
+        // Capture extended function attributes before parse_compound_stmt
+        // resets attr state. These flags flow from ParsedDeclAttrs to the
+        // FunctionAttributes on the AST FunctionDef node.
+        let is_warn_unused_result = self.attrs.parsing_warn_unused_result();
+        let is_malloc = self.attrs.parsing_malloc();
+        let is_pure = self.attrs.parsing_pure();
+        let is_const_attr = self.attrs.parsing_const_attr();
+        let is_cold = self.attrs.parsing_cold();
+        let is_hot = self.attrs.parsing_hot();
 
         // Build return type from derived declarators
         let return_type = self.build_return_type(type_spec, &derived);
@@ -281,6 +328,13 @@ impl Parser {
                 attrs.set_fastcall(decl_attrs.is_fastcall());
                 attrs.set_naked(decl_attrs.is_naked());
                 attrs.set_noreturn(decl_attrs.is_noreturn());
+                attrs.set_warn_unused_result(is_warn_unused_result);
+                attrs.set_malloc(is_malloc);
+                attrs.set_pure(is_pure);
+                attrs.set_const_attr(is_const_attr);
+                attrs.set_cold(is_cold);
+                attrs.set_hot(is_hot);
+                attrs.set_deprecated(decl_attrs.is_deprecated());
                 attrs.section = decl_attrs.section;
                 attrs.visibility = decl_attrs.visibility;
                 attrs.symver = decl_attrs.symver;
@@ -306,7 +360,7 @@ impl Parser {
             // Apply post-Function derivations (Array/Pointer)
             for d in &derived[fpos+1..] {
                 match d {
-                    DerivedDeclarator::Array(size_expr) => {
+                    DerivedDeclarator::Array { size: size_expr, .. } => {
                         return_type = TypeSpecifier::Array(
                             Box::new(return_type),
                             size_expr.clone(),
@@ -324,7 +378,7 @@ impl Parser {
                     DerivedDeclarator::Pointer => {
                         return_type = TypeSpecifier::Pointer(Box::new(return_type), AddressSpace::Default);
                     }
-                    DerivedDeclarator::Array(size_expr) => {
+                    DerivedDeclarator::Array { size: size_expr, .. } => {
                         return_type = TypeSpecifier::Array(
                             Box::new(return_type),
                             size_expr.clone(),
@@ -347,6 +401,7 @@ impl Parser {
         return_type
     }
 
+    // grammar: declaration-list (K&R parameters)
     /// Parse K&R-style parameter declarations.
     /// In K&R style, the parameter list is just names, and type declarations follow.
     fn parse_kr_params(&mut self, mut kr_params: Vec<ParamDecl>) -> Vec<ParamDecl> {
@@ -452,7 +507,7 @@ impl Parser {
         }
         // Collect array dimensions
         let array_dims: Vec<_> = pderived.iter().filter_map(|d| {
-            if let DerivedDeclarator::Array(size) = d {
+            if let DerivedDeclarator::Array { size, .. } = d {
                 Some(size.clone())
             } else {
                 None
@@ -474,6 +529,7 @@ impl Parser {
         (full_type, None)
     }
 
+    // grammar: declaration
     /// Parse the rest of a declaration (not a function definition).
     fn parse_declaration_rest(
         &mut self,
@@ -518,6 +574,9 @@ impl Parser {
         if let Some(ref target) = self.attrs.parsing_alias_target {
             last_decl.attrs.alias_target = Some(target.clone());
         }
+        if let Some(ref resolver) = self.attrs.parsing_ifunc_resolver {
+            last_decl.attrs.ifunc_resolver = Some(resolver.clone());
+        }
         if let Some(ref vis) = self.attrs.parsing_visibility {
             last_decl.attrs.visibility = Some(vis.clone());
         }
@@ -544,6 +603,7 @@ impl Parser {
         }
         self.attrs.set_weak(false);
         self.attrs.parsing_alias_target = None;
+        self.attrs.parsing_ifunc_resolver = None;
         self.attrs.parsing_visibility = None;
         self.attrs.parsing_section = None;
         self.attrs.set_error_attr(false);
@@ -637,6 +697,7 @@ impl Parser {
         d.set_typedef(is_typedef);
         d.set_const(self.attrs.parsing_const());
         d.set_volatile(self.attrs.parsing_volatile());
+        d.set_restrict(self.attrs.is_restrict());
         d.set_common(ctx.is_common);
         d.set_thread_local(self.attrs.parsing_thread_local());
         d.set_transparent_union(is_transparent_union);
@@ -644,6 +705,7 @@ impl Parser {
         Some(ExternalDecl::Declaration(d))
     }
 
+    // grammar: declaration (block-scope)
     pub(super) fn parse_local_declaration(&mut self) -> Option<Declaration> {
         let start = self.peek_span();
         // Selective reset: only storage-class/qualifier flags need clearing here.
@@ -658,6 +720,7 @@ impl Parser {
         self.attrs.set_inline(false);
         self.attrs.set_const(false);
         self.attrs.set_volatile(false);
+        self.attrs.set_restrict(false);
         self.attrs.parsing_address_space = AddressSpace::Default;
         let type_spec = self.parse_type_specifier()?;
 
@@ -685,6 +748,7 @@ impl Parser {
             d.set_typedef(self.attrs.parsing_typedef());
             d.set_const(self.attrs.parsing_const());
             d.set_volatile(self.attrs.parsing_volatile());
+            d.set_restrict(self.attrs.is_restrict());
             d.set_thread_local(self.attrs.parsing_thread_local());
             return Some(d);
         }
@@ -725,6 +789,9 @@ impl Parser {
                     da.set_error_attr(self.attrs.parsing_error_attr());
                     if let Some(ref target) = self.attrs.parsing_alias_target {
                         da.alias_target = Some(target.clone());
+                    }
+                    if let Some(ref resolver) = self.attrs.parsing_ifunc_resolver {
+                        da.ifunc_resolver = Some(resolver.clone());
                     }
                     if let Some(ref vis) = self.attrs.parsing_visibility {
                         da.visibility = Some(vis.clone());
@@ -769,8 +836,37 @@ impl Parser {
 
         self.expect_after(&TokenKind::Semicolon, "after declaration");
         // Merge alignment from _Alignas (captured in parsed_alignas during type specifier parsing)
-        // with alignment from __attribute__((aligned(N))) on declarators
+        // with alignment from __attribute__((aligned(N))) on declarators.
+        // Validate _Alignas constraints before merging: __attribute__((aligned(N)))
+        // has different rules, so only _Alignas values are checked (guarded by
+        // has_c11_alignas flag).
+        let has_c11_alignas = self.attrs.has_c11_alignas();
+        self.attrs.set_c11_alignas(false);
         if let Some(a) = self.attrs.parsed_alignas.take() {
+            if has_c11_alignas {
+                // C11 §6.7.5: _Alignas(N) requires N to be a power of 2.
+                // Use shared validate_alignas utility for consistent validation.
+                if let Err(msg) = crate::common::type_builder::validate_alignas(a) {
+                    self.emit_error(format!("_Alignas: {}", msg), start);
+                }
+                // C11 §6.7.5: _Alignas cannot reduce alignment below the natural
+                // alignment of the declared type.
+                let tag_aligns = if self.struct_tag_alignments.is_empty() {
+                    None
+                } else {
+                    Some(&self.struct_tag_alignments)
+                };
+                let natural = Self::alignof_type_spec(&type_spec, tag_aligns);
+                if a > 0 && a < natural {
+                    self.diagnostics.warning(
+                        format!(
+                            "requested alignment is less than minimum alignment of {} for type",
+                            natural
+                        ),
+                        start,
+                    );
+                }
+            }
             alignment = Some(alignment.map_or(a, |prev| prev.max(a)));
         }
         let alignas_type = self.attrs.parsed_alignas_type.take();
@@ -791,11 +887,13 @@ impl Parser {
         d.set_typedef(is_typedef);
         d.set_const(self.attrs.parsing_const());
         d.set_volatile(self.attrs.parsing_volatile());
+        d.set_restrict(self.attrs.is_restrict());
         d.set_thread_local(self.attrs.parsing_thread_local());
         d.set_transparent_union(is_transparent_union);
         Some(d)
     }
 
+    // grammar: initializer
     /// Parse an initializer: either a braced initializer list or a single expression.
     pub(super) fn parse_initializer(&mut self) -> Initializer {
         if matches!(self.peek(), TokenKind::LBrace) {
@@ -1125,12 +1223,13 @@ impl Parser {
                 TokenKind::Extern => { self.advance(); self.attrs.set_extern(true); }
                 TokenKind::Const => { self.advance(); self.attrs.set_const(true); }
                 TokenKind::Volatile => { self.advance(); self.attrs.set_volatile(true); }
-                TokenKind::Restrict
-                | TokenKind::Inline | TokenKind::Register | TokenKind::Auto => { self.advance(); }
+                TokenKind::Restrict => { self.advance(); self.attrs.set_restrict(true); }
+                TokenKind::Inline | TokenKind::Register | TokenKind::Auto => { self.advance(); }
                 TokenKind::SegGs => { self.advance(); self.attrs.parsing_address_space = AddressSpace::SegGs; }
                 TokenKind::SegFs => { self.advance(); self.attrs.parsing_address_space = AddressSpace::SegFs; }
                 TokenKind::Alignas => {
                     self.advance();
+                    self.attrs.set_c11_alignas(true);
                     if let Some(align) = self.parse_alignas_argument() {
                         self.attrs.parsed_alignas = Some(self.attrs.parsed_alignas.map_or(align, |prev| prev.max(align)));
                     }
@@ -1206,6 +1305,7 @@ impl Parser {
         }
     }
 
+    // grammar: static_assert-declaration
     /// Parse and evaluate `_Static_assert(constant-expr, "message")` or
     /// the C23 single-argument form `_Static_assert(constant-expr)`.
     ///
@@ -1241,36 +1341,54 @@ impl Parser {
         self.expect_closing(&TokenKind::RParen, open);
         self.consume_if(&TokenKind::Semicolon);
 
-        // Evaluate the constant expression
-        let enums = if self.enum_constants.is_empty() {
-            None
-        } else {
-            Some(&self.enum_constants)
+        // Evaluate the constant expression using the shared eval_static_assert_expr
+        // utility, which delegates to the parser's constant evaluator.
+        let eval_result = {
+            let enums = if self.enum_constants.is_empty() {
+                None
+            } else {
+                Some(&self.enum_constants)
+            };
+            let tag_aligns = if self.struct_tag_alignments.is_empty() {
+                None
+            } else {
+                Some(&self.struct_tag_alignments)
+            };
+            let eval_fn = |e: &Expr| -> Option<crate::ir::constants::IrConst> {
+                Self::eval_const_int_expr_with_enums(e, enums, tag_aligns)
+                    .map(|v| crate::ir::constants::IrConst::I64(v as i64))
+            };
+            shared_const_eval::eval_static_assert_expr(&expr, &eval_fn)
         };
-        let tag_aligns = if self.struct_tag_alignments.is_empty() {
-            None
-        } else {
-            Some(&self.struct_tag_alignments)
-        };
-        let unevaluable = if self.unevaluable_enum_constants.is_empty() {
-            None
-        } else {
-            Some(&self.unevaluable_enum_constants)
-        };
-        if let Some(value) = Self::eval_const_int_expr_with_enums(&expr, enums, tag_aligns) {
-            if value == 0 {
-                // Static assertion failed
-                let msg = if let Some(ref m) = message {
-                    format!("static assertion failed: {}", m)
-                } else {
-                    "static assertion failed".to_string()
-                };
+        match eval_result {
+            Ok(true) => { /* assertion passed — nothing to emit */ }
+            Ok(false) => {
+                // Static assertion failed — use sema-level formatter for
+                // consistent error message formatting.
+                let msg = crate::frontend::sema::const_eval::SemaConstEval::format_static_assert_error(
+                    message.as_deref(),
+                    "<expr>",
+                );
                 self.emit_error(msg, assert_span);
             }
-        } else if Self::expr_has_non_const_identifier(&expr, enums, unevaluable) {
-            // The expression references variables or non-enum identifiers, which
-            // means it's definitely not a valid integer constant expression (C11 6.6).
-            self.emit_error("expression in static assertion is not an integer constant expression", assert_span);
+            Err(_) => {
+                // Could not evaluate — check if the expression uses non-const identifiers
+                let enums2 = if self.enum_constants.is_empty() {
+                    None
+                } else {
+                    Some(&self.enum_constants)
+                };
+                let unevaluable = if self.unevaluable_enum_constants.is_empty() {
+                    None
+                } else {
+                    Some(&self.unevaluable_enum_constants)
+                };
+                if Self::expr_has_non_const_identifier(&expr, enums2, unevaluable) {
+                    // The expression references variables or non-enum identifiers, which
+                    // means it's definitely not a valid integer constant expression (C11 6.6).
+                    self.emit_error("expression in static assertion is not an integer constant expression", assert_span);
+                }
+            }
         }
         // If we can't evaluate the expression but it doesn't contain variable
         // references (e.g. sizeof, offsetof, compiler builtins), silently accept.

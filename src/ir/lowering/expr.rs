@@ -15,6 +15,7 @@ use crate::frontend::parser::ast::{
     UnaryOp,
 };
 use crate::ir::reexports::{
+    AtomicOrdering,
     Instruction,
     IrBinOp,
     IrCmpOp,
@@ -261,6 +262,13 @@ impl Lowerer {
             if matches!(ct, CType::Function(_)) {
                 return Operand::Value(addr);
             }
+            // Use AtomicLoad for _Atomic-qualified global variables (C11 default: SeqCst)
+            if ct.is_atomic() {
+                let dest = self.emit_atomic_load(
+                    Operand::Value(addr), ginfo.ty, AtomicOrdering::SeqCst
+                );
+                return Operand::Value(dest);
+            }
         }
         let dest = self.fresh_value();
         self.emit(Instruction::Load { dest, ptr: addr, ty: ginfo.ty, seg_override: ginfo.address_space });
@@ -285,6 +293,7 @@ impl Lowerer {
             let is_struct = info.is_struct;
             let is_complex = info.c_type.as_ref().is_some_and(|ct| ct.is_complex());
             let is_vector = info.c_type.as_ref().is_some_and(|ct| ct.is_vector());
+            let is_atomic = info.c_type.as_ref().is_some_and(|ct| ct.is_atomic());
             let static_global_name = info.static_global_name.clone();
             let asm_register = info.asm_register.clone();
             let asm_register_has_init = info.asm_register_has_init;
@@ -312,6 +321,13 @@ impl Lowerer {
                 if is_array || is_struct || is_vector {
                     return Operand::Value(addr);
                 }
+                // Use AtomicLoad for _Atomic-qualified static local variables (C11 default: SeqCst)
+                if is_atomic {
+                    let dest = self.emit_atomic_load(
+                        Operand::Value(addr), ty, AtomicOrdering::SeqCst
+                    );
+                    return Operand::Value(dest);
+                }
                 let dest = self.fresh_value();
                 self.emit(Instruction::Load { dest, ptr: addr, ty , seg_override: AddressSpace::Default });
                 return Operand::Value(dest);
@@ -321,6 +337,13 @@ impl Lowerer {
             }
             if is_complex || is_vector {
                 return Operand::Value(alloca);
+            }
+            // Use AtomicLoad for _Atomic-qualified local variables (C11 default: SeqCst)
+            if is_atomic {
+                let dest = self.emit_atomic_load(
+                    Operand::Value(alloca), ty, AtomicOrdering::SeqCst
+                );
+                return Operand::Value(dest);
             }
             let dest = self.fresh_value();
             self.emit(Instruction::Load { dest, ptr: alloca, ty , seg_override: AddressSpace::Default });

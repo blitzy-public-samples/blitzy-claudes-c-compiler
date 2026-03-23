@@ -1,0 +1,11 @@
+access_anon_a: OK
+access_anon_b: OK
+offset_x: OK
+offset_a: OK
+offset_b: OK
+offset_y: OK
+sizeof_struct: OK
+store_load_all: OK
+return_struct: OK
+anon_no_overlap: OK
+All anonymous struct tests passed

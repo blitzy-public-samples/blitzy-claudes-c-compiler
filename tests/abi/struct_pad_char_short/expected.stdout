@@ -1,0 +1,6 @@
+sizeof_PadCharShort: OK
+offsetof_a: OK
+offsetof_b: OK
+alignof_PadCharShort: OK
+value_check: OK
+All struct_pad_char_short tests passed

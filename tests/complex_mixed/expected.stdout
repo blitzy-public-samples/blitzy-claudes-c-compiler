@@ -1,0 +1,14 @@
+real+complex: 4.0 2.0
+complex+real: 4.0 2.0
+real*complex: 6.0 8.0
+complex*real: 6.0 8.0
+real-complex: 4.0 -2.0
+complex-real: -4.0 2.0
+complex/real: 3.0 4.0
+int+complex: 4.0 2.0
+float+cdouble: 4.0 3.5
+cfloat+double: 3.0 1.0
+real_to_complex: 42.0 0.0
+complex_to_real: 7.0
+chain: 12.0 6.0
+neg_mixed: -4.0 -4.0

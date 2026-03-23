@@ -109,11 +109,15 @@ impl Lowerer {
             }
         }
 
-        // Scalar constant
+        // Scalar constant — but skip complex constants that should be handled
+        // by eval_complex_global_init above (this guards against fallthrough
+        // from a failed complex evaluation).
         if let Some(val) = self.eval_const_expr(expr) {
-            return GlobalInit::Scalar(
-                self.coerce_scalar_const(val, expr, base_ty, is_long_double_target, is_bool_target)
-            );
+            if !Self::is_complex_constant(&val) {
+                return GlobalInit::Scalar(
+                    self.coerce_scalar_const(val, expr, base_ty, is_long_double_target, is_bool_target)
+                );
+            }
         }
 
         // String literal (narrow, wide, or char16)

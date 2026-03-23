@@ -107,7 +107,7 @@ pub(super) fn optimize_tail_calls(store: &mut LineStore, infos: &mut [LineInfo])
 
         // Check if the sequence after it is purely epilogue
         // (callee-save restores + frame teardown + ret).
-        if let Some(ret_idx) = is_tail_call_candidate(store, infos, i, len) {
+        if let Some(tci) = is_tail_call_candidate(store, infos, i, len) {
             // Extract the call target
             let call_line = store.get(i);
             let trimmed = &call_line[infos[i].trim_start as usize..];
@@ -116,8 +116,14 @@ pub(super) fn optimize_tail_calls(store: &mut LineStore, infos: &mut [LineInfo])
                 // NOP the call
                 mark_nop(&mut infos[i]);
 
+                // NOP any dead stores between call and epilogue (e.g., storing
+                // return value to a stack slot that is never loaded before ret).
+                for &ds_idx in &tci.dead_store_indices {
+                    mark_nop(&mut infos[ds_idx]);
+                }
+
                 // Replace the `ret` with `jmp TARGET`
-                replace_line(store, &mut infos[ret_idx], ret_idx,
+                replace_line(store, &mut infos[tci.ret_idx], tci.ret_idx,
                     format!("    {}", jmp_text));
 
                 changed = true;
@@ -130,11 +136,26 @@ pub(super) fn optimize_tail_calls(store: &mut LineStore, infos: &mut [LineInfo])
     changed
 }
 
+/// Result of a successful tail call candidate check.
+struct TailCallInfo {
+    /// Index of the `ret` instruction to replace with `jmp`.
+    ret_idx: usize,
+    /// Indices of dead store instructions (StoreRbp) between the call and
+    /// epilogue that should be NOPed when applying TCO. These are stores
+    /// to stack slots that are never loaded back before the ret.
+    dead_store_indices: Vec<usize>,
+}
+
 /// Check if the instructions after a call at position `call_idx` form a pure
-/// epilogue sequence ending in `ret`. Returns the index of the `ret` if so.
+/// epilogue sequence ending in `ret`. Returns a `TailCallInfo` if so.
 ///
 /// The allowed pattern between call and ret:
 /// - LoadRbp (callee-save restores): movq offset(%rbp), %REG
+/// - StoreRbp (dead stores to stack): movq %REG, offset(%rbp) — only if the
+///   stored offset is never subsequently loaded before ret. This handles the
+///   common pattern where codegen stores the return value to a local variable
+///   that is never read in the epilogue (a dead store that would be cleaned up
+///   by a later peephole phase, but TCO needs to tolerate it now).
 /// - Other with text "movq %rbp, %rsp" (stack frame teardown)
 /// - Pop with reg being rbp (popq %rbp)
 /// - Directive lines (.cfi_*)
@@ -145,12 +166,18 @@ fn is_tail_call_candidate(
     infos: &[LineInfo],
     call_idx: usize,
     len: usize,
-) -> Option<usize> {
+) -> Option<TailCallInfo> {
     // Limit how far we scan forward
     let limit = (call_idx + 30).min(len);
 
     let mut found_frame_teardown = false;
     let mut found_pop_rbp = false;
+
+    // Track StoreRbp instructions and their stack offsets for dead store analysis.
+    // A store is "dead" if no subsequent LoadRbp reads from the same offset.
+    let mut store_indices: Vec<usize> = Vec::new();
+    let mut store_offsets: Vec<i32> = Vec::new();
+
     let mut j = call_idx + 1;
 
     while j < limit {
@@ -168,10 +195,27 @@ fn is_tail_call_candidate(
                 j += 1;
                 continue;
             }
-            LineKind::LoadRbp { reg, .. } => {
-                // Callee-save restore from stack - OK, but must not restore to %rax (reg 0)
+            LineKind::StoreRbp { offset, .. } => {
+                // Store to a stack slot. This is potentially a dead store that
+                // codegen emitted (e.g., storing the return value to a local).
+                // We allow it provisionally and verify it's truly dead (the
+                // offset is not loaded back) when we see the ret or any LoadRbp.
+                store_indices.push(j);
+                store_offsets.push(offset);
+                j += 1;
+                continue;
+            }
+            LineKind::LoadRbp { reg, offset, .. } => {
+                // Callee-save restore from stack — OK, but must not restore to
+                // %rax (reg 0) which would clobber the return value.
                 if reg == 0 {
-                    return None; // Writing to %rax would clobber the return value
+                    return None;
+                }
+                // Check if this load reads from an offset we previously stored.
+                // If so, the store is live (not dead) and the pattern is not a
+                // pure epilogue — bail out.
+                if store_offsets.contains(&offset) {
+                    return None;
                 }
                 j += 1;
                 continue;
@@ -183,11 +227,11 @@ fn is_tail_call_candidate(
                     j += 1;
                     continue;
                 }
-                // Any other instruction that writes a register - check if it's rax
+                // Any other instruction that writes a register — check if it's rax
                 if dest_reg == 0 {
                     return None; // Writes to %rax
                 }
-                // Any other instruction is suspicious - bail out
+                // Any other instruction is suspicious — bail out
                 return None;
             }
             LineKind::Pop { reg } => {
@@ -201,9 +245,12 @@ fn is_tail_call_candidate(
                 return None;
             }
             LineKind::Ret => {
-                // Found the ret! Make sure we saw the frame teardown
+                // Found the ret! Make sure we saw the frame teardown.
                 if found_frame_teardown && found_pop_rbp {
-                    return Some(j);
+                    return Some(TailCallInfo {
+                        ret_idx: j,
+                        dead_store_indices: store_indices,
+                    });
                 }
                 return None;
             }
@@ -420,4 +467,5 @@ mod tests {
         assert!(result.contains("call bar"), "should NOT convert when lea of local exists: {}", result);
         assert!(result.contains("ret"), "should keep ret when lea of local exists: {}", result);
     }
+
 }

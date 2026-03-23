@@ -157,6 +157,33 @@ pub(super) fn shift_mnemonic(op: IrBinOp) -> (&'static str, &'static str) {
 
 /// x86-64 code generator. Implements the ArchCodegen trait for the shared framework.
 /// Uses System V AMD64 ABI with linear scan register allocation for callee-saved registers.
+///
+/// # System V AMD64 ABI Calling Convention
+///
+/// ## Argument Passing
+/// - **GP argument registers:** `rdi`, `rsi`, `rdx`, `rcx`, `r8`, `r9` (6 registers)
+/// - **FP argument registers:** `xmm0` through `xmm7` (8 registers)
+/// - Arguments beyond the register set are passed on the stack, right-to-left
+/// - Variadic functions: float count passed in `al` register; float args in XMM0-XMM7
+///
+/// ## Return Values
+/// - **Integer return:** `rax` (up to 64-bit), `rdx:rax` (128-bit)
+/// - **Float return:** `xmm0` (float/double), `xmm0:xmm1` (two-field float structs)
+/// - **Long double return:** `st(0)` (x87 80-bit extended)
+///
+/// ## Struct Return
+/// - Large structs (>16 bytes or unclassifiable): hidden first argument in `rdi` (sret pointer)
+/// - Small structs (≤16 bytes): returned in up to 2 registers (GP or SSE per eightbyte class)
+///
+/// ## Stack
+/// - Stack is 16-byte aligned before `call` instruction
+/// - Red zone: 128 bytes below `rsp` available without allocation (leaf functions)
+///
+/// ## Register Preservation
+/// - **Callee-saved:** `rbx`, `rbp`, `r12`, `r13`, `r14`, `r15`
+/// - **Caller-saved:** `rax`, `rcx`, `rdx`, `rsi`, `rdi`, `r8`, `r9`, `r10`, `r11`
+/// - **Frame pointer:** `rbp` (always used as frame pointer in CCC)
+/// - **Stack pointer:** `rsp` (16-byte aligned)
 pub struct X86Codegen {
     pub(crate) state: CodegenState,
     pub(super) current_return_type: IrType,
@@ -454,6 +481,24 @@ impl X86Codegen {
                             self.state.out.emit_instr_imm_reg("    movabsq", low, "rax");
                         }
                     }
+                    // Complex constants: load the real part into rax (low 64 bits of the pair).
+                    // Full complex handling is done at the lowering level with separate components.
+                    IrConst::ComplexF32(re, _) => {
+                        let bits = re.to_bits() as u64;
+                        if bits == 0 {
+                            self.state.emit("    xorl %eax, %eax");
+                        } else {
+                            self.state.out.emit_instr_imm_reg("    movq", bits as i64, "rax");
+                        }
+                    }
+                    IrConst::ComplexF64(re, _) => {
+                        let bits = re.to_bits();
+                        if bits == 0 {
+                            self.state.emit("    xorl %eax, %eax");
+                        } else {
+                            self.state.out.emit_instr_imm_reg("    movabsq", bits as i64, "rax");
+                        }
+                    }
                     IrConst::Zero => self.state.emit("    xorl %eax, %eax"),
                 }
             }
@@ -551,6 +596,23 @@ impl X86Codegen {
                             self.state.out.emit_instr_imm_reg("    movq", low, "rcx");
                         } else {
                             self.state.out.emit_instr_imm_reg("    movabsq", low, "rcx");
+                        }
+                    }
+                    // Complex constants: load the real part into rcx.
+                    IrConst::ComplexF32(re, _) => {
+                        let bits = re.to_bits() as u64;
+                        if bits == 0 {
+                            self.state.emit("    xorl %ecx, %ecx");
+                        } else {
+                            self.state.out.emit_instr_imm_reg("    movq", bits as i64, "rcx");
+                        }
+                    }
+                    IrConst::ComplexF64(re, _) => {
+                        let bits = re.to_bits();
+                        if bits == 0 {
+                            self.state.emit("    xorl %ecx, %ecx");
+                        } else {
+                            self.state.out.emit_instr_imm_reg("    movabsq", bits as i64, "rcx");
                         }
                     }
                     IrConst::Zero => self.state.emit("    xorl %ecx, %ecx"),
@@ -815,6 +877,38 @@ impl X86Codegen {
             "nand" => {
                 self.state.emit_fmt(format_args!("    and{} %{}, %{}", size_suffix, r8_reg, rdx_reg));
                 self.state.emit_fmt(format_args!("    not{} %{}", size_suffix, rdx_reg));
+            }
+            "smin" => {
+                // Signed min: if old > val (signed), new = val; else keep old
+                self.state.emit_fmt(format_args!("    cmp{} %{}, %{}", size_suffix, r8_reg, rdx_reg));
+                let skip_label = format!(".Latomic_skip_{}", label_id);
+                self.state.out.emit_jcc_label("    jle", &skip_label);
+                self.state.emit_fmt(format_args!("    mov{} %{}, %{}", size_suffix, r8_reg, rdx_reg));
+                self.state.out.emit_named_label(&skip_label);
+            }
+            "smax" => {
+                // Signed max: if old < val (signed), new = val; else keep old
+                self.state.emit_fmt(format_args!("    cmp{} %{}, %{}", size_suffix, r8_reg, rdx_reg));
+                let skip_label = format!(".Latomic_skip_{}", label_id);
+                self.state.out.emit_jcc_label("    jge", &skip_label);
+                self.state.emit_fmt(format_args!("    mov{} %{}, %{}", size_suffix, r8_reg, rdx_reg));
+                self.state.out.emit_named_label(&skip_label);
+            }
+            "umin" => {
+                // Unsigned min: if old > val (unsigned), new = val; else keep old
+                self.state.emit_fmt(format_args!("    cmp{} %{}, %{}", size_suffix, r8_reg, rdx_reg));
+                let skip_label = format!(".Latomic_skip_{}", label_id);
+                self.state.out.emit_jcc_label("    jbe", &skip_label);
+                self.state.emit_fmt(format_args!("    mov{} %{}, %{}", size_suffix, r8_reg, rdx_reg));
+                self.state.out.emit_named_label(&skip_label);
+            }
+            "umax" => {
+                // Unsigned max: if old < val (unsigned), new = val; else keep old
+                self.state.emit_fmt(format_args!("    cmp{} %{}, %{}", size_suffix, r8_reg, rdx_reg));
+                let skip_label = format!(".Latomic_skip_{}", label_id);
+                self.state.out.emit_jcc_label("    jae", &skip_label);
+                self.state.emit_fmt(format_args!("    mov{} %{}, %{}", size_suffix, r8_reg, rdx_reg));
+                self.state.out.emit_named_label(&skip_label);
             }
             _ => {}
         }
@@ -1314,6 +1408,10 @@ impl ArchCodegen for X86Codegen {
         fn emit_epilogue_and_ret(&mut self, frame_size: i64) => emit_epilogue_and_ret_impl;
         fn store_instr_for_type(&self, ty: IrType) -> &'static str => store_instr_for_type_impl;
         fn load_instr_for_type(&self, ty: IrType) -> &'static str => load_instr_for_type_impl;
+        // VLA support
+        fn emit_vla_save_sp(&mut self, save_slot: &Value) => emit_vla_save_sp_impl;
+        fn emit_vla_restore_sp(&mut self, save_slot: &Value) => emit_vla_restore_sp_impl;
+        fn emit_vla_alloc(&mut self, dest: &Value, size: &Operand) => emit_vla_alloc_impl;
         // memory
         fn emit_store(&mut self, val: &Operand, ptr: &Value, ty: IrType) => emit_store_impl;
         fn emit_load(&mut self, dest: &Value, ptr: &Value, ty: IrType) => emit_load_impl;
@@ -1412,6 +1510,7 @@ impl ArchCodegen for X86Codegen {
         // atomics
         fn emit_atomic_rmw(&mut self, dest: &Value, op: AtomicRmwOp, ptr: &Operand, val: &Operand, ty: IrType, ordering: AtomicOrdering) => emit_atomic_rmw_impl;
         fn emit_atomic_cmpxchg(&mut self, dest: &Value, ptr: &Operand, expected: &Operand, desired: &Operand, ty: IrType, success_ordering: AtomicOrdering, failure_ordering: AtomicOrdering, returns_bool: bool) => emit_atomic_cmpxchg_impl;
+        fn emit_atomic_cmpxchg_weak(&mut self, dest: &Value, ptr: &Operand, expected: &Operand, desired: &Operand, ty: IrType, success_ordering: AtomicOrdering, failure_ordering: AtomicOrdering, returns_bool: bool) => emit_atomic_cmpxchg_weak_impl;
         fn emit_atomic_load(&mut self, dest: &Value, ptr: &Operand, ty: IrType, ordering: AtomicOrdering) => emit_atomic_load_impl;
         fn emit_atomic_store(&mut self, ptr: &Operand, val: &Operand, ty: IrType, ordering: AtomicOrdering) => emit_atomic_store_impl;
         fn emit_fence(&mut self, ordering: AtomicOrdering) => emit_fence_impl;

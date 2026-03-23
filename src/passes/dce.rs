@@ -7,6 +7,9 @@
 //!
 //! Side-effecting instructions (stores, calls) are never removed.
 //!
+//! Additionally, this module provides `eliminate_noreturn_dead_code` which removes
+//! unreachable instructions after calls to `_Noreturn` functions (C11 §6.7.4).
+//!
 //! Performance: Uses a use-count-based worklist approach instead of a fixpoint
 //! loop. This processes each instruction at most twice (once for counting, once
 //! for removal), giving O(n) complexity instead of O(n*k) where k is the
@@ -16,6 +19,7 @@ use crate::ir::reexports::{
     Instruction,
     IrFunction,
     Operand,
+    Terminator,
 };
 
 /// Eliminate dead code in a single function using use-count-based worklist DCE.
@@ -295,6 +299,77 @@ fn has_side_effects(inst: &Instruction) -> bool {
     ) || matches!(inst, Instruction::Intrinsic { op, dest_ptr, .. } if !op.is_pure() || dest_ptr.is_some())
 }
 
+/// Eliminate unreachable code after calls to `_Noreturn` functions.
+///
+/// C11 §6.7.4: A function declared with `_Noreturn` shall not return to its caller.
+/// Any instructions after a call to a `_Noreturn` function are unreachable and
+/// can be safely removed. This also applies to the block terminator, which is
+/// replaced with `Terminator::Unreachable` to reflect that control flow never
+/// reaches the end of the block.
+///
+/// This pass scans each basic block for calls to noreturn functions and truncates
+/// all subsequent instructions after such calls. It operates independently from
+/// the main use-count-based DCE and can be called separately from `run_passes`
+/// in `mod.rs`.
+///
+/// # Arguments
+///
+/// * `func` - The IR function to optimize.
+/// * `noreturn_funcs` - A set of function names known to be `_Noreturn`.
+///   This information is passed from the module level where function attributes
+///   are known.
+///
+/// # Returns
+///
+/// The number of instructions removed.
+pub(crate) fn eliminate_noreturn_dead_code(
+    func: &mut IrFunction,
+    noreturn_funcs: &std::collections::HashSet<String>,
+) -> usize {
+    let mut total_removed = 0;
+
+    for block in &mut func.blocks {
+        let mut truncate_after = None;
+
+        for (idx, inst) in block.instructions.iter().enumerate() {
+            match inst {
+                Instruction::Call { func: callee_name, .. } => {
+                    if noreturn_funcs.contains(callee_name) {
+                        truncate_after = Some(idx);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if let Some(trunc_idx) = truncate_after {
+            // Keep instructions up to and including the noreturn call.
+            let remove_count = block.instructions.len() - (trunc_idx + 1);
+            if remove_count > 0 {
+                block.instructions.truncate(trunc_idx + 1);
+                // Synchronize source spans if they are parallel to instructions.
+                if block.source_spans.len() > trunc_idx + 1 {
+                    block.source_spans.truncate(trunc_idx + 1);
+                }
+                // Replace the block terminator with Unreachable since control
+                // never returns from a _Noreturn call.
+                block.terminator = Terminator::Unreachable;
+                total_removed += remove_count;
+            } else {
+                // The noreturn call is already the last instruction — no
+                // instructions to remove, but still mark terminator unreachable
+                // if it isn't already.
+                if !matches!(block.terminator, Terminator::Unreachable) {
+                    block.terminator = Terminator::Unreachable;
+                }
+            }
+        }
+    }
+
+    total_removed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -471,4 +546,5 @@ mod tests {
         assert!(func.blocks[1].instructions.is_empty(),
                 "Phi should be removed from loop header");
     }
+
 }

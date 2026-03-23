@@ -18,6 +18,7 @@
 //! - `check`: Post-link undefined symbol checking
 //! - `eh_frame`: .eh_frame_hdr builder for stack unwinding
 //! - `gc_sections`: Garbage collection (`--gc-sections`) for ELF64 linkers
+//! - `linker_script`: GNU ld-compatible linker script parser (SECTIONS, MEMORY, ENTRY, PROVIDE, KEEP)
 //!
 //! This module extracts the duplicated linker code that was copied across x86,
 //! ARM, RISC-V, and (partially) i686 backends. It provides:
@@ -44,6 +45,9 @@
 //!   `-Wl,` flag parsing across backends.
 //! - **Undefined symbol checking**: `check_undefined_symbols_elf64()` for
 //!   post-link validation via the `GlobalSymbolOps` trait.
+//! - **Linker script parsing**: `parse_linker_script()` and `LinkerScript` for
+//!   `-T script.ld` section placement, MEMORY regions, ENTRY/PROVIDE symbols,
+//!   and KEEP directives consumed by per-architecture linkers.
 //!
 //! Each backend linker still handles its own:
 //! - Architecture-specific relocation application
@@ -69,6 +73,7 @@ mod args;
 mod check;
 mod eh_frame;
 mod gc_sections;
+pub(crate) mod linker_script;
 
 // ── Re-exports ──────────────────────────────────────────────────────────
 //
@@ -95,10 +100,14 @@ pub use symbols::{
     OutputSection, GlobalSymbolOps,
     is_linker_defined_symbol,
     is_valid_c_identifier_for_section, resolve_start_stop_symbols,
+    resolve_provide_symbols, resolve_entry_symbol,
 };
 
 // merge.rs
-pub use merge::{merge_sections_elf64, merge_sections_elf64_gc, allocate_common_symbols_elf64};
+pub use merge::{
+    merge_sections_elf64, merge_sections_elf64_gc, allocate_common_symbols_elf64,
+    merge_sections_with_script, is_section_kept,
+};
 
 // dynamic.rs
 pub use dynamic::{
@@ -119,10 +128,16 @@ pub use write::{write_elf64_shdr, write_elf64_phdr, write_elf64_phdr_at, align_u
 pub use args::parse_linker_args;
 
 // check.rs
-pub use check::check_undefined_symbols_elf64;
+pub use check::{check_undefined_symbols_elf64, check_nss_static_warning};
 
 // eh_frame.rs
 pub use eh_frame::{count_eh_frame_fdes, build_eh_frame_hdr};
 
 // gc_sections.rs
 pub use gc_sections::gc_collect_sections_elf64;
+
+// linker_script.rs
+pub use linker_script::{
+    LinkerScript, ScriptSection, SymbolExpr,
+    parse_linker_script,
+};

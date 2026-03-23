@@ -198,6 +198,40 @@ pub(crate) fn resolve_abs_g_modifier(kind: &str, symbol: &str) -> Result<Option<
     }
 }
 
+/// Map an `:abs_g*:` modifier kind string to the appropriate MOVW RelocType.
+///
+/// Per the AArch64 ELF specification, `:abs_g0:` (with overflow check) and
+/// `:abs_g0_nc:` (no check) are distinct relocation types with different ELF
+/// numbers. The `_nc` (no-check) variants are typically used with MOVK (which
+/// fills a 16-bit slice without caring about overflow), while the checking
+/// variants are used with MOVZ (which requires the value to fit).
+fn movw_reloc_type_from_modifier(kind: &str) -> Result<RelocType, String> {
+    match kind {
+        "abs_g0" => Ok(RelocType::MovwUabsG0),
+        "abs_g0_nc" => Ok(RelocType::MovwUabsG0Nc),
+        "abs_g1" => Ok(RelocType::MovwUabsG1),
+        "abs_g1_nc" => Ok(RelocType::MovwUabsG1Nc),
+        "abs_g2" => Ok(RelocType::MovwUabsG2),
+        "abs_g2_nc" => Ok(RelocType::MovwUabsG2Nc),
+        "abs_g3" => Ok(RelocType::MovwUabsG3),
+        "abs_g0_s" => Ok(RelocType::MovwSabsG0),
+        "abs_g1_s" => Ok(RelocType::MovwSabsG1),
+        "abs_g2_s" => Ok(RelocType::MovwSabsG2),
+        _ => Err(format!("unsupported MOVW modifier: {}", kind)),
+    }
+}
+
+/// Get the hardware shift value (hw) from an `:abs_g*:` modifier kind string.
+fn movw_hw_from_modifier(kind: &str) -> u32 {
+    match kind {
+        "abs_g0" | "abs_g0_nc" | "abs_g0_s" => 0,  // bits [15:0]
+        "abs_g1" | "abs_g1_nc" | "abs_g1_s" => 1,  // bits [31:16]
+        "abs_g2" | "abs_g2_nc" | "abs_g2_s" => 2,  // bits [47:32]
+        "abs_g3" => 3,                               // bits [63:48]
+        _ => 0,
+    }
+}
+
 pub(crate) fn encode_movz(operands: &[Operand]) -> Result<EncodeResult, String> {
     let (rd, is_64) = get_reg(operands, 0)?;
     let sf = sf_bit(is_64);
@@ -208,6 +242,18 @@ pub(crate) fn encode_movz(operands: &[Operand]) -> Result<EncodeResult, String> 
             let word = (sf << 31) | (0b10100101 << 23) | (hw << 21) | ((imm16 & 0xFFFF) << 5) | rd;
             return Ok(EncodeResult::Word(word));
         }
+        // Symbolic reference that could not be resolved to a constant — emit relocation
+        let reloc_type = movw_reloc_type_from_modifier(kind)?;
+        let hw = movw_hw_from_modifier(kind);
+        let word = (sf << 31) | (0b10100101 << 23) | (hw << 21) | rd;
+        return Ok(EncodeResult::WordWithReloc {
+            word,
+            reloc: Relocation {
+                reloc_type,
+                symbol: symbol.clone(),
+                addend: 0,
+            },
+        });
     }
 
     let imm = get_imm(operands, 1)?;
@@ -241,6 +287,18 @@ pub(crate) fn encode_movk(operands: &[Operand]) -> Result<EncodeResult, String> 
             let word = (sf << 31) | (0b11100101 << 23) | (hw << 21) | ((imm16 & 0xFFFF) << 5) | rd;
             return Ok(EncodeResult::Word(word));
         }
+        // Symbolic reference — emit relocation
+        let reloc_type = movw_reloc_type_from_modifier(kind)?;
+        let hw = movw_hw_from_modifier(kind);
+        let word = (sf << 31) | (0b11100101 << 23) | (hw << 21) | rd;
+        return Ok(EncodeResult::WordWithReloc {
+            word,
+            reloc: Relocation {
+                reloc_type,
+                symbol: symbol.clone(),
+                addend: 0,
+            },
+        });
     }
 
     let imm = get_imm(operands, 1)?;
@@ -265,8 +323,30 @@ pub(crate) fn encode_movk(operands: &[Operand]) -> Result<EncodeResult, String> 
 
 pub(crate) fn encode_movn(operands: &[Operand]) -> Result<EncodeResult, String> {
     let (rd, is_64) = get_reg(operands, 0)?;
-    let imm = get_imm(operands, 1)?;
     let sf = sf_bit(is_64);
+
+    // Handle :abs_g*: modifiers (e.g., :abs_g0_s:symbol for signed MOVN)
+    if let Some(Operand::Modifier { kind, symbol }) = operands.get(1) {
+        if let Some((imm16, hw)) = resolve_abs_g_modifier(kind, symbol)? {
+            let word = (sf << 31) | (0b00100101 << 23) | (hw << 21) | ((imm16 & 0xFFFF) << 5) | rd;
+            return Ok(EncodeResult::Word(word));
+        }
+        // Symbolic reference — emit relocation
+        // MOVN uses signed SABS relocations for :abs_g*_s: modifiers
+        let reloc_type = movw_reloc_type_from_modifier(kind)?;
+        let hw = movw_hw_from_modifier(kind);
+        let word = (sf << 31) | (0b00100101 << 23) | (hw << 21) | rd;
+        return Ok(EncodeResult::WordWithReloc {
+            word,
+            reloc: Relocation {
+                reloc_type,
+                symbol: symbol.clone(),
+                addend: 0,
+            },
+        });
+    }
+
+    let imm = get_imm(operands, 1)?;
 
     let hw = if operands.len() > 2 {
         if let Some(Operand::Shift { kind, amount }) = operands.get(2) {

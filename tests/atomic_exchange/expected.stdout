@@ -1,0 +1,10 @@
+exchange int: old=42 new=99
+exchange relaxed: old=100 new=200
+double exchange: old1=10 old2=20 z=30
+cmpxchg success: ret=1 a=75 expected=50
+cmpxchg failure: ret=0 b=50 expected=50
+cmpxchg loop: c=110
+cmpxchg acq_rel: ret=1 d=84
+exchange long: old=100000 new=200000
+cmpxchg char: ret=1 cx=20
+cmpxchg retry: fail_ret=0 succ_ret=1 e=77

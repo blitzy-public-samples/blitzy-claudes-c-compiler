@@ -8,6 +8,12 @@
 //!
 //! After inlining, subsequent passes (constant fold, DCE, CFG simplify) clean up
 //! the inlined code and eliminate dead branches.
+//!
+//! The inlining thresholds are configurable per optimization level via `InlineConfig`:
+//! - `-O2` (default): Baseline thresholds matching current behavior
+//! - `-O3`: 150% of baseline budgets for more aggressive inlining
+//! - `-Os`: 50% of baseline budgets to reduce code size
+//! - `-Oz`: Inlining is entirely disabled (pass is skipped by the optimizer)
 
 use crate::ir::reexports::{
     BasicBlock, BlockId, CallInfo, GlobalInit, IrFunction, IrModule, Instruction, Operand,
@@ -192,6 +198,51 @@ const MAX_TRACE_CHAIN_LENGTH: usize = 20;
 /// trees where both operands themselves need recursive tracing.
 const MAX_TRACE_RECURSION_DEPTH: u32 = 10;
 
+/// Configuration for inlining thresholds, adjusted per optimization level.
+/// At -O2 (default), all thresholds use their baseline values (scale = 100%).
+/// At -O3, thresholds are raised for more aggressive inlining (scale = 150%).
+/// At -Os, thresholds are halved to reduce code size (scale = 50%).
+/// At -Oz, inlining is disabled entirely (handled in mod.rs by skipping the pass).
+///
+/// Only optimization-related budgets are scaled. Correctness thresholds
+/// (tiny, small, always_inline, hard caps, absolute caps, trace limits)
+/// are never scaled because they protect against linker errors and stack overflow.
+#[derive(Clone, Copy)]
+pub(crate) struct InlineConfig {
+    /// Scaling factor for instruction budgets (100 = 100% = default).
+    /// -O2: 100, -O3: 150, -Os: 50
+    pub budget_scale_pct: usize,
+}
+
+impl InlineConfig {
+    /// Default configuration, equivalent to -O2 behavior.
+    /// All budgets remain at their baseline values.
+    pub fn default_o2() -> Self {
+        Self { budget_scale_pct: 100 }
+    }
+
+    /// Configuration for -O3: more aggressive inlining.
+    /// Budgets are scaled to 150% of baseline, allowing larger callees
+    /// to be inlined and more total inlining per caller function.
+    pub fn aggressive_o3() -> Self {
+        Self { budget_scale_pct: 150 }
+    }
+
+    /// Configuration for -Os: reduced inlining for smaller code.
+    /// Budgets are scaled to 50% of baseline, reducing the amount of
+    /// inlining to produce smaller binaries at the cost of some performance.
+    pub fn size_optimized_os() -> Self {
+        Self { budget_scale_pct: 50 }
+    }
+
+    /// Apply the scaling factor to a baseline value.
+    /// Uses integer arithmetic: (value * scale_pct + 50) / 100 for rounding.
+    /// When `budget_scale_pct == 100`, returns the baseline value unchanged.
+    fn scale(&self, baseline: usize) -> usize {
+        (baseline * self.budget_scale_pct + 50) / 100
+    }
+}
+
 /// Select the best call site to inline from the given candidates.
 ///
 /// Uses a two-pass strategy:
@@ -313,7 +364,13 @@ fn select_inline_site(
 
 /// Run the inlining pass on the module.
 /// Returns the number of call sites inlined.
-pub fn run(module: &mut IrModule) -> usize {
+///
+/// The `config` parameter controls inlining aggressiveness per optimization level:
+/// - `InlineConfig::default_o2()` for standard `-O2` behavior (unchanged baseline)
+/// - `InlineConfig::aggressive_o3()` for `-O3` (150% budgets, more aggressive)
+/// - `InlineConfig::size_optimized_os()` for `-Os` (50% budgets, smaller code)
+/// - At `-Oz`, the caller should skip this pass entirely (no inlining).
+pub fn run(module: &mut IrModule, config: InlineConfig) -> usize {
     let mut total_inlined = 0;
     let debug_inline = std::env::var("CCC_INLINE_DEBUG").is_ok();
     let skip_list: Vec<String> = std::env::var("CCC_INLINE_SKIP")
@@ -375,8 +432,8 @@ pub fn run(module: &mut IrModule) -> usize {
                 })
             })
         };
-        let mut budget_remaining = MAX_INLINE_BUDGET_PER_CALLER;
-        let mut always_inline_budget_remaining = MAX_ALWAYS_INLINE_BUDGET_PER_CALLER;
+        let mut budget_remaining = config.scale(MAX_INLINE_BUDGET_PER_CALLER);
+        let mut always_inline_budget_remaining = config.scale(MAX_ALWAYS_INLINE_BUDGET_PER_CALLER);
         // Iterate to handle chains of inlined calls (A calls B calls C, all small inline).
         // Limit iterations to prevent infinite loops from recursive inline functions.
         let max_rounds = 200;
@@ -389,7 +446,7 @@ pub fn run(module: &mut IrModule) -> usize {
             // callees are still inlined (required by C semantics).
             let caller_inst_count: usize = module.functions[func_idx].blocks.iter()
                 .map(|b| b.instructions.len()).sum();
-            let caller_too_large = caller_inst_count > MAX_CALLER_INSTRUCTIONS_AFTER_INLINE;
+            let caller_too_large = caller_inst_count > config.scale(MAX_CALLER_INSTRUCTIONS_AFTER_INLINE);
             let caller_at_hard_cap = caller_inst_count > MAX_CALLER_INSTRUCTIONS_HARD_CAP;
             let caller_at_absolute_cap = caller_inst_count > MAX_CALLER_INSTRUCTIONS_ABSOLUTE_CAP;
 
@@ -497,7 +554,7 @@ pub fn run(module: &mut IrModule) -> usize {
         // critical inlines (avoiding linker errors and BRK crashes), so they
         // must proceed regardless of caller size. The budget limit (400 inst)
         // provides the growth bound instead.
-        let mut second_pass_budget = MAX_ALWAYS_INLINE_SECOND_PASS_BUDGET;
+        let mut second_pass_budget = config.scale(MAX_ALWAYS_INLINE_SECOND_PASS_BUDGET);
         for _round in 0..MAX_ALWAYS_INLINE_SECOND_PASS_ROUNDS {
             let call_sites = find_inline_call_sites(&module.functions[func_idx], &callee_map, &skip_list, caller_has_section);
             if call_sites.is_empty() {
@@ -1607,7 +1664,7 @@ fn remap_instruction(inst: &Instruction, vo: u32, bo: u32) -> Instruction {
             ty: *ty,
             ordering: *ordering,
         },
-        Instruction::AtomicCmpxchg { dest, ptr, expected, desired, ty, success_ordering, failure_ordering, returns_bool } => Instruction::AtomicCmpxchg {
+        Instruction::AtomicCmpxchg { dest, ptr, expected, desired, ty, success_ordering, failure_ordering, returns_bool, weak } => Instruction::AtomicCmpxchg {
             dest: remap_value(*dest, vo),
             ptr: remap_operand(ptr, vo),
             expected: remap_operand(expected, vo),
@@ -1616,6 +1673,7 @@ fn remap_instruction(inst: &Instruction, vo: u32, bo: u32) -> Instruction {
             success_ordering: *success_ordering,
             failure_ordering: *failure_ordering,
             returns_bool: *returns_bool,
+            weak: *weak,
         },
         Instruction::AtomicLoad { dest, ptr, ty, ordering } => Instruction::AtomicLoad {
             dest: remap_value(*dest, vo),
@@ -1817,5 +1875,88 @@ fn format_terminator(term: &Terminator) -> String {
             format!("switch {}, default .L{}, [{}]", format_operand(val), default.0, cases_str.join(", "))
         }
         Terminator::Unreachable => "unreachable".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_inline_config_default_o2() {
+        let config = InlineConfig::default_o2();
+        assert_eq!(config.budget_scale_pct, 100);
+    }
+
+    #[test]
+    fn test_inline_config_aggressive_o3() {
+        let config = InlineConfig::aggressive_o3();
+        assert_eq!(config.budget_scale_pct, 150);
+    }
+
+    #[test]
+    fn test_inline_config_size_optimized_os() {
+        let config = InlineConfig::size_optimized_os();
+        assert_eq!(config.budget_scale_pct, 50);
+    }
+
+    #[test]
+    fn test_scale_identity_at_100_pct() {
+        // At 100%, scale must return the baseline unchanged — critical for
+        // ensuring that -O2 behavior is identical to the pre-config baseline.
+        let config = InlineConfig::default_o2();
+        assert_eq!(config.scale(MAX_INLINE_BUDGET_PER_CALLER), MAX_INLINE_BUDGET_PER_CALLER);
+        assert_eq!(config.scale(MAX_ALWAYS_INLINE_BUDGET_PER_CALLER), MAX_ALWAYS_INLINE_BUDGET_PER_CALLER);
+        assert_eq!(config.scale(MAX_CALLER_INSTRUCTIONS_AFTER_INLINE), MAX_CALLER_INSTRUCTIONS_AFTER_INLINE);
+        assert_eq!(config.scale(MAX_ALWAYS_INLINE_SECOND_PASS_BUDGET), MAX_ALWAYS_INLINE_SECOND_PASS_BUDGET);
+        assert_eq!(config.scale(0), 0);
+        assert_eq!(config.scale(1), 1);
+        assert_eq!(config.scale(60), 60);
+    }
+
+    #[test]
+    fn test_scale_at_150_pct() {
+        let config = InlineConfig::aggressive_o3();
+        assert_eq!(config.scale(800), 1200);
+        assert_eq!(config.scale(200), 300);
+        assert_eq!(config.scale(400), 600);
+        assert_eq!(config.scale(0), 0);
+    }
+
+    #[test]
+    fn test_scale_at_50_pct() {
+        let config = InlineConfig::size_optimized_os();
+        assert_eq!(config.scale(800), 400);
+        assert_eq!(config.scale(200), 100);
+        assert_eq!(config.scale(400), 200);
+        assert_eq!(config.scale(1), 1);
+    }
+
+    #[test]
+    fn test_scale_rounding() {
+        let config = InlineConfig { budget_scale_pct: 33 };
+        assert_eq!(config.scale(100), 33);
+        assert_eq!(config.scale(3), 1);
+    }
+
+    #[test]
+    fn test_config_is_copy() {
+        let config = InlineConfig::default_o2();
+        let config2 = config;
+        let _config3 = config;
+        assert_eq!(config2.budget_scale_pct, 100);
+    }
+
+    #[test]
+    fn test_correctness_thresholds_unchanged() {
+        assert_eq!(MAX_TINY_INLINE_INSTRUCTIONS, 5);
+        assert_eq!(MAX_SMALL_INLINE_INSTRUCTIONS, 20);
+        assert_eq!(MAX_SMALL_INLINE_BLOCKS, 3);
+        assert_eq!(MAX_ALWAYS_INLINE_INSTRUCTIONS, 500);
+        assert_eq!(MAX_ALWAYS_INLINE_BLOCKS, 500);
+        assert_eq!(MAX_CALLER_INSTRUCTIONS_HARD_CAP, 500);
+        assert_eq!(MAX_CALLER_INSTRUCTIONS_ABSOLUTE_CAP, 1000);
+        assert_eq!(MAX_TRACE_CHAIN_LENGTH, 20);
+        assert_eq!(MAX_TRACE_RECURSION_DEPTH, 10);
     }
 }

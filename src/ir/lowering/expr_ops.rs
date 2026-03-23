@@ -110,6 +110,74 @@ impl Lowerer {
     fn lower_complex_binary_op(&mut self, op: &BinOp, lhs: &Expr, rhs: &Expr, lhs_ct: &CType, rhs_ct: &CType) -> Operand {
         let result_ct = self.common_complex_type(lhs_ct, rhs_ct);
 
+        // Annex G optimized paths for mixed real/complex arithmetic (C11 Annex G).
+        //
+        // When one operand is real and the other complex, certain operations can
+        // be lowered more efficiently than the general complex-complex formulas:
+        //
+        //   - real * complex / complex * real: componentwise (scalar*re, scalar*im)
+        //     Avoids the full (ac-bd, ad+bc) formula whose NaN recovery overhead
+        //     is unnecessary when the imaginary part of one operand is exactly zero.
+        //
+        //   - complex / real: componentwise (re/scalar, im/scalar)
+        //     Avoids the full division formula with its denominator scaling overhead
+        //     since there is no imaginary denominator component.
+        //
+        //   - real / complex: requires the conjugate method (real * conj(z) / |z|²),
+        //     falls through to the existing full complex division path which is correct.
+        //
+        // Note: _Atomic qualified operands are transparently handled here because
+        // is_complex() unwraps CType::Atomic(inner) to check the inner type, and
+        // the atomic load has already occurred before reaching this function.
+        let lhs_is_complex = lhs_ct.is_complex();
+        let rhs_is_complex = rhs_ct.is_complex();
+
+        if lhs_is_complex != rhs_is_complex {
+            match op {
+                BinOp::Mul => {
+                    // Mixed real * complex or complex * real:
+                    //   result = (scalar * re, scalar * im)
+                    // Normalize so the real operand is always the "scalar" side.
+                    // Delegates to `lower_real_times_complex` which handles the
+                    // componentwise multiplication per C11 Annex G.
+                    let (real_expr, real_ct, complex_expr, complex_ct) = if lhs_is_complex {
+                        (rhs, rhs_ct, lhs, lhs_ct)
+                    } else {
+                        (lhs, lhs_ct, rhs, rhs_ct)
+                    };
+                    let scalar_val = self.lower_expr(real_expr);
+                    let complex_val = self.lower_expr(complex_expr);
+                    let complex_converted = self.convert_to_complex(complex_val, complex_ct, &result_ct);
+                    let complex_ptr = self.operand_to_value(complex_converted);
+                    return self.lower_real_times_complex(scalar_val, real_ct, complex_ptr, &result_ct);
+                }
+                BinOp::Div if lhs_is_complex && !rhs_is_complex => {
+                    // complex / real: (re / scalar, im / scalar)
+                    // Delegates to `lower_complex_div_real` which performs the
+                    // componentwise division per C11 Annex G.
+                    let lhs_val = self.lower_expr(lhs);
+                    let rhs_val = self.lower_expr(rhs);
+                    let lhs_converted = self.convert_to_complex(lhs_val, lhs_ct, &result_ct);
+                    let lhs_ptr = self.operand_to_value(lhs_converted);
+                    return self.lower_complex_div_real(lhs_ptr, &result_ct, rhs_val, rhs_ct);
+                }
+                BinOp::Div if !lhs_is_complex && rhs_is_complex => {
+                    // Annex G: real / complex uses conjugate method:
+                    //   r / (c + di) = (r·c)/(c²+d²) + (-(r·d)/(c²+d²))i
+                    // This avoids the general complex division formula overhead
+                    // and produces better precision for this specific case.
+                    let lhs_val = self.lower_expr(lhs);
+                    let rhs_val = self.lower_expr(rhs);
+                    let rhs_converted = self.convert_to_complex(rhs_val, rhs_ct, &result_ct);
+                    let rhs_ptr = self.operand_to_value(rhs_converted);
+                    return self.lower_real_div_complex(lhs_val, lhs_ct, rhs_ptr, &result_ct);
+                }
+                // Add/Sub: falls through — Sub has special -0.0 handling below,
+                // Add is already componentwise and handles mixed operands correctly.
+                _ => {}
+            }
+        }
+
         // Special case: real - complex uses negation for imag part to preserve -0.0
         if *op == BinOp::Sub && !lhs_ct.is_complex() && rhs_ct.is_complex() {
             let lhs_val = self.lower_expr(lhs);
@@ -777,6 +845,31 @@ impl Lowerer {
     fn lower_inc_dec_impl(&mut self, inner: &Expr, is_inc: bool, return_new: bool) -> Operand {
         if let Some(result) = self.try_lower_bitfield_inc_dec(inner, is_inc, return_new) {
             return result;
+        }
+
+        // C11 §6.5.2.4, §6.5.3.1: ++/-- on _Atomic variables perform atomic fetch-add/sub.
+        let inner_ct = self.expr_ctype(inner);
+        if inner_ct.is_atomic() && !inner_ct.is_complex() {
+            let ty = self.get_expr_type(inner);
+            if let Some(lv) = self.lower_lvalue(inner) {
+                let addr = self.lvalue_addr(&lv);
+                let old_val = self.emit_atomic_inc_dec(
+                    Operand::Value(addr),
+                    is_inc,
+                    ty,
+                    crate::ir::reexports::AtomicOrdering::SeqCst,
+                );
+                if return_new {
+                    // Pre-increment/decrement: return old_val ± 1
+                    let ir_op = if is_inc { IrBinOp::Add } else { IrBinOp::Sub };
+                    let one = Operand::Const(IrConst::from_i64(1, ty));
+                    let new_val = self.emit_binop_val(ir_op, Operand::Value(old_val), one, ty);
+                    return Operand::Value(new_val);
+                } else {
+                    // Post-increment/decrement: return old value
+                    return Operand::Value(old_val);
+                }
+            }
         }
 
         let ty = self.get_expr_type(inner);

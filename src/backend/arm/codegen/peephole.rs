@@ -454,6 +454,11 @@ pub fn peephole_optimize(asm: String) -> String {
         }
     }
 
+    // Phase 4: Tail call optimization
+    // Convert `bl func; <epilogue>; ret` to `<epilogue>; b func` for self-recursive
+    // and direct tail calls. This eliminates stack frame growth for recursive algorithms.
+    optimize_tail_calls(&mut lines, &mut kinds, n);
+
     // Build result, filtering out Nop lines
     let mut result = String::with_capacity(asm.len());
     for i in 0..n {
@@ -794,6 +799,17 @@ fn propagate_register_copies(lines: &mut [String], kinds: &mut [LineKind], n: us
             || trimmed_j.starts_with("ldaxp ")
             || trimmed_j.starts_with("ldxp ")
             || trimmed_j.starts_with("cas ")
+            || trimmed_j.starts_with("casp ")
+            || trimmed_j.starts_with("caspa ")
+            || trimmed_j.starts_with("caspl ")
+            || trimmed_j.starts_with("caspal ")
+            || trimmed_j.starts_with("stlxr ")
+            || trimmed_j.starts_with("stlxrb ")
+            || trimmed_j.starts_with("stlxrh ")
+            || trimmed_j.starts_with("ldxrb ")
+            || trimmed_j.starts_with("ldxrh ")
+            || trimmed_j.starts_with("ldaxrb ")
+            || trimmed_j.starts_with("ldaxrh ")
         {
             continue;
         }
@@ -952,6 +968,250 @@ fn extract_sp_offset(line: &str) -> Option<i32> {
         }
     }
     None
+}
+
+// ── Tail call optimization ───────────────────────────────────────────────────
+//
+// Convert `bl func; <epilogue>; ret` to `<epilogue>; b func` for direct tail
+// calls. This eliminates stack frame growth for recursive algorithms and is
+// critical for threaded interpreters that use tail calls to dispatch between
+// handlers without overflowing the stack.
+//
+// SAFETY: We must NOT apply this optimization when:
+// 1. The function passes a pointer to a local variable to the callee
+//    (e.g., `add xN, sp, #off` or `add xN, x29, #off` where xN != sp).
+//    After frame teardown, such pointers become dangling.
+// 2. The function uses dynamic stack allocation (`sub sp, sp, xN` where xN
+//    is a register, not an immediate). After frame teardown, alloca'd memory
+//    is in unowned space and may be clobbered.
+// Suppression is reset at function boundaries (global labels not starting
+// with `.L`, or `.cfi_startproc` directives).
+
+/// Tail call optimization: convert `bl func; <epilogue>; ret` to `<epilogue>; b func`.
+fn optimize_tail_calls(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    let mut changed = false;
+
+    // First pass: scan for suppression conditions and function boundaries.
+    // We track per-function suppression. A new function starts at global labels
+    // (labels not starting with ".L") or `.cfi_startproc` directives.
+    let mut func_suppress: Vec<bool> = vec![false; n];
+    let mut cur_suppress = false;
+
+    for i in 0..n {
+        match kinds[i] {
+            LineKind::Label => {
+                let trimmed = lines[i].trim();
+                // Global labels (not .L prefixed) indicate function boundaries
+                if let Some(name) = trimmed.strip_suffix(':') {
+                    if !name.starts_with(".L") {
+                        cur_suppress = false;
+                    }
+                }
+            }
+            LineKind::Directive => {
+                let trimmed = lines[i].trim();
+                if trimmed.starts_with(".cfi_startproc") {
+                    cur_suppress = false;
+                }
+            }
+            LineKind::Alu => {
+                let trimmed = lines[i].trim();
+                // Detect address-of-local: `add xN, sp, #off` or `add xN, x29, #off`
+                if trimmed.starts_with("add ")
+                    && (trimmed.contains(", sp,") || trimmed.contains(", x29,"))
+                {
+                    // Check it's not `add sp, sp, #imm` (frame deallocation)
+                    if let Some(rest) = trimmed.strip_prefix("add ") {
+                        if let Some((dst, _)) = rest.split_once(',') {
+                            let dst = dst.trim();
+                            if dst != "sp" {
+                                cur_suppress = true;
+                            }
+                        }
+                    }
+                }
+                // Detect dynamic alloca: `sub sp, sp, xN` (register, not immediate)
+                if trimmed.starts_with("sub sp, sp, ") {
+                    let operand = trimmed
+                        .strip_prefix("sub sp, sp, ")
+                        .unwrap_or("")
+                        .trim();
+                    if !operand.starts_with('#') {
+                        cur_suppress = true;
+                    }
+                }
+            }
+            _ => {}
+        }
+        func_suppress[i] = cur_suppress;
+    }
+
+    // Second pass: find bl + epilogue + ret patterns and transform them.
+    let mut i = 0;
+    while i < n {
+        if kinds[i] != LineKind::Call || func_suppress[i] {
+            i += 1;
+            continue;
+        }
+
+        // Extract call target from "bl <target>"
+        let call_line = lines[i].trim().to_string();
+        let call_target = if let Some(target) = call_line.strip_prefix("bl ") {
+            target.trim()
+        } else {
+            // blr (indirect call) — skip, can't tail-call optimize indirect calls safely
+            i += 1;
+            continue;
+        };
+
+        // Must be a direct call to a named function (not a register)
+        if call_target.is_empty()
+            || call_target.starts_with('x')
+            || call_target.starts_with('w')
+        {
+            i += 1;
+            continue;
+        }
+
+        // Scan forward past the call for the epilogue + ret pattern.
+        // Epilogue on AArch64 consists of:
+        //   - Optional callee-save restores: ldp xN, xM, [sp, #off]
+        //   - Frame pointer/LR restore: ldp x29, x30, [sp, ...] or ldp x29, x30, [sp], #N
+        //   - Frame deallocation: add sp, sp, #N (if not post-indexed ldp)
+        //   - ret
+        let call_idx = i;
+        let mut j = i + 1;
+
+        // Skip Nops
+        while j < n && kinds[j] == LineKind::Nop {
+            j += 1;
+        }
+
+        // Collect epilogue lines: we expect ldp pairs, possibly add sp, then ret.
+        // Track dead instructions (register moves that shuffle the return value)
+        // between the call and the real epilogue — these should be NOPed when
+        // applying TCO since the tail-called function produces its own return value.
+        let epilogue_start = j;
+        let mut found_ret = false;
+        let mut ret_idx = 0;
+        let mut dead_indices: Vec<usize> = Vec::new();
+
+        while j < n {
+            match kinds[j] {
+                LineKind::Nop => {
+                    j += 1;
+                    continue;
+                }
+                LineKind::LoadPairSp => {
+                    // ldp from stack (callee-save restore)
+                    j += 1;
+                    continue;
+                }
+                LineKind::Alu => {
+                    let trimmed = lines[j].trim();
+                    // add sp, sp, #N — frame deallocation
+                    if trimmed.starts_with("add sp, sp, #") {
+                        j += 1;
+                        continue;
+                    }
+                    break; // Other ALU — not epilogue
+                }
+                LineKind::Ret => {
+                    found_ret = true;
+                    ret_idx = j;
+                    break;
+                }
+                LineKind::Directive => {
+                    let trimmed = lines[j].trim();
+                    // Allow .cfi_* directives in the epilogue
+                    if trimmed.starts_with(".cfi_") {
+                        j += 1;
+                        continue;
+                    }
+                    break;
+                }
+                LineKind::Move { .. } => {
+                    // Register-to-register moves between call and epilogue are
+                    // dead in a tail call context. Codegen often shuffles the
+                    // return value (x0) into callee-saved registers and back.
+                    // Since the tail-called function produces its own x0 return
+                    // value, these moves are unnecessary. NOP them.
+                    dead_indices.push(j);
+                    j += 1;
+                    continue;
+                }
+                LineKind::StoreSp { .. } => {
+                    // Stores to the stack between call and epilogue are dead:
+                    // the frame is about to be torn down, so the stored value
+                    // is never read back.
+                    dead_indices.push(j);
+                    j += 1;
+                    continue;
+                }
+                LineKind::StorePairSp => {
+                    // Store-pair to stack: dead for the same reason as StoreSp.
+                    dead_indices.push(j);
+                    j += 1;
+                    continue;
+                }
+                LineKind::Other => {
+                    // Check for "ldp x29, x30, [sp], #N" (post-indexed, may classify as Other)
+                    let trimmed = lines[j].trim();
+                    if trimmed.starts_with("ldp x29, x30, [sp]")
+                        || trimmed.starts_with("ldp ")
+                    {
+                        j += 1;
+                        continue;
+                    }
+                    // Tolerate store-pair to stack (dead stores of return value)
+                    // that might be classified as Other instead of StorePairSp:
+                    if trimmed.starts_with("stp ") && trimmed.contains("[sp") {
+                        dead_indices.push(j);
+                        j += 1;
+                        continue;
+                    }
+                    // Tolerate single store to stack:
+                    if trimmed.starts_with("str ") && trimmed.contains("[sp") {
+                        dead_indices.push(j);
+                        j += 1;
+                        continue;
+                    }
+                    break;
+                }
+                _ => break, // Not part of epilogue
+            }
+        }
+
+        if !found_ret || epilogue_start == ret_idx {
+            // No epilogue found or empty epilogue — skip
+            i += 1;
+            continue;
+        }
+
+        // Verify that at least one epilogue instruction exists between the call and ret.
+        let has_epilogue = (epilogue_start..ret_idx).any(|k| kinds[k] != LineKind::Nop);
+        if !has_epilogue {
+            i += 1;
+            continue;
+        }
+
+        // Transform: replace `bl target` with Nop and `ret` with `b target`.
+        // The epilogue instructions (ldp, add sp) remain to clean up the frame.
+        kinds[call_idx] = LineKind::Nop;
+
+        // NOP dead instructions between call and epilogue (return value shuffles).
+        for &di in &dead_indices {
+            kinds[di] = LineKind::Nop;
+        }
+
+        lines[ret_idx] = format!("    b {}", call_target);
+        kinds[ret_idx] = LineKind::Branch;
+        changed = true;
+
+        i = ret_idx + 1;
+    }
+
+    changed
 }
 
 #[cfg(test)]
@@ -1220,4 +1480,97 @@ mod tests {
         // Store must be preserved because address of stack slot is taken
         assert!(result.contains("str w0, [sp, #16]"));
     }
+
+    // ── Tail call optimization tests ─────────────────────────────────
+
+    #[test]
+    fn test_tail_call_basic() {
+        // A self-recursive tail call: bl self + ret → b self
+        let input = "\
+my_func:\n\
+    .cfi_startproc\n\
+    stp x29, x30, [sp, #-16]!\n\
+    bl my_func\n\
+    ldp x29, x30, [sp], #16\n\
+    ret\n\
+    .cfi_endproc\n";
+        let result = peephole_optimize(input.to_string());
+        // After optimization: bl+ret should become just b
+        assert!(result.contains("b my_func"), "expected tail call to branch: {}", result);
+        // The bl should be removed or replaced
+        assert!(!result.contains("bl my_func"), "bl should be replaced: {}", result);
+    }
+
+    #[test]
+    fn test_tail_call_suppressed_by_address_of_local() {
+        // Tail call must be suppressed when address-of-local is taken
+        let input = "\
+my_func:\n\
+    .cfi_startproc\n\
+    stp x29, x30, [sp, #-16]!\n\
+    add x1, sp, #8\n\
+    bl my_func\n\
+    ldp x29, x30, [sp], #16\n\
+    ret\n\
+    .cfi_endproc\n";
+        let result = peephole_optimize(input.to_string());
+        // Should NOT optimize: address-of-local suppresses tail call
+        assert!(result.contains("bl my_func"), "tail call should be suppressed: {}", result);
+    }
+
+    #[test]
+    fn test_tail_call_non_self_also_optimized() {
+        // The AArch64 tail call optimizer handles ANY direct call in tail position,
+        // not just self-recursive calls (general tail call optimization).
+        let input = "\
+my_func:\n\
+    .cfi_startproc\n\
+    stp x29, x30, [sp, #-16]!\n\
+    bl other_func\n\
+    ldp x29, x30, [sp], #16\n\
+    ret\n\
+    .cfi_endproc\n";
+        let result = peephole_optimize(input.to_string());
+        // Non-self calls in tail position are also optimized
+        assert!(result.contains("b other_func"), "non-self tail call should be optimized: {}", result);
+        assert!(!result.contains("bl other_func"), "bl should be replaced with b: {}", result);
+    }
+
+    #[test]
+    fn test_tail_call_suppressed_by_alloca() {
+        // Dynamic stack allocation (sub sp, sp, xN) suppresses tail calls
+        let input = "\
+my_func:\n\
+    .cfi_startproc\n\
+    stp x29, x30, [sp, #-16]!\n\
+    sub sp, sp, x0\n\
+    bl my_func\n\
+    ldp x29, x30, [sp], #16\n\
+    ret\n\
+    .cfi_endproc\n";
+        let result = peephole_optimize(input.to_string());
+        // Should NOT optimize: dynamic alloca suppresses tail call
+        assert!(result.contains("bl my_func"), "tail call should be suppressed with alloca: {}", result);
+    }
+
+    #[test]
+    fn test_tail_call_with_ldp_restore() {
+        // Verify pattern with callee-saved register pair restore using ldp.
+        // The epilogue scanner accepts ldp pairs (callee-save restores).
+        let input = "\
+factorial:\n\
+    .cfi_startproc\n\
+    stp x29, x30, [sp, #-32]!\n\
+    stp x19, x20, [sp, #16]\n\
+    mov x19, x0\n\
+    bl factorial\n\
+    ldp x19, x20, [sp, #16]\n\
+    ldp x29, x30, [sp], #32\n\
+    ret\n\
+    .cfi_endproc\n";
+        let result = peephole_optimize(input.to_string());
+        // The bl+ldp restore+ldp frame+ret pattern should be optimized
+        assert!(result.contains("b factorial"), "expected tail call with ldp restores: {}", result);
+    }
+
 }

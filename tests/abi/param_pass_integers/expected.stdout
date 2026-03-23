@@ -1,0 +1,8 @@
+single_char: OK
+single_short: OK
+single_int: OK
+single_long: OK
+single_longlong: OK
+six_integers: OK
+mixed_int_types: OK
+All integer param tests passed

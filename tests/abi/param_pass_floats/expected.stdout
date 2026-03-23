@@ -1,0 +1,10 @@
+single_float: OK
+single_double: OK
+four_floats: OK
+four_doubles: OK
+mixed_fp: OK
+eight_doubles: OK
+int_float_mix: OK
+sum_floats: OK
+sum_doubles: OK
+All float param tests passed

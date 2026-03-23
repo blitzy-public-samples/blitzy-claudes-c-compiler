@@ -9,10 +9,80 @@
 //! - `emit_shared`: shared library (.so) emission
 
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
+
 use super::elf_read::*;
 use super::relocations::section_order;
 use super::{input, sections, symbols};
+use crate::backend::elf::STT_GNU_IFUNC;
 use crate::backend::linker_common;
+use linker_common::SymbolExpr;
+
+// ── Linker script expression evaluator ──────────────────────────────────
+
+/// Evaluate a linker script symbol expression to a `u64` value.
+///
+/// Supports constant values, symbol references (looked up in `globals`),
+/// and basic arithmetic (add, subtract, bitwise AND, bitwise NOT, ALIGN).
+/// Returns `None` for expressions that cannot be resolved at this stage
+/// (e.g., `.` dot location counter, which depends on layout).
+fn eval_symbol_expr(expr: &SymbolExpr, globals: &HashMap<String, super::relocations::GlobalSym>) -> Option<u64> {
+    match expr {
+        SymbolExpr::Constant(v) => Some(*v),
+        SymbolExpr::Symbol(name) => {
+            globals.get(name.as_str()).and_then(|s| {
+                if s.defined { Some(s.value) } else { None }
+            })
+        }
+        SymbolExpr::Add(l, r) => {
+            let lv = eval_symbol_expr(l, globals)?;
+            let rv = eval_symbol_expr(r, globals)?;
+            Some(lv.wrapping_add(rv))
+        }
+        SymbolExpr::Sub(l, r) => {
+            let lv = eval_symbol_expr(l, globals)?;
+            let rv = eval_symbol_expr(r, globals)?;
+            Some(lv.wrapping_sub(rv))
+        }
+        SymbolExpr::And(l, r) => {
+            let lv = eval_symbol_expr(l, globals)?;
+            let rv = eval_symbol_expr(r, globals)?;
+            Some(lv & rv)
+        }
+        SymbolExpr::Not(inner) => {
+            let v = eval_symbol_expr(inner, globals)?;
+            Some(!v)
+        }
+        SymbolExpr::Align(inner) => {
+            // ALIGN(n) rounds up the location counter to the next multiple of n.
+            // At this stage we don't have the location counter, so return v itself.
+            let v = eval_symbol_expr(inner, globals)?;
+            Some(v)
+        }
+        SymbolExpr::Dot => None, // Cannot resolve `.` without layout context
+    }
+}
+
+// ── IFUNC diagnostic ────────────────────────────────────────────────────
+
+/// Check for `STT_GNU_IFUNC` symbols in input objects and return an error
+/// if any are found.  RISC-V does not support GNU IFUNC (indirect function
+/// dispatch) — unlike x86-64 and AArch64, the RISC-V ABI has no defined
+/// IRELATIVE relocation or runtime dispatch mechanism.
+fn check_no_ifunc_symbols(input_objs: &[(String, ElfObject)]) -> Result<(), String> {
+    for (name, obj) in input_objs {
+        for sym in &obj.symbols {
+            if sym.sym_type() == STT_GNU_IFUNC {
+                return Err(format!(
+                    "IFUNC (indirect function) is not supported on RISC-V target: \
+                     symbol '{}' in '{}'",
+                    sym.name, name
+                ));
+            }
+        }
+    }
+    Ok(())
+}
 
 // ── Public entry point: executable linking ───────────────────────────────
 
@@ -41,6 +111,7 @@ pub fn link_builtin(
     let parsed_args = linker_common::parse_linker_args(user_args);
     let is_static = parsed_args.is_static;
     let defsym_defs = parsed_args.defsym_defs;
+    let linker_script_path = parsed_args.linker_script.clone();
 
     // Collect all input files: CRT before + user objects + bare files from args + CRT after
     let mut all_inputs: Vec<String> = Vec::new();
@@ -70,6 +141,9 @@ pub fn link_builtin(
     let mut input_objs: Vec<(String, ElfObject)> = Vec::new();
     let mut inline_archive_paths: Vec<String> = Vec::new();
     input::load_input_files(&all_inputs, &mut input_objs, &mut inline_archive_paths)?;
+
+    // Detect IFUNC symbols early — RISC-V does not support GNU IFUNC dispatch.
+    check_no_ifunc_symbols(&input_objs)?;
 
     let mut defined_syms: HashSet<String> = HashSet::new();
     let mut undefined_syms: HashSet<String> = HashSet::new();
@@ -105,6 +179,14 @@ pub fn link_builtin(
         }
     }
 
+    // ── Parse linker script if provided via -T ─────────────────────────
+
+    let script = if let Some(ref script_path) = linker_script_path {
+        Some(linker_common::parse_linker_script(Path::new(script_path))?)
+    } else {
+        None
+    };
+
     // ── Phase 2: Merge sections ─────────────────────────────────────────
 
     let (mut merged_sections, mut merged_map, input_sec_refs) =
@@ -134,6 +216,70 @@ pub fn link_builtin(
         }
     }
 
+    // Resolve PROVIDE symbols from linker script before undefined symbol check.
+    // PROVIDE(symbol = expr) creates a symbol only if it is otherwise undefined.
+    if let Some(ref s) = script {
+        let provide_pairs: Vec<(String, u64)> = s.provide_symbols.iter().filter_map(|p| {
+            eval_symbol_expr(&p.expr, &global_syms).map(|val| (p.name.clone(), val))
+        }).collect();
+        // Build a name→hidden lookup so we can apply PROVIDE_HIDDEN semantics.
+        let hidden_lookup: std::collections::HashMap<&str, bool> = s
+            .provide_symbols
+            .iter()
+            .map(|p| (p.name.as_str(), p.hidden))
+            .collect();
+        // resolve_provide_symbols requires GlobalSymbolOps, but our GlobalSym
+        // does not implement that trait.  Instead we apply the same logic inline:
+        // add provided symbols only if they are currently undefined or absent.
+        for (name, addr) in &provide_pairs {
+            let already_defined = global_syms.get(name.as_str()).map_or(false, |sym| sym.defined);
+            if !already_defined {
+                use super::relocations::GlobalSym;
+                let is_hidden = hidden_lookup.get(name.as_str()).copied().unwrap_or(false);
+                let vis = if is_hidden {
+                    crate::backend::elf::STV_HIDDEN
+                } else {
+                    crate::backend::elf::STV_DEFAULT
+                };
+                global_syms.insert(name.clone(), GlobalSym {
+                    value: *addr,
+                    size: 0,
+                    binding: crate::backend::elf::STB_GLOBAL,
+                    sym_type: crate::backend::elf::STT_NOTYPE,
+                    visibility: vis,
+                    defined: true,
+                    needs_plt: false,
+                    plt_idx: 0,
+                    got_offset: None,
+                    section_idx: None,
+                });
+            }
+        }
+    }
+
+    // Apply ENTRY directive from linker script.
+    // When the linker script specifies ENTRY(symbol), that symbol's address
+    // becomes the ELF e_entry field.  For the common case of ENTRY(_start),
+    // this is already handled by emit_executable.  For non-_start entry
+    // symbols (e.g., kernel builds), alias _start to the ENTRY symbol so
+    // the executable emitter picks up the correct address.
+    if let Some(ref s) = script {
+        if let Some(ref entry_name) = s.entry {
+            if entry_name != "_start" {
+                if let Some(entry_sym) = global_syms.get(entry_name).cloned() {
+                    if entry_sym.defined {
+                        let start_defined = global_syms
+                            .get("_start")
+                            .map_or(false, |s| s.defined);
+                        if !start_defined {
+                            global_syms.insert("_start".to_string(), entry_sym);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     if !is_static {
         symbols::check_undefined_symbols(&global_syms, &shared_lib_syms)?;
     } else {
@@ -149,6 +295,20 @@ pub fn link_builtin(
         let ms = &merged_sections[i];
         section_order(&ms.name, ms.sh_flags)
     });
+
+    // ── Apply linker script section addresses to merged sections ────────
+    // When a linker script specifies SECTIONS { . = 0xADDR; .name : { } },
+    // set the vaddr of the corresponding merged section so the emitter uses
+    // the script-specified address instead of the default sequential layout.
+    if let Some(ref s) = script {
+        for sec_def in &s.sections {
+            if let Some(addr) = sec_def.address {
+                if let Some(&si) = merged_map.get(&sec_def.name) {
+                    merged_sections[si].vaddr = addr;
+                }
+            }
+        }
+    }
 
     // ── Phase 4+: Emit executable ───────────────────────────────────────
 
@@ -184,11 +344,12 @@ pub fn link_shared(
 ) -> Result<(), String> {
     let lib_path_strings: Vec<String> = lib_paths.iter().map(|s| s.to_string()).collect();
 
-    // Parse user args for -L, -l, -Wl,-soname=, bare .o/.a files
+    // Parse user args for -L, -l, -Wl,-soname=, -T, bare .o/.a files
     let mut extra_lib_paths: Vec<String> = Vec::new();
     let mut libs_to_load: Vec<String> = Vec::new();
     let mut extra_object_files: Vec<String> = Vec::new();
     let mut soname: Option<String> = None;
+    let mut linker_script_path: Option<String> = None;
     let mut i = 0;
     let args: Vec<&str> = user_args.iter().map(|s| s.as_str()).collect();
     while i < args.len() {
@@ -199,6 +360,15 @@ pub fn link_shared(
         } else if let Some(lib) = arg.strip_prefix("-l") {
             let l = if lib.is_empty() && i + 1 < args.len() { i += 1; args[i] } else { lib };
             libs_to_load.push(l.to_string());
+        } else if arg == "-T" && i + 1 < args.len() {
+            // -T <path>: linker script (two-argument form)
+            i += 1;
+            linker_script_path = Some(args[i].to_string());
+        } else if let Some(path) = arg.strip_prefix("-T") {
+            // -T<path>: linker script (joined form, e.g., -Tscript.ld)
+            if !path.is_empty() {
+                linker_script_path = Some(path.to_string());
+            }
         } else if let Some(wl_arg) = arg.strip_prefix("-Wl,") {
             let parts: Vec<&str> = wl_arg.split(',').collect();
             for j in 0..parts.len() {
@@ -210,6 +380,12 @@ pub fn link_shared(
                     extra_lib_paths.push(lpath.to_string());
                 } else if let Some(lib) = parts[j].strip_prefix("-l") {
                     libs_to_load.push(lib.to_string());
+                } else if parts[j] == "-T" && j + 1 < parts.len() {
+                    linker_script_path = Some(parts[j + 1].to_string());
+                } else if let Some(script) = parts[j].strip_prefix("-T") {
+                    if !script.is_empty() {
+                        linker_script_path = Some(script.to_string());
+                    }
                 }
             }
         } else if arg == "-shared" || arg == "-nostdlib" || arg == "-o" {
@@ -234,6 +410,10 @@ pub fn link_shared(
         object_files, &extra_object_files,
         &mut input_objs, &mut defined_syms, &mut undefined_syms,
     )?;
+
+    // Detect IFUNC symbols early — RISC-V does not support GNU IFUNC dispatch.
+    check_no_ifunc_symbols(&input_objs)?;
+
     input::resolve_shared_lib_deps(
         &libs_to_load, &all_lib_paths,
         &mut input_objs, &mut defined_syms, &mut undefined_syms,
@@ -243,6 +423,13 @@ pub fn link_shared(
     if input_objs.is_empty() {
         return Err("No input files for shared library".to_string());
     }
+
+    // Parse linker script if provided via -T.
+    let _script = if let Some(ref script_path) = linker_script_path {
+        Some(linker_common::parse_linker_script(Path::new(script_path))?)
+    } else {
+        None
+    };
 
     // ── Phase 2: Merge sections ─────────────────────────────────────
 

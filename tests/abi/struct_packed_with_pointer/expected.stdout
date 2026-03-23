@@ -1,0 +1,7 @@
+sizeof_packed_ptr_struct: OK
+offset_p_is_one: OK
+offset_b_after_ptr: OK
+alignof_packed_struct: OK
+value_store_load: OK
+pointer_value_survives: OK
+All packed pointer struct tests passed
